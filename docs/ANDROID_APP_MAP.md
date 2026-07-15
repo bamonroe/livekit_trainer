@@ -91,7 +91,9 @@ android/app/build/outputs/apk/debug/app-debug.apk
 
 ## Export Contract
 
-The first export format should be simple and explicit:
+The export format is defined in `docs/TRAINING_BUNDLE_FORMAT.md`.
+
+The first export format is simple and explicit:
 
 ```text
 bundle/
