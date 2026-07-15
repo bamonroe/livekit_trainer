@@ -66,6 +66,8 @@ Current scaffold:
 - Minimum SDK: 26.
 - Target SDK: 35.
 - Compile SDK: 35.
+- Local project storage currently uses `SharedPreferences`.
+- Prompt generation currently creates a deterministic mixed preview per project.
 - Build command verified:
 
 ```bash

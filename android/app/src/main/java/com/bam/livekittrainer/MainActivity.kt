@@ -107,9 +107,15 @@ class MainActivity : Activity() {
         }
 
         projects.forEach { project ->
+            val promptPreview = PromptGenerator.initialBatch(project)
+                .take(4)
+                .joinToString(separator = "\n") { prompt ->
+                    "${prompt.label.name.lowercase()}: ${prompt.instruction}"
+                }
+
             projectList.addView(
                 TextView(this).apply {
-                    text = "${project.phrase}\n${project.slug}"
+                    text = "${project.phrase}\n${project.slug}\n\n$promptPreview"
                     textSize = 18f
                     setPadding(0, 16, 0, 16)
                 },
