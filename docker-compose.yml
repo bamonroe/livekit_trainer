@@ -1,0 +1,19 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: livekit-trainer-dev:local
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - /data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - livekit-trainer-python-cache:/root/.cache
+    environment:
+      PYTHONUNBUFFERED: "1"
+    tty: true
+    stdin_open: true
+
+volumes:
+  livekit-trainer-python-cache:

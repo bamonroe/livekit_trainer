@@ -233,6 +233,16 @@ Preferred shape:
 Do not assume host packages are available. If a command needs system
 dependencies, add them to the relevant Dockerfile.
 
+Use the project dev container with:
+
+```bash
+docker compose run --rm dev
+```
+
+The dev container bind-mounts this repo at `/workspace`, mounts `/data`, and
+mounts the host Docker socket so it can call shared build tooling such as
+`/data/android/build.sh`.
+
 ## Runtime Notes
 
 The inherited Rust sidecar accepts raw little-endian i16 mono PCM and returns a

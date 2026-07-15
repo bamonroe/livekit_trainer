@@ -70,6 +70,17 @@ class ProjectStore(context: Context) {
         )
     }
 
+    fun promptIndex(projectId: String, promptCount: Int): Int {
+        if (promptCount <= 0) return 0
+        return prefs.getInt(promptIndexKey(projectId), 0).coerceIn(0, promptCount - 1)
+    }
+
+    fun advancePrompt(projectId: String, promptCount: Int) {
+        if (promptCount <= 0) return
+        val next = (promptIndex(projectId, promptCount) + 1) % promptCount
+        prefs.edit().putInt(promptIndexKey(projectId), next).apply()
+    }
+
     private fun saveProjects(projects: List<WakeWordProject>) {
         val array = JSONArray()
         projects.forEach { project ->
@@ -107,6 +118,8 @@ class ProjectStore(context: Context) {
     }
 
     private fun clipsKey(projectId: String): String = "clips_$projectId"
+
+    private fun promptIndexKey(projectId: String): String = "prompt_index_$projectId"
 
     private companion object {
         const val KEY_PROJECTS = "projects"

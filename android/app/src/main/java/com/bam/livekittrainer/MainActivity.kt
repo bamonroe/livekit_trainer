@@ -17,6 +17,7 @@ import java.util.UUID
 class MainActivity : Activity() {
     private lateinit var store: ProjectStore
     private lateinit var recorder: WavRecorder
+    private lateinit var exporter: BundleExporter
     private lateinit var projectList: LinearLayout
     private lateinit var phraseInput: EditText
     private var activeProject: WakeWordProject? = null
@@ -27,6 +28,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         store = ProjectStore(this)
         recorder = WavRecorder(this)
+        exporter = BundleExporter(this)
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
@@ -115,7 +117,8 @@ class MainActivity : Activity() {
 
         projects.forEach { project ->
             val prompts = PromptGenerator.initialBatch(project)
-            val firstPrompt = prompts.first()
+            val promptIndex = store.promptIndex(project.id, prompts.size)
+            val currentPrompt = prompts[promptIndex]
             val clips = store.loadClips(project.id)
             val promptPreview = prompts
                 .take(4)
@@ -134,13 +137,27 @@ class MainActivity : Activity() {
                         },
                     )
                     addView(
+                        TextView(this@MainActivity).apply {
+                            text = "Current prompt ${promptIndex + 1}/${prompts.size}: ${currentPrompt.instruction}"
+                            textSize = 16f
+                            setPadding(0, 8, 0, 8)
+                        },
+                    )
+                    addView(
                         Button(this@MainActivity).apply {
                             text = if (recorder.isRecording && activeProject?.id == project.id) {
                                 "Stop recording"
                             } else {
-                                "Record first prompt"
+                                "Record current prompt"
                             }
-                            setOnClickListener { toggleRecording(project, firstPrompt) }
+                            setOnClickListener { toggleRecording(project, currentPrompt, prompts.size) }
+                        },
+                    )
+                    addView(
+                        Button(this@MainActivity).apply {
+                            text = "Export bundle"
+                            isEnabled = clips.isNotEmpty()
+                            setOnClickListener { exportBundle(project, clips) }
                         },
                     )
                     addClipViews(project, clips)
@@ -189,7 +206,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun toggleRecording(project: WakeWordProject, prompt: RecordingPrompt) {
+    private fun toggleRecording(project: WakeWordProject, prompt: RecordingPrompt, promptCount: Int) {
         if (recorder.isRecording) {
             val result = recorder.stop()
             activeProject = null
@@ -209,6 +226,7 @@ class MainActivity : Activity() {
                     encoding = result.encoding,
                 )
                 store.addClip(clip)
+                store.advancePrompt(project.id, promptCount)
                 statusMessage = "Saved ${result.output.name}"
             }
             renderProjects()
@@ -251,6 +269,13 @@ class MainActivity : Activity() {
         File(clip.filePath).delete()
         store.deleteClip(clip)
         statusMessage = "Deleted clip from ${project.slug}"
+        renderProjects()
+        showStatus()
+    }
+
+    private fun exportBundle(project: WakeWordProject, clips: List<ClipRecord>) {
+        val exportRoot = exporter.exportProject(project, clips)
+        statusMessage = "Exported bundle to ${exportRoot.absolutePath}"
         renderProjects()
         showStatus()
     }

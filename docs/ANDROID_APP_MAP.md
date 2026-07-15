@@ -20,6 +20,8 @@ Current builder facts:
 - JDK: 21.
 - SDKs baked into the image: Android 34 and Android 35.
 - Each app keeps its own Gradle cache at `<project>/.gradle-cache/`.
+- The build script mounts the project parent at `/workspace` and works from
+  `/workspace/<project-dir-name>`.
 
 Build command shape:
 
@@ -68,8 +70,11 @@ Current scaffold:
 - Compile SDK: 35.
 - Local project storage currently uses `SharedPreferences`.
 - Prompt generation currently creates a deterministic mixed preview per project.
+- Prompt recording advances through the generated batch one prompt at a time.
 - Basic recording currently writes 16 kHz mono PCM WAV files into app-private
   storage under `filesDir/clips/<wake_word_slug>/`.
+- Bundle export currently writes unzipped training bundles into app-private
+  storage under `filesDir/exports/<wake_word_slug>_<timestamp>/`.
 - Build command verified:
 
 ```bash
