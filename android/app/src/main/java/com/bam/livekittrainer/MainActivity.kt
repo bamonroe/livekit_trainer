@@ -14,12 +14,15 @@ import java.util.UUID
 
 class MainActivity : Activity() {
     private lateinit var store: ProjectStore
+    private lateinit var recorder: WavRecorder
     private lateinit var projectList: LinearLayout
     private lateinit var phraseInput: EditText
+    private var activeProject: WakeWordProject? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = ProjectStore(this)
+        recorder = WavRecorder(this)
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
@@ -107,18 +110,69 @@ class MainActivity : Activity() {
         }
 
         projects.forEach { project ->
-            val promptPreview = PromptGenerator.initialBatch(project)
+            val prompts = PromptGenerator.initialBatch(project)
+            val firstPrompt = prompts.first()
+            val promptPreview = prompts
                 .take(4)
                 .joinToString(separator = "\n") { prompt ->
                     "${prompt.label.name.lowercase()}: ${prompt.instruction}"
                 }
 
             projectList.addView(
+                LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, 16, 0, 24)
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "${project.phrase}\n${project.slug}\n\n$promptPreview"
+                            textSize = 18f
+                        },
+                    )
+                    addView(
+                        Button(this@MainActivity).apply {
+                            text = if (recorder.isRecording && activeProject?.id == project.id) {
+                                "Stop recording"
+                            } else {
+                                "Record first prompt"
+                            }
+                            setOnClickListener { toggleRecording(project, firstPrompt) }
+                        },
+                    )
+                },
+            )
+        }
+    }
+
+    private fun toggleRecording(project: WakeWordProject, prompt: RecordingPrompt) {
+        if (recorder.isRecording) {
+            val output = recorder.stop()
+            activeProject = null
+            renderProjects()
+            if (output != null) {
+                projectList.addView(
+                    TextView(this).apply {
+                        text = "Saved ${output.name}"
+                        textSize = 16f
+                        setPadding(0, 8, 0, 8)
+                    },
+                    0,
+                )
+            }
+            return
+        }
+
+        try {
+            recorder.start(project, prompt)
+            activeProject = project
+            renderProjects()
+        } catch (error: IllegalStateException) {
+            projectList.addView(
                 TextView(this).apply {
-                    text = "${project.phrase}\n${project.slug}\n\n$promptPreview"
+                    text = error.message ?: "Could not start recording"
                     textSize = 18f
                     setPadding(0, 16, 0, 16)
                 },
+                0,
             )
         }
     }

@@ -68,6 +68,8 @@ Current scaffold:
 - Compile SDK: 35.
 - Local project storage currently uses `SharedPreferences`.
 - Prompt generation currently creates a deterministic mixed preview per project.
+- Basic recording currently writes 16 kHz mono PCM WAV files into app-private
+  storage under `filesDir/clips/<wake_word_slug>/`.
 - Build command verified:
 
 ```bash
