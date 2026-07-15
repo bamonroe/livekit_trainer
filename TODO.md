@@ -10,12 +10,6 @@ discovered. Prefer small, actionable items with clear status.
 - [ ] Add `Dockerfile.dev` for containerized Android and pipeline development.
 - [ ] Add `docker-compose.yml` for the development container and persistent
   caches.
-- [ ] Add import tooling to convert exported sessions into
-  `data/real/<wake_word_slug>/{positive,negative,background}`.
-- [ ] Add config-generation tooling for LiveKit wake-word YAML files.
-- [ ] Add a smoke-test training path using a tiny calibration config.
-- [ ] Define the model artifact source-of-truth policy and export conventions
-  for downstream projects.
 - [ ] Decide Android persistence layer and audio storage strategy.
 
 ## Later
@@ -37,6 +31,12 @@ discovered. Prefer small, actionable items with clear status.
 - [x] Add basic microphone recording flow for prompted clips.
 - [x] Persist clip metadata for recorded prompt clips.
 - [x] Add local clip listing, replay, and delete flow.
+- [x] Add import tooling to convert exported sessions into
+  `data/real/<wake_word_slug>/{positive,negative,background}`.
+- [x] Add config-generation tooling for LiveKit wake-word YAML files.
+- [x] Define the model artifact source-of-truth policy and export conventions
+  for downstream projects.
+- [x] Add a smoke-test training path using a tiny calibration config.
 - [x] Re-examine `/data/android` and update the Android map with the latest
   builder facts.
 - [x] Scaffold the Android app under `android/` with a Gradle wrapper compatible

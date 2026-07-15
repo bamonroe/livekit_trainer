@@ -79,3 +79,14 @@ current trainer.
 
 `configs/bump_cal.yaml` is a short calibration config using the real model
 shape but fewer steps. Use this before expensive full training runs.
+
+## Smoke Test
+
+For a tiny end-to-end pipeline check:
+
+```bash
+trainer/scripts/smoke_train.sh
+```
+
+This uses `configs/smoke.yaml`. It is meant to validate the container and CLI
+path, not to produce a useful wake-word model.

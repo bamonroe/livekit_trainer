@@ -1,0 +1,20 @@
+# Tiny end-to-end trainer smoke test.
+model_name: smoke_test
+target_phrases:
+  - "smoke test"
+
+custom_negative_phrases:
+  - "test smoke"
+  - "ordinary sentence"
+
+data_dir: ./data
+output_dir: ./output
+
+model:
+  model_type: conv_attention
+  model_size: tiny
+
+n_samples: 40
+n_samples_val: 10
+steps: 20
+target_fp_per_hour: 1.0
