@@ -14,6 +14,13 @@ Important files:
 - `/data/android/build.sh` builds Android projects in a disposable container.
 - `/data/android/docker-compose.yml` runs the headless emulator.
 
+Current builder facts:
+
+- Builder image: `android-builder:local`.
+- JDK: 21.
+- SDKs baked into the image: Android 34 and Android 35.
+- Each app keeps its own Gradle cache at `<project>/.gradle-cache/`.
+
 Build command shape:
 
 ```bash
@@ -46,11 +53,30 @@ can build it without host Android tooling.
 Initial stack preference:
 
 - Kotlin.
-- Jetpack Compose for UI.
+- Native Android UI first, with room to move to Jetpack Compose later when the
+  recorder workflow needs richer state handling.
 - Room or another local persistence layer for projects, prompts, sessions, and
   clips.
 - Android-native audio recording APIs.
 - Local-only storage by default.
+
+Current scaffold:
+
+- Package: `com.bam.livekittrainer`.
+- Minimum SDK: 26.
+- Target SDK: 35.
+- Compile SDK: 35.
+- Build command verified:
+
+```bash
+/data/android/build.sh /data/livekit_trainer/android :app:assembleDebug
+```
+
+Verified output:
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
 
 ## First App Features
 
@@ -105,8 +131,7 @@ categories.
 
 ## Open Decisions
 
-- Package name.
-- Minimum Android SDK.
+- Whether to keep native Android views or move to Jetpack Compose.
 - Exact local database schema.
 - Whether to store raw PCM first and encode WAV on export, or write WAV at
   capture time.

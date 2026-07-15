@@ -7,20 +7,21 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] Scaffold the Android app under `android/` with a Gradle wrapper compatible
-  with `/data/android/build.sh`.
 - [ ] Add `Dockerfile.dev` for containerized Android and pipeline development.
 - [ ] Add `docker-compose.yml` for the development container and persistent
   caches.
 - [ ] Define the Android training bundle export format.
+- [ ] Build the first app screen for creating wake-word projects.
+- [ ] Add prompt batch data model and prompt generation rules.
+- [ ] Add microphone recording flow for prompted clips.
+- [ ] Add local clip review, replay, and delete flow.
 - [ ] Add import tooling to convert exported sessions into
   `data/real/<wake_word_slug>/{positive,negative,background}`.
 - [ ] Add config-generation tooling for LiveKit wake-word YAML files.
 - [ ] Add a smoke-test training path using a tiny calibration config.
 - [ ] Define the model artifact source-of-truth policy and export conventions
   for downstream projects.
-- [ ] Decide Android package name, minimum SDK, persistence layer, and audio
-  storage strategy.
+- [ ] Decide Android persistence layer and audio storage strategy.
 
 ## Later
 
@@ -34,6 +35,12 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Done
 
+- [x] Re-examine `/data/android` and update the Android map with the latest
+  builder facts.
+- [x] Scaffold the Android app under `android/` with a Gradle wrapper compatible
+  with `/data/android/build.sh`.
+- [x] Verify the Android scaffold builds with
+  `/data/android/build.sh /data/livekit_trainer/android :app:assembleDebug`.
 - [x] Add repository policy to commit often and push remotes frequently.
 - [x] Initialize `/data/livekit_trainer` as a Git repository on branch `main`.
 - [x] Add `docs/ANDROID_APP_MAP.md` referencing the `/data/android` build and
