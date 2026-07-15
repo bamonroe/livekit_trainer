@@ -10,7 +10,6 @@ discovered. Prefer small, actionable items with clear status.
 - [ ] Add `Dockerfile.dev` for containerized Android and pipeline development.
 - [ ] Add `docker-compose.yml` for the development container and persistent
   caches.
-- [ ] Build the first app screen for creating wake-word projects.
 - [ ] Add prompt batch data model and prompt generation rules.
 - [ ] Add microphone recording flow for prompted clips.
 - [ ] Add local clip review, replay, and delete flow.
@@ -36,6 +35,7 @@ discovered. Prefer small, actionable items with clear status.
 
 - [x] Define the initial Android training bundle export format in
   `docs/TRAINING_BUNDLE_FORMAT.md`.
+- [x] Build the first app screen for creating wake-word projects.
 - [x] Re-examine `/data/android` and update the Android map with the latest
   builder facts.
 - [x] Scaffold the Android app under `android/` with a Gradle wrapper compatible
