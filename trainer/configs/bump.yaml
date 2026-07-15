@@ -1,0 +1,31 @@
+# "bump bump" seed wake-word config copied from the previous trainer setup.
+# Doubled monosyllable: distinctive rhythm, easy to say. Variants cover
+# soft pronunciations where the b/p consonant drops.
+model_name: bump_bump
+target_phrases:      # all of these SHOULD fire (soft-speech variants)
+  - "bump bump"
+  - "bum bum"
+  - "ump ump"
+
+# Guard: lone single syllables must NOT wake, real neighbors doubled up,
+# and the end token family so the two don't cross-trigger.
+custom_negative_phrases:
+  - "bump"
+  - "bum"
+  - "ump"
+  - "jump jump"
+  - "thump thump"
+  - "beep beep"
+  - "bee bee"
+
+data_dir: ./data
+output_dir: ./output
+
+model:
+  model_type: conv_attention
+  model_size: medium
+
+n_samples: 20000
+n_samples_val: 4000
+steps: 50000
+target_fp_per_hour: 0.2

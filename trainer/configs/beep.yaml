@@ -1,0 +1,32 @@
+# "beep beep" seed wake-word config copied from the previous trainer setup.
+# Doubled monosyllable, mirror of the bump start token. Variants cover
+# soft pronunciations where the b/p consonant drops.
+model_name: beep_beep
+target_phrases:      # all of these SHOULD fire (soft-speech variants)
+  - "beep beep"
+  - "bee bee"
+  - "eep eep"
+
+# Guard: lone single syllables must NOT end the turn, real neighbors
+# doubled up, and the start token family so the two don't cross-trigger.
+custom_negative_phrases:
+  - "beep"
+  - "bee"
+  - "eep"
+  - "keep keep"
+  - "peep peep"
+  - "deep deep"
+  - "bump bump"
+  - "bum bum"
+
+data_dir: ./data
+output_dir: ./output
+
+model:
+  model_type: conv_attention
+  model_size: medium
+
+n_samples: 20000
+n_samples_val: 4000
+steps: 50000
+target_fp_per_hour: 0.2

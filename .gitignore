@@ -1,0 +1,26 @@
+# Android and Gradle
+android/.gradle/
+android/build/
+android/**/build/
+android/local.properties
+
+# Training data and generated artifacts
+data/
+output/
+*.wav
+*.flac
+*.mp3
+*.npy
+*.onnx
+*.pt
+
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Local/editor state
+.DS_Store
+*.log

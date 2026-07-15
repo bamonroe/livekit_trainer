@@ -1,0 +1,30 @@
+# Wake-word trainer for livekit_trainer.
+# PyTorch CUDA base ships a matching Python + torch/CUDA, avoiding the
+# numba/llvmlite Python-version conflict that bit the bare-metal install.
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
+
+# Speech-synthesis + audio system deps required by the training pipeline.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        espeak-ng \
+        sox \
+        ffmpeg \
+        libsndfile1 \
+        portaudio19-dev \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# The LiveKit wake-word trainer CLI (data-gen + train + eval + ONNX export).
+RUN pip install --no-cache-dir "livekit-wakeword[train,eval,export]"
+
+# Our patch: fan per-clip augmentation across CPU cores (upstream is single
+# threaded). Applied over the installed package (strip a/src/ -> livekit/...).
+COPY patches/0001-parallel-augmentation.patch /tmp/0001-parallel-augmentation.patch
+RUN sp=$(python -c "import livekit, os; print(os.path.dirname(os.path.dirname(livekit.__file__)))") \
+    && patch -p2 -d "$sp" < /tmp/0001-parallel-augmentation.patch
+
+WORKDIR /work
+# configs/, data/ (downloaded corpora), and output/ (trained .onnx) are
+# bind-mounted at runtime so artifacts persist on the host.
+CMD ["bash"]

@@ -1,0 +1,29 @@
+# Calibration run: real bump_bump architecture + full data pipeline, but only
+# 4000 training steps — to benchmark generation/augment/feature time and the
+# per-step training rate on conv_attention/medium, then extrapolate the full 50000.
+model_name: bump_cal
+target_phrases:
+  - "bump bump"
+  - "bum bum"
+  - "ump ump"
+
+custom_negative_phrases:
+  - "bump"
+  - "bum"
+  - "ump"
+  - "jump jump"
+  - "thump thump"
+  - "beep beep"
+  - "bee bee"
+
+data_dir: ./data
+output_dir: ./output
+
+model:
+  model_type: conv_attention
+  model_size: medium
+
+n_samples: 20000
+n_samples_val: 4000
+steps: 4000
+target_fp_per_hour: 0.2
