@@ -7,6 +7,7 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [ ] Check trainer smoke job `1784158450_2056621_1ea2` and fix any failures.
 - [ ] Decide Android persistence layer and audio storage strategy.
 
 ## Later
