@@ -34,16 +34,30 @@ class WavRecorder(private val context: Context) {
             writeRecording(output, running)
         }
 
-        active = ActiveRecording(output = output, running = running, worker = worker, prompt = prompt)
+        active = ActiveRecording(
+            output = output,
+            running = running,
+            worker = worker,
+            prompt = prompt,
+            startedAtMillis = System.currentTimeMillis(),
+        )
         return output
     }
 
-    fun stop(): File? {
+    fun stop(): RecordingResult? {
         val recording = active ?: return null
         recording.running.set(false)
         recording.worker.join()
         active = null
-        return recording.output
+        return RecordingResult(
+            output = recording.output,
+            prompt = recording.prompt,
+            recordedAtMillis = recording.startedAtMillis,
+            durationMs = System.currentTimeMillis() - recording.startedAtMillis,
+            sampleRateHz = SAMPLE_RATE,
+            channels = CHANNELS,
+            encoding = ENCODING,
+        )
     }
 
     private fun clipFile(project: WakeWordProject): File {
@@ -126,11 +140,23 @@ class WavRecorder(private val context: Context) {
         val running: AtomicBoolean,
         val worker: Thread,
         val prompt: RecordingPrompt,
+        val startedAtMillis: Long,
+    )
+
+    data class RecordingResult(
+        val output: File,
+        val prompt: RecordingPrompt,
+        val recordedAtMillis: Long,
+        val durationMs: Long,
+        val sampleRateHz: Int,
+        val channels: Int,
+        val encoding: String,
     )
 
     private companion object {
         const val SAMPLE_RATE = 16_000
         const val CHANNELS = 1
         const val BYTES_PER_SAMPLE = 2
+        const val ENCODING = "pcm_s16le"
     }
 }

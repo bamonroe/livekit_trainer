@@ -10,8 +10,6 @@ discovered. Prefer small, actionable items with clear status.
 - [ ] Add `Dockerfile.dev` for containerized Android and pipeline development.
 - [ ] Add `docker-compose.yml` for the development container and persistent
   caches.
-- [ ] Add local clip review, replay, and delete flow.
-- [ ] Persist clip metadata for recorded prompt clips.
 - [ ] Add import tooling to convert exported sessions into
   `data/real/<wake_word_slug>/{positive,negative,background}`.
 - [ ] Add config-generation tooling for LiveKit wake-word YAML files.
@@ -37,6 +35,8 @@ discovered. Prefer small, actionable items with clear status.
 - [x] Build the first app screen for creating wake-word projects.
 - [x] Add prompt batch data model and prompt generation rules.
 - [x] Add basic microphone recording flow for prompted clips.
+- [x] Persist clip metadata for recorded prompt clips.
+- [x] Add local clip listing, replay, and delete flow.
 - [x] Re-examine `/data/android` and update the Android map with the latest
   builder facts.
 - [x] Scaffold the Android app under `android/` with a Gradle wrapper compatible
