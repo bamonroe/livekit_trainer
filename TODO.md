@@ -33,6 +33,8 @@ No active items. Pick the next item from Later when starting new work.
 - [x] Persist clip metadata for recorded prompt clips.
 - [x] Add local clip listing, replay, and delete flow.
 - [x] Add prompt-by-prompt advancement after each saved recording.
+- [x] Add a cleaner Android collection UI with project sidebar navigation and
+  direct prompt picking.
 - [x] Add Android bundle export from recorded clip metadata.
 - [x] Add Dockerized Rust app-to-repo server sync for Android training bundles.
 - [x] Investigate local Docker builder hangs and verify `docker compose build

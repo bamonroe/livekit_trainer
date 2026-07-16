@@ -72,8 +72,11 @@ Current scaffold:
   `wake_word_collection.db`.
 - The SQLite store includes a one-time migration from the original
   `SharedPreferences` metadata format.
-- Prompt generation currently creates a deterministic mixed preview per project.
-- Prompt recording advances through the generated batch one prompt at a time.
+- Prompt generation creates a deterministic mixed batch per project.
+- The UI now shows a project sidebar and a focused workspace for the selected
+  wake word.
+- Prompt recording supports direct prompt picking, previous, and skip controls
+  so the user is not forced to restart or follow the generated order exactly.
 - Basic recording currently writes 16 kHz mono PCM WAV files into app-private
   storage under `filesDir/clips/<wake_word_slug>/`.
 - Bundle export currently writes unzipped training bundles into app-private
@@ -94,7 +97,8 @@ android/app/build/outputs/apk/debug/app-debug.apk
 
 1. Create a wake-word project with a phrase and slug.
 2. Generate a randomized prompt batch.
-3. Record prompted clips.
+3. Pick any prompt from the batch and record clips in the order that makes
+   sense during collection.
 4. Label clips as `positive`, `negative`, `hard_negative`, `background`,
    `false_positive`, or `false_negative`.
 5. Review, replay, and delete clips.

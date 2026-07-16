@@ -99,12 +99,16 @@ class ProjectStore(context: Context) {
     fun advancePrompt(projectId: String, promptCount: Int) {
         if (promptCount <= 0) return
         val next = (promptIndex(projectId, promptCount) + 1) % promptCount
+        setPromptIndex(projectId, next)
+    }
+
+    fun setPromptIndex(projectId: String, promptIndex: Int) {
         dbHelper.writableDatabase.insertWithOnConflict(
             TABLE_PROMPT_STATE,
             null,
             ContentValues().apply {
                 put("project_id", projectId)
-                put("prompt_index", next)
+                put("prompt_index", promptIndex.coerceAtLeast(0))
             },
             SQLiteDatabase.CONFLICT_REPLACE,
         )
