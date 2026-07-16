@@ -7,7 +7,7 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] Check trainer smoke job `1784158450_2056621_1ea2` and fix any failures.
+- [ ] Rerun trainer smoke job after Dockerfile patch-location fix.
 - [ ] Decide Android persistence layer and audio storage strategy.
 
 ## Later
@@ -39,6 +39,8 @@ discovered. Prefer small, actionable items with clear status.
 - [x] Define the model artifact source-of-truth policy and export conventions
   for downstream projects.
 - [x] Add a smoke-test training path using a tiny calibration config.
+- [x] Fix trainer Dockerfile package-path lookup for namespace-package
+  `livekit`.
 - [x] Add `Dockerfile.dev` for containerized Android and pipeline development.
 - [x] Add `docker-compose.yml` for the development container and persistent
   caches.

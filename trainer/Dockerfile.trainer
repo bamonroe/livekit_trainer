@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir "livekit-wakeword[train,eval,export]"
 # Our patch: fan per-clip augmentation across CPU cores (upstream is single
 # threaded). Applied over the installed package (strip a/src/ -> livekit/...).
 COPY patches/0001-parallel-augmentation.patch /tmp/0001-parallel-augmentation.patch
-RUN sp=$(python -c "import livekit, os; print(os.path.dirname(os.path.dirname(livekit.__file__)))") \
+RUN sp=$(python -c "import livekit.wakeword, pathlib; print(pathlib.Path(livekit.wakeword.__file__).resolve().parents[2])") \
     && patch -p2 -d "$sp" < /tmp/0001-parallel-augmentation.patch
 
 WORKDIR /work
