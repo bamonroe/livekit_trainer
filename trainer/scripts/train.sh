@@ -22,4 +22,4 @@ docker build -f "$repo_root/trainer/Dockerfile.trainer" -t "$image" "$repo_root/
 docker run --rm "${gpu_args[@]}" \
   -v "$repo_root:/work" \
   "$image" \
-  bash -lc "livekit-wakeword setup -c '$config' && livekit-wakeword run -c '$config'"
+  bash -lc "livekit-wakeword setup -c '$config' && livekit-wakeword run '$config'"
