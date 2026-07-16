@@ -57,8 +57,8 @@ Initial stack preference:
 - Kotlin.
 - Native Android UI first, with room to move to Jetpack Compose later when the
   recorder workflow needs richer state handling.
-- Room or another local persistence layer for projects, prompts, sessions, and
-  clips.
+- SQLite-backed local persistence for projects, prompt state, sessions, and
+  clips. Room can be introduced later if query complexity starts to justify it.
 - Android-native audio recording APIs.
 - Local-only storage by default.
 
@@ -68,7 +68,10 @@ Current scaffold:
 - Minimum SDK: 26.
 - Target SDK: 35.
 - Compile SDK: 35.
-- Local project storage currently uses `SharedPreferences`.
+- Local project and clip metadata uses an app-private SQLite database at
+  `wake_word_collection.db`.
+- The SQLite store includes a one-time migration from the original
+  `SharedPreferences` metadata format.
 - Prompt generation currently creates a deterministic mixed preview per project.
 - Prompt recording advances through the generated batch one prompt at a time.
 - Basic recording currently writes 16 kHz mono PCM WAV files into app-private
@@ -143,8 +146,9 @@ categories.
 ## Open Decisions
 
 - Whether to keep native Android views or move to Jetpack Compose.
-- Exact local database schema.
-- Whether to store raw PCM first and encode WAV on export, or write WAV at
-  capture time.
+- Whether to add Room once prompt sessions, correction batches, and review
+  filters need richer queries.
+- Whether to keep writing WAV at capture time long term or store raw PCM first
+  and encode WAV on export.
 - How to transfer bundles from phone to this repo: USB pull, Android share
   sheet, local network upload, or manual file copy.

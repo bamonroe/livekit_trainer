@@ -7,11 +7,13 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] Decide Android persistence layer and audio storage strategy.
+No active items. Pick the next item from Later when starting new work.
 
 ## Later
 
 - [ ] Add optional runtime scorer service or test harness under `runtime/`.
+- [ ] Add emulator or instrumentation coverage for SQLite metadata migration
+  and app-private WAV file retention.
 - [ ] Add evaluation tooling that creates follow-up false-positive and
   false-negative collection batches.
 - [ ] Add dataset summary reports by wake word, label, phrase, session, and
@@ -30,6 +32,8 @@ discovered. Prefer small, actionable items with clear status.
 - [x] Add local clip listing, replay, and delete flow.
 - [x] Add prompt-by-prompt advancement after each saved recording.
 - [x] Add Android bundle export from recorded clip metadata.
+- [x] Decide Android persistence and storage strategy: SQLite metadata with
+  app-private WAV files written at capture time.
 - [x] Add audio validation for duration, silence, clipping, and WAV format.
 - [x] Add sample bundle tests for `scripts/import_bundle.py`.
 - [x] Add import tooling to convert exported sessions into
