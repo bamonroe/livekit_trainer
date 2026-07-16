@@ -29,6 +29,8 @@ No active items. Pick the next item from Later when starting new work.
   `docs/TRAINING_BUNDLE_FORMAT.md`.
 - [x] Build the first app screen for creating wake-word projects.
 - [x] Add prompt batch data model and prompt generation rules.
+- [x] Improve hard-negative prompt generation with pronounceable sound-alike
+  phrase variants.
 - [x] Add basic microphone recording flow for prompted clips.
 - [x] Persist clip metadata for recorded prompt clips.
 - [x] Add local clip listing, replay, and delete flow.

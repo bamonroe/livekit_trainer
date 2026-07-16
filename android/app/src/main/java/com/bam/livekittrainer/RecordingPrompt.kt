@@ -72,16 +72,69 @@ object PromptGenerator {
     }
 
     private fun hardNegativeCandidates(phrase: String): List<String> {
-        val words = phrase.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        val words = phrase.trim().lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
         val variants = mutableListOf<String>()
+
         if (words.isNotEmpty()) {
+            if (words.size == 1) {
+                variants.addAll(soundAlikes(words.first()))
+                variants.add("${words.first()} now")
+            } else {
+                variants.add(words.joinToString(" ") { word -> soundAlikes(word).firstOrNull() ?: word })
+                words.forEachIndexed { index, word ->
+                    soundAlikes(word).take(2).forEach { replacement ->
+                        variants.add(words.replaceAt(index, replacement).joinToString(" "))
+                    }
+                }
+                variants.add(words.first())
+                variants.add(words.last())
+            }
+
+            if (words.size == 2 && words[0] == words[1]) {
+                val word = words.first()
+                variants.add("$word ${soundAlikes(word).firstOrNull() ?: "now"}")
+                variants.add("${soundAlikes(word).firstOrNull() ?: "now"} $word")
+                variants.add("$word $word $word")
+            }
+
             variants.add(words.drop(1).joinToString(" ").ifBlank { words.first() })
-            variants.add(words.joinToString(" ") { word -> word.drop(1).ifBlank { word } })
-            variants.add(words.joinToString(" ") { word -> "${word.first()}${word}" })
+            variants.add(words.dropLast(1).joinToString(" ").ifBlank { words.first() })
+            variants.add("$phrase now")
+            variants.add("not $phrase")
+            variants.add("$phrase please")
         }
-        variants.add("$phrase now")
-        variants.add("not $phrase")
-        return variants.map { it.trim() }.filter { it.isNotBlank() && it != phrase }.distinct()
+
+        return variants
+            .map { it.trim().replace(Regex("\\s+"), " ") }
+            .filter { it.isNotBlank() && it != phrase.lowercase() }
+            .distinct()
+    }
+
+    private fun List<String>.replaceAt(index: Int, value: String): List<String> {
+        return mapIndexed { itemIndex, item -> if (itemIndex == index) value else item }
+    }
+
+    private fun soundAlikes(word: String): List<String> {
+        val known = mapOf(
+            "beep" to listOf("peep", "deep", "bleep", "boop"),
+            "boop" to listOf("beep", "loop", "scoop"),
+            "hey" to listOf("hi", "okay", "hey there"),
+            "hello" to listOf("yellow", "hollow", "hello there"),
+            "buddy" to listOf("body", "bunny", "muddy"),
+            "computer" to listOf("commuter", "calculator", "compute"),
+            "assistant" to listOf("assistance", "resistant", "assistant now"),
+            "bump" to listOf("pump", "dump", "bumped"),
+            "wake" to listOf("wait", "bake", "awake"),
+            "word" to listOf("world", "work", "words"),
+        )
+        known[word]?.let { return it }
+
+        return when {
+            word.endsWith("ing") && word.length > 5 -> listOf(word.removeSuffix("ing"), "$word now")
+            word.endsWith("er") && word.length > 4 -> listOf(word.removeSuffix("er"), "${word} now")
+            word.length <= 3 -> listOf("$word now", "not $word")
+            else -> listOf("$word now", "not $word", "$word please")
+        }
     }
 
     private fun stableRandom(seed: String): kotlin.random.Random {
