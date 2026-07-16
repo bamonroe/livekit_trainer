@@ -7,7 +7,6 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] Check trainer smoke job `1784196277_3287142_4aad`.
 - [ ] Decide Android persistence layer and audio storage strategy.
 
 ## Later
@@ -39,6 +38,8 @@ discovered. Prefer small, actionable items with clear status.
 - [x] Define the model artifact source-of-truth policy and export conventions
   for downstream projects.
 - [x] Add a smoke-test training path using a tiny calibration config.
+- [x] Verify trainer smoke job `1784196277_3287142_4aad` completes the full
+  generate, augment, feature, train, export, and eval pipeline.
 - [x] Fix trainer Dockerfile package-path lookup for namespace-package
   `livekit`.
 - [x] Add `Dockerfile.dev` for containerized Android and pipeline development.
