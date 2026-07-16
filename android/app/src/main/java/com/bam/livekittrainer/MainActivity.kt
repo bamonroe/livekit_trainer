@@ -2,6 +2,7 @@ package com.bam.livekittrainer
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.pm.PackageManager
 import android.media.MediaPlayer
 import android.os.Bundle
@@ -20,6 +21,7 @@ class MainActivity : Activity() {
     private lateinit var exporter: BundleExporter
     private lateinit var projectList: LinearLayout
     private lateinit var phraseInput: EditText
+    private lateinit var serverUrlInput: EditText
     private var activeProject: WakeWordProject? = null
     private var player: MediaPlayer? = null
     private var statusMessage: String = ""
@@ -62,6 +64,15 @@ class MainActivity : Activity() {
             setOnClickListener { createProject() }
         }
 
+        val syncPrefs = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+        serverUrlInput = EditText(this).apply {
+            hint = "Sync server URL"
+            setSingleLine()
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 16f
+            setText(syncPrefs.getString(KEY_SYNC_SERVER_URL, DEFAULT_SYNC_SERVER_URL))
+        }
+
         val listTitle = TextView(this).apply {
             text = "Projects"
             textSize = 22f
@@ -76,6 +87,7 @@ class MainActivity : Activity() {
         root.addView(subtitle)
         root.addView(phraseInput)
         root.addView(createButton)
+        root.addView(serverUrlInput)
         root.addView(listTitle)
         root.addView(projectList)
 
@@ -158,6 +170,13 @@ class MainActivity : Activity() {
                             text = "Export bundle"
                             isEnabled = clips.isNotEmpty()
                             setOnClickListener { exportBundle(project, clips) }
+                        },
+                    )
+                    addView(
+                        Button(this@MainActivity).apply {
+                            text = "Sync with server"
+                            isEnabled = clips.isNotEmpty()
+                            setOnClickListener { syncBundle(project, clips) }
                         },
                     )
                     addClipViews(project, clips)
@@ -280,6 +299,40 @@ class MainActivity : Activity() {
         showStatus()
     }
 
+    private fun syncBundle(project: WakeWordProject, clips: List<ClipRecord>) {
+        val serverUrl = serverUrlInput.text.toString().trim()
+        if (serverUrl.isBlank()) {
+            serverUrlInput.error = "Server URL required"
+            return
+        }
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_SYNC_SERVER_URL, serverUrl)
+            .apply()
+
+        statusMessage = "Syncing ${clips.size} clips for ${project.slug}"
+        renderProjects()
+        showStatus()
+
+        Thread {
+            try {
+                val zip = exporter.exportProjectZip(project, clips)
+                val response = BundleSyncClient(serverUrl).upload(zip)
+                runOnUiThread {
+                    statusMessage = "Synced ${project.slug}: $response"
+                    renderProjects()
+                    showStatus()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    statusMessage = error.message ?: "Sync failed"
+                    renderProjects()
+                    showStatus()
+                }
+            }
+        }.start()
+    }
+
     private fun showStatus() {
         if (statusMessage.isBlank()) return
         projectList.addView(
@@ -303,5 +356,8 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQUEST_RECORD_AUDIO = 100
+        const val SYNC_PREFS = "sync"
+        const val KEY_SYNC_SERVER_URL = "server_url"
+        const val DEFAULT_SYNC_SERVER_URL = "http://100.64.0.2:8765"
     }
 }

@@ -5,7 +5,11 @@ import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.time.Instant
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class BundleExporter(private val context: Context) {
     fun exportProject(project: WakeWordProject, clips: List<ClipRecord>): File {
@@ -30,6 +34,14 @@ class BundleExporter(private val context: Context) {
             Charsets.UTF_8,
         )
         return exportRoot
+    }
+
+    fun exportProjectZip(project: WakeWordProject, clips: List<ClipRecord>): File {
+        val exportRoot = exportProject(project, clips)
+        val syncDir = File(context.cacheDir, "sync").apply { mkdirs() }
+        val zip = File(syncDir, "${exportRoot.name}.zip")
+        zipDirectory(exportRoot, zip)
+        return zip
     }
 
     private fun manifest(project: WakeWordProject, clips: JSONArray): JSONObject {
@@ -84,5 +96,20 @@ class BundleExporter(private val context: Context) {
             .put("encoding", encoding)
             .put("session_id", "initial")
             .put("notes", "")
+    }
+
+    private fun zipDirectory(sourceDir: File, output: File) {
+        ZipOutputStream(FileOutputStream(output)).use { zip ->
+            sourceDir.walkTopDown()
+                .filter { it.isFile }
+                .forEach { file ->
+                    val relative = sourceDir.toPath().relativize(file.toPath()).toString()
+                    zip.putNextEntry(ZipEntry(relative))
+                    FileInputStream(file).use { input ->
+                        input.copyTo(zip)
+                    }
+                    zip.closeEntry()
+                }
+        }
     }
 }

@@ -8,6 +8,7 @@ android/local.properties
 # Training data and generated artifacts
 data/
 output/
+incoming/
 *.wav
 *.flac
 *.mp3

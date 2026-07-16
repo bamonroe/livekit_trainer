@@ -32,6 +32,11 @@ def main() -> int:
         default=Path("data/real"),
         help="Destination real-data root, default: data/real",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Do not rewrite clip files or metadata records that already exist",
+    )
     args = parser.parse_args()
 
     bundle = args.bundle.resolve()
@@ -57,6 +62,8 @@ def main() -> int:
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest_name = f"{clip['id']}_{safe_filename(clip.get('spoken_phrase') or label)}.wav"
             dest = dest_dir / dest_name
+            if args.skip_existing and dest.exists():
+                continue
             shutil.copy2(src, dest)
 
             record = {

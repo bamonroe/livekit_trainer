@@ -134,6 +134,25 @@ data/real/<wake_word_slug>/
 Richer labels should remain in metadata even when mapped to the current trainer
 categories.
 
+## Server Sync
+
+The app can upload a zipped bundle directly to the repo-side sync receiver.
+Start it from the repo root:
+
+```bash
+scripts/sync_server.py --host 0.0.0.0 --port 8765
+```
+
+On this machine the default app URL is:
+
+```text
+http://100.64.0.2:8765
+```
+
+`POST /sync` stores the raw upload under `incoming/bundles/`, validates the
+bundle, and imports clips into `data/real/<wake_word_slug>/`. Repeated syncs are
+idempotent for already-imported clip files.
+
 ## Build And Test Loop
 
 1. Build with `/data/android/build.sh /data/livekit_trainer/android`.
@@ -150,5 +169,5 @@ categories.
   filters need richer queries.
 - Whether to keep writing WAV at capture time long term or store raw PCM first
   and encode WAV on export.
-- How to transfer bundles from phone to this repo: USB pull, Android share
-  sheet, local network upload, or manual file copy.
+- Whether synced clips should be pruned from app-private storage after the
+  server acknowledges import.

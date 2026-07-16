@@ -12,6 +12,8 @@ No active items. Pick the next item from Later when starting new work.
 ## Later
 
 - [ ] Add optional runtime scorer service or test harness under `runtime/`.
+- [ ] Add a post-sync cleanup policy for app-private clips after server import
+  is acknowledged.
 - [ ] Add emulator or instrumentation coverage for SQLite metadata migration
   and app-private WAV file retention.
 - [ ] Add evaluation tooling that creates follow-up false-positive and
@@ -32,6 +34,7 @@ No active items. Pick the next item from Later when starting new work.
 - [x] Add local clip listing, replay, and delete flow.
 - [x] Add prompt-by-prompt advancement after each saved recording.
 - [x] Add Android bundle export from recorded clip metadata.
+- [x] Add app-to-repo server sync for Android training bundles.
 - [x] Decide Android persistence and storage strategy: SQLite metadata with
   app-private WAV files written at capture time.
 - [x] Add audio validation for duration, silence, clipping, and WAV format.
