@@ -61,6 +61,9 @@ Useful existing work lives in sibling repos:
   - Read `/data/android/README.md` and `/data/android/BUILD-ENV-PLAN.md` before
     building or testing the Android app.
   - Build app projects with `/data/android/build.sh <project-dir> [gradle-task]`.
+  - When Android changes pass the build and any emulator checks requested for
+    the change, install the resulting debug APK onto the connected phone and
+    tablet when both are available.
 
 Do not make this repo depend on the claude spawner application. Copy or adapt
 only the generic wake-word pieces that belong here.
