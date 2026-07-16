@@ -7,7 +7,7 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] Rerun trainer smoke job after Dockerfile patch-location fix.
+- [ ] Check trainer smoke job `1784167204_2407267_f6f8`.
 - [ ] Decide Android persistence layer and audio storage strategy.
 
 ## Later
