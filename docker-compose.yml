@@ -15,5 +15,20 @@ services:
     tty: true
     stdin_open: true
 
+  sync-server:
+    build:
+      context: ./runtime/sync-server
+      dockerfile: Dockerfile
+    image: livekit-trainer-sync-server:local
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/data
+      - ./incoming:/incoming
+    environment:
+      BIND_ADDR: "0.0.0.0:8765"
+      DATA_ROOT: "/data/real"
+      INCOMING_ROOT: "/incoming/bundles"
+
 volumes:
   livekit-trainer-python-cache:

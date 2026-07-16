@@ -136,11 +136,11 @@ categories.
 
 ## Server Sync
 
-The app can upload a zipped bundle directly to the repo-side sync receiver.
-Start it from the repo root:
+The app can upload a zipped bundle directly to the repo-side Rust sync server.
+Start it from the repo root with Docker Compose:
 
 ```bash
-scripts/sync_server.py --host 0.0.0.0 --port 8765
+docker compose up -d --build sync-server
 ```
 
 On this machine the default app URL is:
@@ -149,9 +149,10 @@ On this machine the default app URL is:
 http://100.64.0.2:8765
 ```
 
-`POST /sync` stores the raw upload under `incoming/bundles/`, validates the
-bundle, and imports clips into `data/real/<wake_word_slug>/`. Repeated syncs are
-idempotent for already-imported clip files.
+The container exposes `POST /sync` on port `8765`, stores the raw upload under
+`incoming/bundles/`, validates the bundle, and imports clips into
+`data/real/<wake_word_slug>/`. Repeated syncs are idempotent for already-imported
+clip files.
 
 ## Build And Test Loop
 

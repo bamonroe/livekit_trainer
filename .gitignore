@@ -23,6 +23,10 @@ __pycache__/
 .ruff_cache/
 .venv/
 
+# Rust
+target/
+runtime/**/target/
+
 # Local/editor state
 .DS_Store
 *.log
