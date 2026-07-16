@@ -28,6 +28,9 @@ class MainActivity : Activity() {
     private lateinit var workspace: LinearLayout
     private lateinit var phraseInput: EditText
     private lateinit var serverUrlInput: EditText
+    private var drawerOpen: Boolean = false
+    private var settingsOpen: Boolean = false
+    private var darkMode: Boolean = false
     private var selectedProjectId: String? = null
     private var activeProject: WakeWordProject? = null
     private var player: MediaPlayer? = null
@@ -38,6 +41,8 @@ class MainActivity : Activity() {
         store = ProjectStore(this)
         recorder = WavRecorder(this)
         exporter = BundleExporter(this)
+        darkMode = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_DARK_MODE, false)
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
@@ -45,13 +50,13 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(SURFACE)
+            setBackgroundColor(surfaceColor())
         }
 
         sidebar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(18), dp(14), dp(18))
-            setBackgroundColor(SIDEBAR)
+            setBackgroundColor(sidebarColor())
             layoutParams = LinearLayout.LayoutParams(dp(156), LinearLayout.LayoutParams.MATCH_PARENT)
         }
 
@@ -75,13 +80,16 @@ class MainActivity : Activity() {
             selectedProjectId = projects.firstOrNull()?.id
         }
         renderSidebar(projects)
+        sidebar.visibility = if (drawerOpen) View.VISIBLE else View.GONE
+        sidebar.setBackgroundColor(sidebarColor())
+        workspace.rootView.setBackgroundColor(surfaceColor())
         renderWorkspace(projects.firstOrNull { it.id == selectedProjectId })
     }
 
     private fun renderSidebar(projects: List<WakeWordProject>) {
         sidebar.removeAllViews()
-        sidebar.addView(text("Projects", 22f, TEXT, Typeface.BOLD))
-        sidebar.addView(text("${projects.size} wake words", 13f, MUTED).withBottom(dp(14)))
+        sidebar.addView(text("Projects", 22f, textColor(), Typeface.BOLD))
+        sidebar.addView(text("${projects.size} wake words", 13f, mutedColor()).withBottom(dp(14)))
 
         projects.forEach { project ->
             val clips = store.loadClips(project.id)
@@ -91,10 +99,11 @@ class MainActivity : Activity() {
                     textSize = 13f
                     gravity = Gravity.CENTER_VERTICAL
                     isAllCaps = false
-                    setTextColor(if (project.id == selectedProjectId) Color.WHITE else TEXT)
-                    background = rounded(if (project.id == selectedProjectId) ACCENT else Color.WHITE, dp(8), 0)
+                    setTextColor(if (project.id == selectedProjectId) Color.WHITE else textColor())
+                    background = rounded(if (project.id == selectedProjectId) ACCENT else cardColor(), dp(8), 0)
                     setOnClickListener {
                         selectedProjectId = project.id
+                        drawerOpen = false
                         render()
                     }
                 }.withBottom(dp(8)),
@@ -104,8 +113,11 @@ class MainActivity : Activity() {
 
     private fun renderWorkspace(project: WakeWordProject?) {
         workspace.removeAllViews()
-        workspace.addView(text("Wake Word Trainer", 28f, TEXT, Typeface.BOLD))
-        workspace.addView(text("Collect, review, and sync training clips.", 16f, MUTED).withBottom(dp(18)))
+        workspace.addView(topBar())
+        if (settingsOpen) {
+            workspace.addView(settingsCard().withBottom(dp(14)))
+        }
+        workspace.addView(text("Collect, review, and sync training clips.", 16f, mutedColor()).withBottom(dp(18)))
         workspace.addView(createProjectCard())
 
         if (project == null) {
@@ -128,24 +140,55 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun topBar(): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(12))
+            addView(
+                Button(this@MainActivity).apply {
+                    text = "☰"
+                    textSize = 22f
+                    isAllCaps = false
+                    setOnClickListener {
+                        drawerOpen = !drawerOpen
+                        render()
+                    }
+                },
+            )
+            addView(
+                text("Wake Word Trainer", 26f, textColor(), Typeface.BOLD).apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                        leftMargin = dp(10)
+                    }
+                },
+            )
+            addView(
+                Button(this@MainActivity).apply {
+                    text = "⚙"
+                    textSize = 22f
+                    isAllCaps = false
+                    setOnClickListener {
+                        settingsOpen = !settingsOpen
+                        render()
+                    }
+                },
+            )
+        }
+    }
+
     private fun createProjectCard(): View {
-        val syncPrefs = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
         phraseInput = EditText(this).apply {
             hint = "New wake phrase"
             setSingleLine()
             imeOptions = EditorInfo.IME_ACTION_DONE
             textSize = 16f
-        }
-        serverUrlInput = EditText(this).apply {
-            hint = "Sync server URL"
-            setSingleLine()
-            imeOptions = EditorInfo.IME_ACTION_DONE
-            textSize = 14f
-            setText(syncPrefs.getString(KEY_SYNC_SERVER_URL, DEFAULT_SYNC_SERVER_URL))
+            styleInput()
         }
 
         return card().apply {
-            addView(text("New project", 18f, TEXT, Typeface.BOLD))
+            addView(text("New project", 18f, textColor(), Typeface.BOLD))
             addView(phraseInput)
             addView(
                 Button(this@MainActivity).apply {
@@ -154,20 +197,49 @@ class MainActivity : Activity() {
                     setOnClickListener { createProject() }
                 },
             )
-            addView(serverUrlInput.withTop(dp(8)))
+        }
+    }
+
+    private fun settingsCard(): View {
+        val syncPrefs = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+        serverUrlInput = EditText(this).apply {
+            hint = "Sync server URL"
+            setSingleLine()
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(syncPrefs.getString(KEY_SYNC_SERVER_URL, DEFAULT_SYNC_SERVER_URL))
+            styleInput()
+        }
+
+        return card().apply {
+            addView(text("Settings", 20f, textColor(), Typeface.BOLD))
+            addView(text("Server", 15f, mutedColor()).withTop(dp(8)))
+            addView(serverUrlInput)
+            addView(
+                actionButton("Save server URL") {
+                    saveServerUrl(serverUrlInput.text.toString().trim())
+                }.withTop(dp(8)),
+            )
+            addView(text("Appearance", 15f, mutedColor()).withTop(dp(14)))
+            val row = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            row.addView(actionButton("Light") { setDarkMode(false) })
+            row.addView(actionButton("Dark") { setDarkMode(true) }.withLeft(dp(8)))
+            addView(row.withTop(dp(8)))
         }
     }
 
     private fun projectHeader(project: WakeWordProject, clips: List<ClipRecord>): View {
         val counts = clips.groupingBy { it.label }.eachCount()
         return card().apply {
-            addView(text(project.phrase, 24f, TEXT, Typeface.BOLD))
-            addView(text(project.slug, 14f, MUTED).withBottom(dp(10)))
+            addView(text(project.phrase, 24f, textColor(), Typeface.BOLD))
+            addView(text(project.slug, 14f, mutedColor()).withBottom(dp(10)))
             addView(
                 text(
                     "Positive ${counts[ClipLabel.POSITIVE] ?: 0}    Negative ${negativeCount(counts)}    Background ${counts[ClipLabel.BACKGROUND] ?: 0}",
                     15f,
-                    TEXT,
+                    textColor(),
                 ),
             )
         }
@@ -180,9 +252,9 @@ class MainActivity : Activity() {
         selectedPrompt: RecordingPrompt,
     ): View {
         return card().apply {
-            addView(text("Recording prompt", 20f, TEXT, Typeface.BOLD))
+            addView(text("Recording prompt", 20f, textColor(), Typeface.BOLD))
             addView(labelText(selectedPrompt.label).withTop(dp(8)))
-            addView(text(selectedPrompt.instruction, 22f, TEXT, Typeface.BOLD).withTop(dp(6)))
+            addView(text(selectedPrompt.instruction, 22f, textColor(), Typeface.BOLD).withTop(dp(6)))
 
             val controls = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -199,7 +271,7 @@ class MainActivity : Activity() {
             }.withLeft(dp(8)))
             addView(controls)
 
-            addView(text("Pick any prompt", 16f, TEXT, Typeface.BOLD))
+            addView(text("Pick any prompt", 16f, textColor(), Typeface.BOLD))
             prompts.forEachIndexed { index, prompt ->
                 addView(
                     Button(this@MainActivity).apply {
@@ -207,8 +279,8 @@ class MainActivity : Activity() {
                         textSize = 14f
                         isAllCaps = false
                         gravity = Gravity.CENTER_VERTICAL
-                        setTextColor(if (index == selectedIndex) Color.WHITE else TEXT)
-                        background = rounded(if (index == selectedIndex) ACCENT else PROMPT, dp(8), 0)
+                        setTextColor(if (index == selectedIndex) Color.WHITE else textColor())
+                        background = rounded(if (index == selectedIndex) ACCENT else promptColor(), dp(8), 0)
                         setOnClickListener { selectPrompt(project, prompts, index) }
                     }.withTop(dp(6)),
                 )
@@ -218,7 +290,7 @@ class MainActivity : Activity() {
 
     private fun syncCard(project: WakeWordProject, clips: List<ClipRecord>): View {
         return card().apply {
-            addView(text("Export and sync", 20f, TEXT, Typeface.BOLD))
+            addView(text("Export and sync", 20f, textColor(), Typeface.BOLD))
             val row = LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 setPadding(0, dp(10), 0, 0)
@@ -231,13 +303,13 @@ class MainActivity : Activity() {
 
     private fun clipsCard(project: WakeWordProject, clips: List<ClipRecord>): View {
         return card().apply {
-            addView(text("Recent clips", 20f, TEXT, Typeface.BOLD))
+            addView(text("Recent clips", 20f, textColor(), Typeface.BOLD))
             if (clips.isEmpty()) {
-                addView(text("No clips recorded yet.", 15f, MUTED).withTop(dp(8)))
+                addView(text("No clips recorded yet.", 15f, mutedColor()).withTop(dp(8)))
             } else {
                 clips.take(8).forEach { clip ->
-                    addView(text("${clip.label.name.lowercase()}  ${clip.durationMs} ms", 15f, TEXT, Typeface.BOLD).withTop(dp(10)))
-                    addView(text(clip.prompt, 14f, MUTED))
+                    addView(text("${clip.label.name.lowercase()}  ${clip.durationMs} ms", 15f, textColor(), Typeface.BOLD).withTop(dp(10)))
+                    addView(text(clip.prompt, 14f, mutedColor()))
                     val row = LinearLayout(this@MainActivity).apply {
                         orientation = LinearLayout.HORIZONTAL
                     }
@@ -344,15 +416,13 @@ class MainActivity : Activity() {
     }
 
     private fun syncBundle(project: WakeWordProject, clips: List<ClipRecord>) {
-        val serverUrl = serverUrlInput.text.toString().trim()
+        val serverUrl = savedServerUrl()
         if (serverUrl.isBlank()) {
-            serverUrlInput.error = "Server URL required"
+            statusMessage = "Server URL required"
+            settingsOpen = true
+            render()
             return
         }
-        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_SYNC_SERVER_URL, serverUrl)
-            .apply()
 
         statusMessage = "Syncing ${clips.size} clips for ${project.slug}"
         render()
@@ -374,6 +444,35 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun saveServerUrl(serverUrl: String) {
+        if (serverUrl.isBlank()) {
+            serverUrlInput.error = "Server URL required"
+            return
+        }
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_SYNC_SERVER_URL, serverUrl)
+            .apply()
+        statusMessage = "Saved server URL"
+        settingsOpen = false
+        render()
+    }
+
+    private fun savedServerUrl(): String {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_SYNC_SERVER_URL, DEFAULT_SYNC_SERVER_URL)
+            ?: DEFAULT_SYNC_SERVER_URL
+    }
+
+    private fun setDarkMode(enabled: Boolean) {
+        darkMode = enabled
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_DARK_MODE, enabled)
+            .apply()
+        render()
+    }
+
     override fun onDestroy() {
         player?.release()
         player = null
@@ -385,13 +484,13 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = rounded(Color.WHITE, dp(10), STROKE)
+            background = rounded(cardColor(), dp(10), strokeColor())
         }
     }
 
     private fun emptyCard(message: String): View {
         return card().apply {
-            addView(text(message, 15f, TEXT))
+            addView(text(message, 15f, textColor()))
         }
     }
 
@@ -402,6 +501,11 @@ class MainActivity : Activity() {
             isAllCaps = false
             setOnClickListener { onClick() }
         }
+    }
+
+    private fun EditText.styleInput() {
+        setTextColor(textColor())
+        setHintTextColor(mutedColor())
     }
 
     private fun labelText(label: ClipLabel): TextView {
@@ -445,6 +549,20 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun surfaceColor(): Int = if (darkMode) Color.rgb(28, 32, 34) else Color.rgb(243, 245, 247)
+
+    private fun sidebarColor(): Int = if (darkMode) Color.rgb(36, 42, 44) else Color.rgb(230, 235, 232)
+
+    private fun cardColor(): Int = if (darkMode) Color.rgb(42, 48, 51) else Color.WHITE
+
+    private fun promptColor(): Int = if (darkMode) Color.rgb(53, 60, 64) else Color.rgb(238, 241, 244)
+
+    private fun textColor(): Int = if (darkMode) Color.rgb(238, 242, 244) else Color.rgb(31, 36, 38)
+
+    private fun mutedColor(): Int = if (darkMode) Color.rgb(180, 190, 194) else Color.rgb(91, 101, 107)
+
+    private fun strokeColor(): Int = if (darkMode) Color.rgb(72, 82, 86) else Color.rgb(216, 222, 226)
+
     private fun View.withTop(top: Int): View {
         val params = (layoutParams as? LinearLayout.LayoutParams)
             ?: LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -475,13 +593,8 @@ class MainActivity : Activity() {
         const val REQUEST_RECORD_AUDIO = 100
         const val SYNC_PREFS = "sync"
         const val KEY_SYNC_SERVER_URL = "server_url"
+        const val KEY_DARK_MODE = "dark_mode"
         const val DEFAULT_SYNC_SERVER_URL = "http://100.64.0.2:8765"
-        val SURFACE: Int = Color.rgb(243, 245, 247)
-        val SIDEBAR: Int = Color.rgb(230, 235, 232)
-        val PROMPT: Int = Color.rgb(238, 241, 244)
-        val TEXT: Int = Color.rgb(31, 36, 38)
-        val MUTED: Int = Color.rgb(91, 101, 107)
         val ACCENT: Int = Color.rgb(47, 111, 109)
-        val STROKE: Int = Color.rgb(216, 222, 226)
     }
 }

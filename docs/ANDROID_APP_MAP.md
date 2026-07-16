@@ -73,8 +73,8 @@ Current scaffold:
 - The SQLite store includes a one-time migration from the original
   `SharedPreferences` metadata format.
 - Prompt generation creates a deterministic mixed batch per project.
-- The UI now shows a project sidebar and a focused workspace for the selected
-  wake word.
+- The UI has a top-left hamburger button that opens the project drawer, plus a
+  top-right settings gear for server URL and appearance controls.
 - Prompt recording supports direct prompt picking, previous, and skip controls
   so the user is not forced to restart or follow the generated order exactly.
 - Basic recording currently writes 16 kHz mono PCM WAV files into app-private
