@@ -11,6 +11,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 class WavRecorder(private val context: Context) {
@@ -18,18 +19,6 @@ class WavRecorder(private val context: Context) {
 
     val isRecording: Boolean
         get() = active != null
-
-    fun start(project: WakeWordProject, prompt: RecordingPrompt): File {
-        check(active == null) { "recording already active" }
-        check(
-            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED,
-        ) { "record audio permission is required" }
-
-        val output = clipFile(project)
-        startRecording(output, prompt)
-        return output
-    }
 
     fun startBulk(project: WakeWordProject, script: String): File {
         check(active == null) { "recording already active" }
@@ -51,9 +40,22 @@ class WavRecorder(private val context: Context) {
     private fun startRecording(output: File, prompt: RecordingPrompt) {
         output.parentFile?.mkdirs()
 
+        val minBuffer = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        val bufferSize = maxOf(minBuffer, SAMPLE_RATE / 2)
+
+        // Open and start the microphone on the caller's thread so any failure
+        // propagates synchronously (leaving `active` null and the recorder
+        // unwedged) instead of crashing the worker thread.
+        val recorder = openMicrophone(bufferSize)
+
         val running = AtomicBoolean(true)
+        val pcmBytes = AtomicInteger(0)
         val worker = thread(name = "wav-recorder") {
-            writeRecording(output, running)
+            writeRecording(recorder, bufferSize, output, running, pcmBytes)
         }
 
         active = ActiveRecording(
@@ -62,7 +64,38 @@ class WavRecorder(private val context: Context) {
             worker = worker,
             prompt = prompt,
             startedAtMillis = System.currentTimeMillis(),
+            pcmBytes = pcmBytes,
         )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openMicrophone(bufferSize: Int): AudioRecord {
+        val recorder = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferSize,
+            )
+        } catch (error: IllegalArgumentException) {
+            throw IllegalStateException("could not open microphone", error)
+        }
+        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            recorder.release()
+            throw IllegalStateException("microphone is unavailable")
+        }
+        try {
+            recorder.startRecording()
+        } catch (error: IllegalStateException) {
+            recorder.release()
+            throw IllegalStateException("could not start microphone", error)
+        }
+        if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            recorder.release()
+            throw IllegalStateException("microphone did not start")
+        }
+        return recorder
     }
 
     fun stop(): RecordingResult? {
@@ -70,20 +103,17 @@ class WavRecorder(private val context: Context) {
         recording.running.set(false)
         recording.worker.join()
         active = null
+        val byteRate = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE
+        val durationMs = recording.pcmBytes.get().toLong() * 1000L / byteRate
         return RecordingResult(
             output = recording.output,
             prompt = recording.prompt,
             recordedAtMillis = recording.startedAtMillis,
-            durationMs = System.currentTimeMillis() - recording.startedAtMillis,
+            durationMs = durationMs,
             sampleRateHz = SAMPLE_RATE,
             channels = CHANNELS,
             encoding = ENCODING,
         )
-    }
-
-    private fun clipFile(project: WakeWordProject): File {
-        val id = "clip_${System.currentTimeMillis()}_${UUID.randomUUID()}"
-        return File(context.filesDir, "clips/${project.slug}/$id.wav")
     }
 
     private fun bulkFile(project: WakeWordProject): File {
@@ -91,43 +121,42 @@ class WavRecorder(private val context: Context) {
         return File(context.filesDir, "bulk/${project.slug}/$id.wav")
     }
 
-    @SuppressLint("MissingPermission")
-    private fun writeRecording(output: File, running: AtomicBoolean) {
-        val minBuffer = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        val bufferSize = maxOf(minBuffer, SAMPLE_RATE / 2)
+    private fun writeRecording(
+        recorder: AudioRecord,
+        bufferSize: Int,
+        output: File,
+        running: AtomicBoolean,
+        pcmBytes: AtomicInteger,
+    ) {
         val buffer = ByteArray(bufferSize)
-        var pcmBytes = 0
-
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize,
-        )
-
-        RandomAccessFile(output, "rw").use { file ->
-            file.setLength(0)
-            writeHeader(file, 0)
-            recorder.startRecording()
-            try {
-                while (running.get()) {
-                    val read = recorder.read(buffer, 0, buffer.size)
-                    if (read > 0) {
-                        file.write(buffer, 0, read)
-                        pcmBytes += read
+        try {
+            RandomAccessFile(output, "rw").use { file ->
+                file.setLength(0)
+                writeHeader(file, 0)
+                var total = 0
+                try {
+                    while (running.get()) {
+                        val read = recorder.read(buffer, 0, buffer.size)
+                        if (read > 0) {
+                            file.write(buffer, 0, read)
+                            total += read
+                        } else if (read < 0) {
+                            // Persistent read error (e.g. dead object); stop cleanly.
+                            break
+                        }
                     }
+                } finally {
+                    pcmBytes.set(total)
+                    file.seek(0)
+                    writeHeader(file, total)
                 }
-            } finally {
-                recorder.stop()
-                recorder.release()
-                file.seek(0)
-                writeHeader(file, pcmBytes)
             }
+        } finally {
+            try {
+                recorder.stop()
+            } catch (_: IllegalStateException) {
+            }
+            recorder.release()
         }
     }
 
@@ -167,6 +196,7 @@ class WavRecorder(private val context: Context) {
         val worker: Thread,
         val prompt: RecordingPrompt,
         val startedAtMillis: Long,
+        val pcmBytes: AtomicInteger,
     )
 
     data class RecordingResult(

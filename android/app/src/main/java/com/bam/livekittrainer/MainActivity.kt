@@ -47,9 +47,7 @@ class MainActivity : Activity() {
     private lateinit var bulkWakePlacementsInput: EditText
     private var drawerOpen: Boolean = false
     private var currentPage: AppPage = AppPage.Project
-    private var recordingMode: RecordingMode = RecordingMode.ShortPrompts
     private var bulkScriptRevision: Int = 0
-    private var bulkReviewFilter: BulkReviewFilter = BulkReviewFilter.All
     private var darkMode: Boolean = false
     private var selectedProjectId: String? = null
     private var selectedBulkRecordingId: String? = null
@@ -64,7 +62,6 @@ class MainActivity : Activity() {
     private var alignmentPlaybackMs: Int = 0
     private var alignmentPlaybackStartUptimeMs: Long = 0L
     private var lastScheduledAlignmentBoundaryMs: Int = -1
-    private val selectedConditions = mutableSetOf<ClipCondition>()
     private var player: MediaPlayer? = null
     private var activePlaybackKey: String? = null
     private val playbackHandler = Handler(Looper.getMainLooper())
@@ -359,25 +356,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun recordingModeCard(): View {
-        return card().apply {
-            addView(text("Recording mode", 20f, textColor(), Typeface.BOLD))
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton("Short prompts", if (recordingMode == RecordingMode.ShortPrompts) ButtonStyle.Primary else ButtonStyle.Secondary) {
-                        recordingMode = RecordingMode.ShortPrompts
-                        render()
-                    })
-                    addView(actionButton("Bulk script", if (recordingMode == RecordingMode.BulkScript) ButtonStyle.Primary else ButtonStyle.Secondary) {
-                        recordingMode = RecordingMode.BulkScript
-                        render()
-                    }.withLeft(dp(8)))
-                }.withTop(dp(10)),
-            )
-        }
-    }
-
     private fun bulkOverviewCard(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
         val reviewClips = if (bulkReviewProjectSlug == project.slug) bulkReviewClips else emptyList()
         val reviewCounts = reviewClips.groupingBy { it.label }.eachCount()
@@ -498,94 +476,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun bulkReviewFilterControls(reviewCounts: Map<String, Int>): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(actionButton("All ${reviewCounts.values.sum()}", if (bulkReviewFilter == BulkReviewFilter.All) ButtonStyle.Primary else ButtonStyle.Secondary) {
-                bulkReviewFilter = BulkReviewFilter.All
-                render()
-            })
-            addView(actionButton("Pos ${reviewCounts["positive"] ?: 0}", if (bulkReviewFilter == BulkReviewFilter.Positive) ButtonStyle.Primary else ButtonStyle.Secondary) {
-                bulkReviewFilter = BulkReviewFilter.Positive
-                render()
-            }.withLeft(dp(8)))
-            addView(actionButton("Neg ${reviewCounts["negative"] ?: 0}", if (bulkReviewFilter == BulkReviewFilter.Negative) ButtonStyle.Primary else ButtonStyle.Secondary) {
-                bulkReviewFilter = BulkReviewFilter.Negative
-                render()
-            }.withLeft(dp(8)))
-        }
-    }
-
-    private fun promptCard(
-        project: WakeWordProject,
-        prompts: List<RecordingPrompt>,
-        selectedIndex: Int,
-        selectedPrompt: RecordingPrompt,
-    ): View {
-        return card().apply {
-            addView(text("Recording prompt", 20f, textColor(), Typeface.BOLD))
-            addView(labelText(selectedPrompt.label).withTop(dp(8)))
-            addView(text(selectedPrompt.instruction, 24f, textColor(), Typeface.BOLD).withTop(dp(6)))
-            addView(conditionSelector().withTop(dp(12)))
-
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    setPadding(0, dp(14), 0, dp(14))
-                    addView(actionButton("Previous", ButtonStyle.Secondary) {
-                        selectPrompt(project, prompts, selectedIndex - 1)
-                    })
-                    addView(actionButton("Skip", ButtonStyle.Secondary) {
-                        selectPrompt(project, prompts, selectedIndex + 1)
-                    }.withLeft(dp(8)))
-                    val recordingThisProject = recorder.isRecording && activeProject?.id == project.id
-                    addView(
-                        actionButton(if (recordingThisProject) "Stop" else "Record", if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Primary) {
-                            toggleRecording(project, selectedPrompt, prompts.size)
-                        }.withLeft(dp(8)),
-                    )
-                },
-            )
-
-            addView(text("Prompt queue", 16f, textColor(), Typeface.BOLD))
-            prompts.forEachIndexed { index, prompt ->
-                addView(
-                    promptRow(index, prompt, index == selectedIndex).apply {
-                        setOnClickListener { selectPrompt(project, prompts, index) }
-                    }.withTop(dp(6)),
-                )
-            }
-        }
-    }
-
-    private fun syncCard(project: WakeWordProject, clips: List<ClipRecord>, bulkRecordings: List<BulkRecording>): View {
-        val hasRecordings = clips.isNotEmpty() || bulkRecordings.isNotEmpty()
-        return card().apply {
-            addView(text("Export and sync", 20f, textColor(), Typeface.BOLD))
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    setPadding(0, dp(10), 0, 0)
-                    addView(actionButton("Export", ButtonStyle.Secondary) { exportBundle(project, clips, bulkRecordings) }.apply { isEnabled = hasRecordings })
-                    addView(actionButton("Sync", ButtonStyle.Primary) { syncBundle(project, clips, bulkRecordings) }.apply { isEnabled = hasRecordings }.withLeft(dp(8)))
-                },
-            )
-        }
-    }
-
-    private fun clipsCard(project: WakeWordProject, clips: List<ClipRecord>): View {
-        return card().apply {
-            addView(text("Recent clips", 20f, textColor(), Typeface.BOLD))
-            if (clips.isEmpty()) {
-                addView(text("No clips recorded yet.", 15f, mutedColor()).withTop(dp(8)))
-            } else {
-                clips.take(8).forEach { clip ->
-                    addView(clipRow(project, clip).withTop(dp(8)))
-                }
-            }
-        }
-    }
-
     private fun createProject() {
         val phrase = phraseInput.text.toString().trim()
         if (phrase.isBlank()) {
@@ -605,57 +495,6 @@ class MainActivity : Activity() {
         render()
     }
 
-    private fun selectPrompt(project: WakeWordProject, prompts: List<RecordingPrompt>, index: Int) {
-        val next = Math.floorMod(index, prompts.size)
-        store.setPromptIndex(project.id, next)
-        render()
-    }
-
-    private fun toggleRecording(project: WakeWordProject, prompt: RecordingPrompt, promptCount: Int) {
-        if (recorder.isRecording) {
-            val result = recorder.stop()
-            activeProject = null
-            if (result != null) {
-                store.addClip(
-                    ClipRecord(
-                        id = result.output.nameWithoutExtension,
-                        projectId = project.id,
-                        projectSlug = project.slug,
-                        filePath = result.output.absolutePath,
-                        label = result.prompt.label,
-                        prompt = result.prompt.instruction,
-                        spokenPhrase = result.prompt.spokenPhrase,
-                        recordedAtMillis = result.recordedAtMillis,
-                        durationMs = result.durationMs,
-                        sampleRateHz = result.sampleRateHz,
-                        channels = result.channels,
-                        encoding = result.encoding,
-                        conditions = selectedConditions.toList(),
-                    ),
-                )
-                store.advancePrompt(project.id, promptCount)
-                statusMessage = "Saved ${result.output.name}"
-            }
-            render()
-            return
-        }
-
-        try {
-            recorder.start(project, prompt)
-            activeProject = project
-            val conditionText = selectedConditions
-                .takeIf { it.isNotEmpty() }
-                ?.joinToString(", ") { it.displayName.lowercase() }
-                ?.let { " with $it" }
-                ?: ""
-            statusMessage = "Recording ${prompt.label.name.lowercase().replace('_', ' ')}$conditionText"
-            render()
-        } catch (error: IllegalStateException) {
-            statusMessage = error.message ?: "Could not start recording"
-            render()
-        }
-    }
-
     private fun toggleBulkRecording(project: WakeWordProject, script: String) {
         if (recorder.isRecording) {
             val result = recorder.stop()
@@ -673,7 +512,7 @@ class MainActivity : Activity() {
                         sampleRateHz = result.sampleRateHz,
                         channels = result.channels,
                         encoding = result.encoding,
-                        conditions = selectedConditions.toList(),
+                        conditions = emptyList(),
                     ),
                 )
                 bulkScriptRevision += 1
@@ -694,46 +533,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun playClip(clip: ClipRecord) {
-        val playbackKey = "clip:${clip.id}"
-        player?.let { current ->
-            if (activePlaybackKey == playbackKey) {
-                if (current.isPlaying) {
-                    current.pause()
-                } else {
-                    current.start()
-                }
-                render()
-                return
-            }
-        }
-        player?.release()
-        player = MediaPlayer().apply {
-            setDataSource(clip.filePath)
-            setOnCompletionListener {
-                it.release()
-                if (player === it) player = null
-                activePlaybackKey = null
-                render()
-            }
-            prepare()
-            start()
-        }
-        activePlaybackKey = playbackKey
-        statusMessage = "Playing ${File(clip.filePath).name}"
-        render()
-    }
-
-    private fun deleteClip(project: WakeWordProject, clip: ClipRecord) {
-        player?.release()
-        player = null
-        activePlaybackKey = null
-        File(clip.filePath).delete()
-        store.deleteClip(clip)
-        statusMessage = "Deleted clip from ${project.slug}"
-        render()
-    }
-
     private fun deleteBulkRecording(recording: BulkRecording) {
         player?.release()
         player = null
@@ -742,45 +541,6 @@ class MainActivity : Activity() {
         store.deleteBulkRecording(recording)
         statusMessage = "Deleted bulk recording"
         render()
-    }
-
-    private fun exportBundle(project: WakeWordProject, clips: List<ClipRecord>, bulkRecordings: List<BulkRecording>) {
-        val exportRoot = exporter.exportProject(project, clips, bulkRecordings)
-        statusMessage = "Exported bundle to ${exportRoot.absolutePath}"
-        render()
-    }
-
-    private fun syncBundle(project: WakeWordProject, clips: List<ClipRecord>, bulkRecordings: List<BulkRecording>) {
-        val serverUrl = savedServerUrl()
-        if (serverUrl.isBlank()) {
-            statusMessage = "Server URL required"
-            currentPage = AppPage.Settings
-            render()
-            return
-        }
-
-        statusMessage = "Syncing ${clips.size} clips and ${bulkRecordings.size} bulk recordings for ${project.slug}"
-        render()
-
-        Thread {
-            try {
-                val client = BundleSyncClient(serverUrl, savedWhisperServerUrl())
-                val syncedBulkIds = client.syncedBulkRecordingIds(project.slug)
-                val unsyncedBulkRecordings = bulkRecordings.filter { it.id !in syncedBulkIds }
-                val zip = exporter.exportProjectZip(project, clips, unsyncedBulkRecordings)
-                val response = client.upload(zip)
-                val skipped = bulkRecordings.size - unsyncedBulkRecordings.size
-                runOnUiThread {
-                    statusMessage = "Synced ${project.slug}; skipped $skipped existing bulk recordings: $response"
-                    render()
-                }
-            } catch (error: Exception) {
-                runOnUiThread {
-                    statusMessage = error.message ?: "Sync failed"
-                    render()
-                }
-            }
-        }.start()
     }
 
     private fun splitBulkBatch(project: WakeWordProject, bulkRecordings: List<BulkRecording>) {
@@ -1186,7 +946,6 @@ class MainActivity : Activity() {
         if (recorder.isRecording) recorder.stop()
         activeProject = null
         selectedProjectId = null
-        selectedConditions.clear()
         val clipCount = store.resetAllData()
         statusMessage = "Deleted all training data and $clipCount clips"
         currentPage = AppPage.Project
@@ -1248,15 +1007,6 @@ class MainActivity : Activity() {
         background = rounded(inputColor(), dp(12), strokeColor())
     }
 
-    private fun labelText(label: ClipLabel): TextView {
-        return text(label.name.lowercase().replace('_', ' '), 13f, Color.WHITE, Typeface.BOLD).apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            background = rounded(labelColor(label), dp(20), 0)
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-    }
-
     private fun menuRow(title: String, subtitle: String, selected: Boolean): View {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1275,45 +1025,6 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             addView(text(count.toString(), 20f, textColor(), Typeface.BOLD).apply { gravity = Gravity.CENTER })
             addView(text(label, 12f, mutedColor()).apply { gravity = Gravity.CENTER })
-        }
-    }
-
-    private fun promptRow(index: Int, prompt: RecordingPrompt, selected: Boolean): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = rounded(if (selected) ACCENT else promptColor(), dp(12), if (selected) 0 else strokeColor())
-            addView(
-                text(
-                    "${index + 1}. ${prompt.label.name.lowercase().replace('_', ' ')}",
-                    12f,
-                    if (selected) Color.rgb(221, 245, 242) else mutedColor(),
-                    Typeface.BOLD,
-                ),
-            )
-            addView(text(prompt.instruction, 15f, if (selected) Color.WHITE else textColor()).withTop(dp(2)))
-        }
-    }
-
-    private fun clipRow(project: WakeWordProject, clip: ClipRecord): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = rounded(promptColor(), dp(12), 0)
-            addView(text("${clip.label.name.lowercase().replace('_', ' ')}  ${clip.durationMs} ms", 14f, textColor(), Typeface.BOLD))
-            addView(text(clip.prompt, 13f, mutedColor()).withTop(dp(2)))
-            if (clip.conditions.isNotEmpty()) {
-                addView(text(clip.conditions.joinToString(", ") { it.displayName }, 12f, mutedColor(), Typeface.BOLD).withTop(dp(2)))
-            }
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    val playbackKey = "clip:${clip.id}"
-                    val playLabel = if (activePlaybackKey == playbackKey && player?.isPlaying == true) "Pause" else "Play"
-                    addView(actionButton(playLabel, ButtonStyle.Ghost) { playClip(clip) })
-                    addView(actionButton("Delete", ButtonStyle.Ghost) { deleteClip(project, clip) }.withLeft(dp(8)))
-                }.withTop(dp(6)),
-            )
         }
     }
 
@@ -1478,49 +1189,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun conditionSelector(): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(text("Conditions", 16f, textColor(), Typeface.BOLD))
-            ClipCondition.entries.chunked(2).forEach { rowConditions ->
-                addView(
-                    LinearLayout(this@MainActivity).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        rowConditions.forEachIndexed { index, condition ->
-                            addView(
-                                conditionButton(condition).apply {
-                                    if (index > 0) withLeft(dp(8))
-                                },
-                            )
-                        }
-                        if (rowConditions.size == 1) {
-                            addView(View(this@MainActivity).apply {
-                                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                                    leftMargin = dp(8)
-                                }
-                            })
-                        }
-                    }.withTop(dp(6)),
-                )
-            }
-        }
-    }
-
-    private fun conditionButton(condition: ClipCondition): Button {
-        val selected = condition in selectedConditions
-        return actionButton(condition.displayName, if (selected) ButtonStyle.Primary else ButtonStyle.Secondary) {
-            if (condition in selectedConditions) {
-                selectedConditions.remove(condition)
-            } else {
-                selectedConditions.add(condition)
-            }
-            render()
-        }.apply {
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f)
-        }
-    }
-
     private fun text(value: String, size: Float, color: Int, style: Int = Typeface.NORMAL): TextView {
         return TextView(this).apply {
             text = value
@@ -1570,20 +1238,6 @@ class MainActivity : Activity() {
             setColor(fill)
             cornerRadius = radius.toFloat()
             if (stroke != 0) setStroke(dp(1), stroke)
-        }
-    }
-
-    private fun negativeCount(counts: Map<ClipLabel, Int>): Int {
-        return (counts[ClipLabel.NEGATIVE] ?: 0) +
-            (counts[ClipLabel.HARD_NEGATIVE] ?: 0) +
-            (counts[ClipLabel.FALSE_POSITIVE] ?: 0)
-    }
-
-    private fun labelColor(label: ClipLabel): Int {
-        return when (label) {
-            ClipLabel.POSITIVE, ClipLabel.FALSE_NEGATIVE -> ACCENT
-            ClipLabel.NEGATIVE, ClipLabel.HARD_NEGATIVE, ClipLabel.FALSE_POSITIVE -> Color.rgb(149, 90, 49)
-            ClipLabel.BACKGROUND -> Color.rgb(83, 91, 112)
         }
     }
 
@@ -1666,17 +1320,6 @@ class MainActivity : Activity() {
         BulkRecord,
         BulkDetail,
         Settings,
-    }
-
-    private enum class RecordingMode {
-        ShortPrompts,
-        BulkScript,
-    }
-
-    private enum class BulkReviewFilter {
-        All,
-        Positive,
-        Negative,
     }
 
     private enum class ButtonStyle {

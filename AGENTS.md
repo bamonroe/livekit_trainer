@@ -179,32 +179,39 @@ tools can rebalance or inspect the dataset.
 
 Build the Android app as a real collection tool, not a demo.
 
+The app is **bulk-import only**. Data is collected by recording a single long
+scripted bulk WAV per take, then letting the sync server transcribe and slice it
+into positive and negative clips using Whisper word timestamps. There is no
+one-at-a-time short-prompt recording flow, no per-clip label picker, and no
+manual Export/Sync of individual clips; that orphaned path was removed. Do not
+reintroduce it without an explicit decision to change direction.
+
 Core workflows:
 
 - Create and edit wake-word projects.
-- Record positive examples for each target phrase.
-- Record hard negatives for similar phrases.
-- Record background and silence clips.
-- Review clips, delete bad takes, and replay audio.
-- Show per-wake-word collection counts.
-- Export a training bundle to this repo layout.
+- Generate a randomized bulk collection script for a project.
+- Record a bulk WAV of the whole script in one take.
+- Sync the bulk recording to the server, which aligns and slices it.
+- Review the generated slices per bulk recording: see each slice's transcript,
+  confidence, and source timing; replay it; and delete bad slices.
+- Inspect the source alignment (word timings and cut boundaries) for a recording.
+- Show per-wake-word bulk recording and slice counts.
 
-Prompt workflow:
+Bulk script workflow:
 
-- Generate randomized prompt batches per wake-word project.
-- Mix positive prompts, near-miss negative prompts, ordinary sentence prompts,
-  silence prompts, and background noise prompts.
+- Generate a randomized bulk script per wake-word project.
+- Mix wake-phrase placements, near-miss hard negatives, and ordinary sentences
+  so the take yields positives and negatives from one recording.
 - Avoid predictable ordering so the speaker does not fall into a fixed cadence.
-- Track completion counts per label and phrase variant.
+- Let the number of wake placements per script be configurable.
 - Support correction batches created from model evaluation mistakes.
-- Keep prompts short enough for fast repeated recording.
 
 Design expectations:
 
-- Keep recording controls large and reliable.
-- Make labels explicit at record time.
+- Keep the record control large and reliable.
+- Keep bulk recording, slice review, and settings on clearly separated pages.
 - Avoid hidden state in the recording flow.
-- Store raw recordings locally before export.
+- Store raw bulk recordings locally before sync.
 - Prefer deterministic filenames with timestamp and sanitized phrase.
 
 Technical expectations:
@@ -212,8 +219,9 @@ Technical expectations:
 - Use Android-native audio APIs.
 - Request microphone permission clearly.
 - Keep sample conversion code tested.
-- Treat user voice recordings as private local data.
-- Do not upload recordings unless the user explicitly adds that feature.
+- Treat user voice recordings as private data.
+- Upload bulk recordings only to the user's own configured sync server; do not
+  add any other upload destination without an explicit request.
 
 ## Containerized Development
 

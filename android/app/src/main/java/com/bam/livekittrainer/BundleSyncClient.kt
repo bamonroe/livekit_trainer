@@ -27,8 +27,13 @@ class BundleSyncClient(
         connection.setRequestProperty("Content-Type", "application/json")
         connection.setFixedLengthStreamingMode(body.size)
 
-        connection.outputStream.use { output ->
-            output.write(body)
+        try {
+            connection.outputStream.use { output ->
+                output.write(body)
+            }
+        } catch (error: IOException) {
+            connection.disconnect()
+            throw error
         }
 
         return readResponse(connection, "Save settings failed")
@@ -48,10 +53,15 @@ class BundleSyncClient(
         }
         connection.setFixedLengthStreamingMode(bundleZip.length())
 
-        bundleZip.inputStream().use { input ->
-            connection.outputStream.use { output ->
-                input.copyTo(output)
+        try {
+            bundleZip.inputStream().use { input ->
+                connection.outputStream.use { output ->
+                    input.copyTo(output)
+                }
             }
+        } catch (error: IOException) {
+            connection.disconnect()
+            throw error
         }
 
         return readResponse(connection, "Sync failed")
@@ -181,17 +191,20 @@ class BundleSyncClient(
     }
 
     private fun readResponse(connection: HttpURLConnection, errorPrefix: String): String {
-        val code = connection.responseCode
-        val response = if (code in 200..299) {
-            connection.inputStream.bufferedReader().use { it.readText() }
-        } else {
-            connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        try {
+            val code = connection.responseCode
+            val response = if (code in 200..299) {
+                connection.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                connection.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            }
+            if (code !in 200..299) {
+                throw IOException("$errorPrefix HTTP $code: $response")
+            }
+            return response
+        } finally {
+            connection.disconnect()
         }
-        connection.disconnect()
-        if (code !in 200..299) {
-            throw IOException("$errorPrefix HTTP $code: $response")
-        }
-        return response
     }
 
     private fun jsonString(value: String): String {

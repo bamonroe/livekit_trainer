@@ -225,63 +225,78 @@ class ProjectStore(context: Context) {
     private fun migrateLegacyPreferences() {
         if (legacyPrefs.getBoolean(KEY_MIGRATED, false)) return
 
-        val rawProjects = legacyPrefs.getString(KEY_PROJECTS, "[]") ?: "[]"
+        val projects = try {
+            JSONArray(legacyPrefs.getString(KEY_PROJECTS, "[]") ?: "[]")
+        } catch (_: JSONException) {
+            // Nothing recoverable from a malformed top-level list; don't retry.
+            legacyPrefs.edit().putBoolean(KEY_MIGRATED, true).apply()
+            return
+        }
+
         val db = dbHelper.writableDatabase
         db.beginTransaction()
         try {
-            val projects = JSONArray(rawProjects)
             for (index in 0 until projects.length()) {
-                val item = projects.getJSONObject(index)
-                val project = WakeWordProject(
-                    id = item.getString("id"),
-                    phrase = item.getString("phrase"),
-                    slug = item.getString("slug"),
-                    createdAtMillis = item.getLong("created_at_millis"),
-                )
-                db.insertWithOnConflict(
-                    TABLE_PROJECTS,
-                    null,
-                    project.toContentValues(),
-                    SQLiteDatabase.CONFLICT_IGNORE,
-                )
-                migrateLegacyClips(db, project.id)
-                migrateLegacyPromptIndex(db, project.id)
+                try {
+                    val item = projects.getJSONObject(index)
+                    val project = WakeWordProject(
+                        id = item.getString("id"),
+                        phrase = item.getString("phrase"),
+                        slug = item.getString("slug"),
+                        createdAtMillis = item.getLong("created_at_millis"),
+                    )
+                    db.insertWithOnConflict(
+                        TABLE_PROJECTS,
+                        null,
+                        project.toContentValues(),
+                        SQLiteDatabase.CONFLICT_IGNORE,
+                    )
+                    migrateLegacyClips(db, project.id)
+                    migrateLegacyPromptIndex(db, project.id)
+                } catch (_: JSONException) {
+                    // Skip a single malformed project and keep migrating the rest.
+                }
             }
             db.setTransactionSuccessful()
-            legacyPrefs.edit().putBoolean(KEY_MIGRATED, true).apply()
-        } catch (_: JSONException) {
-            legacyPrefs.edit().putBoolean(KEY_MIGRATED, true).apply()
         } finally {
             db.endTransaction()
         }
+        // Only mark migration complete after the good records are committed.
+        legacyPrefs.edit().putBoolean(KEY_MIGRATED, true).apply()
     }
 
     private fun migrateLegacyClips(db: SQLiteDatabase, projectId: String) {
         val rawClips = legacyPrefs.getString(legacyClipsKey(projectId), "[]") ?: "[]"
         val clips = JSONArray(rawClips)
         for (index in 0 until clips.length()) {
-            val item = clips.getJSONObject(index)
-            val clip = ClipRecord(
-                id = item.getString("id"),
-                projectId = item.getString("project_id"),
-                projectSlug = item.getString("project_slug"),
-                filePath = item.getString("file_path"),
-                label = ClipLabel.valueOf(item.getString("label")),
-                prompt = item.getString("prompt"),
-                spokenPhrase = item.getString("spoken_phrase"),
-                recordedAtMillis = item.getLong("recorded_at_millis"),
-                durationMs = item.getLong("duration_ms"),
-                sampleRateHz = item.getInt("sample_rate_hz"),
-                channels = item.getInt("channels"),
-                encoding = item.getString("encoding"),
-                conditions = emptyList(),
-            )
-            db.insertWithOnConflict(
-                TABLE_CLIPS,
-                null,
-                clip.toContentValues(),
-                SQLiteDatabase.CONFLICT_IGNORE,
-            )
+            try {
+                val item = clips.getJSONObject(index)
+                val clip = ClipRecord(
+                    id = item.getString("id"),
+                    projectId = item.getString("project_id"),
+                    projectSlug = item.getString("project_slug"),
+                    filePath = item.getString("file_path"),
+                    label = ClipLabel.valueOf(item.getString("label")),
+                    prompt = item.getString("prompt"),
+                    spokenPhrase = item.getString("spoken_phrase"),
+                    recordedAtMillis = item.getLong("recorded_at_millis"),
+                    durationMs = item.getLong("duration_ms"),
+                    sampleRateHz = item.getInt("sample_rate_hz"),
+                    channels = item.getInt("channels"),
+                    encoding = item.getString("encoding"),
+                    conditions = emptyList(),
+                )
+                db.insertWithOnConflict(
+                    TABLE_CLIPS,
+                    null,
+                    clip.toContentValues(),
+                    SQLiteDatabase.CONFLICT_IGNORE,
+                )
+            } catch (_: JSONException) {
+                // Skip a single malformed clip.
+            } catch (_: IllegalArgumentException) {
+                // Skip a clip with an unknown label enum.
+            }
         }
     }
 
