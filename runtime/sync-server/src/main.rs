@@ -230,6 +230,7 @@ struct AlignmentSummary {
     recordings: usize,
     positives: usize,
     negatives: usize,
+    dropped_positives: usize,
     warnings: Vec<String>,
 }
 
@@ -852,7 +853,7 @@ async fn align_bulk_recordings(
                 continue;
             }
         };
-        let whisper = match transcribe_with_words(whisper_url, &source, &recording.script).await {
+        let whisper = match transcribe_with_words(whisper_url, &source, None).await {
             Ok(whisper) => whisper,
             Err(error) => {
                 summary
@@ -934,16 +935,38 @@ async fn align_bulk_recordings(
             let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(&phrase));
             let dest = dest_root.join("positive").join(&file_name);
             if write_wav_slice(&source, &dest, start, end)? {
-                slice_rows.push(build_slice_row(
-                    &clip_id,
-                    "positive",
-                    &dest,
-                    &file_name,
-                    start,
-                    end,
-                    slice_words,
-                ));
-                summary.positives += 1;
+                // Verify the cut audio actually contains the wake phrase, judged
+                // on its own with no script prompt. Whisper word timings are
+                // unstable, so a phrase the alignment placed here may not really
+                // be in the slice; drop it rather than poison training.
+                let heard = transcribe_with_words(whisper_url, &dest, None)
+                    .await
+                    .ok()
+                    .map(|response| transcript_tail_has_phrase(&response.text, &phrase_words));
+                match heard {
+                    Some(false) => {
+                        let _ = fs::remove_file(&dest);
+                        summary.dropped_positives += 1;
+                        summary.warnings.push(format!(
+                            "{}: dropped positive at {:.2}-{:.2}s; wake phrase not heard in slice",
+                            recording.id, start, end
+                        ));
+                    }
+                    // Kept when the phrase is heard, or when verification itself
+                    // failed (a transient Whisper error should not discard data).
+                    _ => {
+                        slice_rows.push(build_slice_row(
+                            &clip_id,
+                            "positive",
+                            &dest,
+                            &file_name,
+                            start,
+                            end,
+                            slice_words,
+                        ));
+                        summary.positives += 1;
+                    }
+                }
             }
             occupied.push((start, end));
         }
@@ -1064,7 +1087,7 @@ fn build_slice_row(
 async fn transcribe_with_words(
     whisper_url: &str,
     wav_path: &Path,
-    script: &str,
+    prompt: Option<&str>,
 ) -> Result<WhisperResponse, AppError> {
     let bytes = fs::read(wav_path)?;
     let file_name = wav_path
@@ -1076,13 +1099,18 @@ async fn transcribe_with_words(
         .file_name(file_name)
         .mime_str("audio/wav")
         .map_err(|error| AppError::internal(format!("prepare Whisper upload: {error}")))?;
-    let form = reqwest::multipart::Form::new()
+    // The prompt is deliberately omitted for alignment and verification: on this
+    // clean, scripted audio it does not improve accuracy and it biases Whisper
+    // toward reporting the scripted words even where the audio differs.
+    let mut form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("response_format", "verbose_json")
         .text("temperature", "0.0")
         .text("no_context", "true")
-        .text("word_timestamps", "true")
-        .text("prompt", script.to_string());
+        .text("word_timestamps", "true");
+    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
+        form = form.text("prompt", prompt.to_string());
+    }
     let endpoint = format!("{}/inference", whisper_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .post(endpoint)
@@ -1398,6 +1426,12 @@ fn alignment_summary(summary: &AlignmentSummary) -> String {
         "Aligned {} bulk recordings into {} positives and {} negatives",
         summary.recordings, summary.positives, summary.negatives
     );
+    if summary.dropped_positives > 0 {
+        output.push_str(&format!(
+            " ({} positives dropped: wake phrase not heard)",
+            summary.dropped_positives
+        ));
+    }
     if !summary.warnings.is_empty() {
         output.push_str("\nWarnings:");
         for warning in &summary.warnings {
@@ -1442,6 +1476,33 @@ fn normalized_words(value: &str) -> Vec<String> {
         .map(normalize_word)
         .filter(|word| !word.is_empty())
         .collect()
+}
+
+/// True when the wake phrase appears at (or very near) the END of the normalized
+/// transcript. Positives are tail-aligned, so the wake phrase must be the last
+/// thing spoken; `TAIL_SLACK` words of trailing audio are tolerated for the tail
+/// padding. Requiring the phrase at the tail — not just anywhere — rejects
+/// slices that were cut too early and only contain the lead-in (e.g. "the next
+/// words are ...") even when a flaky Whisper pass imagines the phrase mid-slice.
+fn transcript_tail_has_phrase(text: &str, phrase_words: &[String]) -> bool {
+    const TAIL_SLACK: usize = 2;
+    if phrase_words.is_empty() {
+        return false;
+    }
+    let heard = normalized_words(text);
+    if heard.len() < phrase_words.len() {
+        return false;
+    }
+    let last_start = heard.len() - phrase_words.len();
+    for start in 0..=last_start {
+        if &heard[start..start + phrase_words.len()] == phrase_words {
+            let words_after = heard.len() - (start + phrase_words.len());
+            if words_after <= TAIL_SLACK {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn normalize_word(value: &str) -> String {
@@ -1596,6 +1657,22 @@ mod tests {
         assert!(!is_safe_slug("_bad"));
         assert!(!is_safe_slug("bad-name"));
         assert!(!is_safe_slug("../bad"));
+    }
+
+    #[test]
+    fn transcript_tail_has_phrase_requires_phrase_at_end() {
+        let phrase = normalized_words("all set");
+        // Phrase at the tail (with a little trailing slack) is accepted.
+        assert!(transcript_tail_has_phrase("the next words are all set.", &phrase));
+        assert!(transcript_tail_has_phrase("All Set!", &phrase));
+        assert!(transcript_tail_has_phrase("say all set now", &phrase));
+        // Phrase absent, or buried mid-slice by a flaky pass, is rejected.
+        assert!(!transcript_tail_has_phrase("the next words are over", &phrase));
+        assert!(!transcript_tail_has_phrase(
+            "the next words are all in the same sentence",
+            &phrase
+        ));
+        assert!(!transcript_tail_has_phrase("all is not set", &phrase));
     }
 
     #[test]
