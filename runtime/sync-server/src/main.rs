@@ -25,7 +25,14 @@ use zip::ZipArchive;
 mod db;
 
 const POSITIVE_MAX_SECONDS: f64 = 1.5;
-const POSITIVE_TAIL_PADDING_SECONDS: f64 = 0.010;
+// Whisper word timestamps drift from the true audio, so cutting exactly at
+// word.start/word.end clips onsets and (worst of all) chops the tail-aligned
+// wake phrase. Nudge each cut outward, bounded by the neighboring words, to keep
+// slices honest to their transcript. The positive tail is padded hardest because
+// a positive that lost its wake phrase is the most damaging error.
+const CUT_LEAD_PADDING_SECONDS: f64 = 0.08;
+const POSITIVE_TAIL_PADDING_SECONDS: f64 = 0.28;
+const NEGATIVE_TAIL_PADDING_SECONDS: f64 = 0.10;
 const NEGATIVE_TARGET_SECONDS: f64 = 1.5;
 
 #[derive(Clone)]
@@ -906,10 +913,22 @@ async fn align_bulk_recordings(
             }
         }
 
+        let source_end = wav_duration_seconds(&source)
+            .unwrap_or_else(|_| words.last().map(|word| word.end).unwrap_or(0.0));
+
         let mut occupied = Vec::new();
         let mut slice_rows = Vec::new();
         for (first, last) in positive_ranges.iter() {
-            let (start, end, context_first) = positive_cut_range(&words, *first, *last);
+            let context_first = positive_context_first(&words, *first, *last);
+            let (start, end) = padded_bounds(
+                &words,
+                context_first,
+                *last,
+                source_end,
+                CUT_LEAD_PADDING_SECONDS,
+                POSITIVE_TAIL_PADDING_SECONDS,
+                false,
+            );
             let slice_words = &words[context_first..=*last];
             let clip_id = bulk_clip_hash_id(recording, "positive", start, end, slice_words);
             let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(&phrase));
@@ -930,9 +949,18 @@ async fn align_bulk_recordings(
         }
 
         let negative_ranges = negative_ranges(&words, &occupied);
-        for (start, end, word_start, word_end) in negative_ranges.iter() {
+        for (_, _, word_start, word_end) in negative_ranges.iter() {
             let slice_words = &words[*word_start..=*word_end];
-            let clip_id = bulk_clip_hash_id(recording, "negative", *start, *end, slice_words);
+            let (start, end) = padded_bounds(
+                &words,
+                *word_start,
+                *word_end,
+                source_end,
+                CUT_LEAD_PADDING_SECONDS,
+                NEGATIVE_TAIL_PADDING_SECONDS,
+                true,
+            );
+            let clip_id = bulk_clip_hash_id(recording, "negative", start, end, slice_words);
             let phrase_text = slice_words
                 .iter()
                 .map(|word| word.word.trim())
@@ -944,14 +972,14 @@ async fn align_bulk_recordings(
                 safe_filename(&phrase_text)
             );
             let dest = dest_root.join("negative").join(&file_name);
-            if write_wav_slice(&source, &dest, *start, *end)? {
+            if write_wav_slice(&source, &dest, start, end)? {
                 slice_rows.push(build_slice_row(
                     &clip_id,
                     "negative",
                     &dest,
                     &file_name,
-                    *start,
-                    *end,
+                    start,
+                    end,
                     slice_words,
                 ));
                 summary.negatives += 1;
@@ -1126,14 +1154,68 @@ fn phrase_ranges(words: &[WhisperWord], phrase_words: &[String]) -> Vec<(usize, 
     ranges
 }
 
-fn positive_cut_range(words: &[WhisperWord], first: usize, last: usize) -> (f64, f64, usize) {
-    let end = words[last].end + POSITIVE_TAIL_PADDING_SECONDS;
-    let earliest_start = (end - POSITIVE_MAX_SECONDS).max(0.0);
+/// Pick the earliest word to include as lead-in context for a tail-aligned
+/// positive, filling up to POSITIVE_MAX_SECONDS of speech before the phrase end.
+fn positive_context_first(words: &[WhisperWord], first: usize, last: usize) -> usize {
+    let anchor_end = words[last].end;
+    let earliest_start = (anchor_end - POSITIVE_MAX_SECONDS).max(0.0);
     let mut context_first = first;
     while context_first > 0 && words[context_first - 1].start >= earliest_start {
         context_first -= 1;
     }
-    (words[context_first].start.max(0.0), end, context_first)
+    context_first
+}
+
+/// Expand a word-index range into padded second bounds. The start is nudged
+/// earlier and the end later so onsets and (crucially) the wake-phrase tail are
+/// not clipped.
+///
+/// `clamp_tail_to_neighbor` controls how far the trailing edge may grow. For
+/// negatives it is `true`: the end must not run into the next word, so a
+/// negative can never accidentally swallow an adjacent wake phrase. For
+/// positives it is `false`: the wake phrase sits at the very end and Whisper
+/// routinely places its end (and the following word's start) too early, so the
+/// tail is allowed to grow past the neighbor up to the recording end — capturing
+/// a positive that would otherwise lose its wake phrase matters more than a
+/// little trailing audio.
+fn padded_bounds(
+    words: &[WhisperWord],
+    first: usize,
+    last: usize,
+    source_end: f64,
+    lead: f64,
+    tail: f64,
+    clamp_tail_to_neighbor: bool,
+) -> (f64, f64) {
+    let raw_start = words[first].start.max(0.0);
+    let prev_end = if first > 0 {
+        words[first - 1].end.max(0.0)
+    } else {
+        0.0
+    };
+    // Move the start earlier, but not into the previous word.
+    let start_floor = prev_end.min(raw_start);
+    let start = (raw_start - lead).clamp(start_floor, raw_start);
+
+    let raw_end = words[last].end.max(raw_start);
+    let neighbor_cap = if clamp_tail_to_neighbor && last + 1 < words.len() {
+        words[last + 1].start
+    } else {
+        source_end
+    };
+    let end_cap = neighbor_cap.max(raw_end).min(source_end.max(raw_end));
+    let end = (raw_end + tail).clamp(raw_end, end_cap);
+    (start, end)
+}
+
+fn wav_duration_seconds(path: &Path) -> Result<f64, AppError> {
+    let reader = WavReader::open(path)
+        .map_err(|error| AppError::bad_request(format!("cannot read WAV duration: {error}")))?;
+    let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return Ok(0.0);
+    }
+    Ok(reader.duration() as f64 / spec.sample_rate as f64)
 }
 
 fn is_hard_negative_context(words: &[WhisperWord], first: usize, last: usize) -> bool {
@@ -1517,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_cut_uses_max_words_inside_tail_aligned_window() {
+    fn positive_context_first_fills_tail_aligned_window() {
         let words = vec![
             test_word("alpha", 0.00, 0.20),
             test_word("bravo", 0.35, 0.55),
@@ -1526,12 +1608,37 @@ mod tests {
             test_word("word", 1.65, 1.90),
         ];
 
-        let (start, end, context_first) = positive_cut_range(&words, 3, 4);
+        assert_eq!(positive_context_first(&words, 3, 4), 2);
+    }
 
-        assert_eq!(context_first, 2);
-        assert!((start - 0.90).abs() < f64::EPSILON);
-        assert!((end - 1.91).abs() < f64::EPSILON);
-        assert!(end - start <= POSITIVE_MAX_SECONDS);
+    #[test]
+    fn padded_bounds_expand_without_crossing_neighbors() {
+        let words = vec![
+            test_word("alpha", 0.00, 0.20),
+            test_word("bravo", 0.35, 0.55),
+            test_word("charlie", 0.90, 1.10),
+            test_word("wake", 1.30, 1.55),
+            test_word("word", 1.65, 1.90),
+        ];
+
+        // Final word: start padded but not into the previous word; tail padded.
+        let (start, end) = padded_bounds(&words, 2, 4, 3.0, 0.08, 0.18, false);
+        assert!((start - 0.82).abs() < 1e-9);
+        assert!((end - 2.08).abs() < 1e-9);
+
+        // With neighbor clamping on (negatives), an interior end clamps to the
+        // next word's start instead of overrunning it.
+        let (_, clamped_end) = padded_bounds(&words, 2, 3, 3.0, 0.08, 0.18, true);
+        assert!((clamped_end - 1.65).abs() < 1e-9);
+
+        // With neighbor clamping off (positives), the tail grows past the next
+        // word toward the recording end so the wake phrase is not clipped.
+        let (_, open_end) = padded_bounds(&words, 2, 3, 3.0, 0.08, 0.18, false);
+        assert!((open_end - 1.73).abs() < 1e-9);
+
+        // A large lead never pulls the start before the previous word's end.
+        let (floor_start, _) = padded_bounds(&words, 1, 1, 3.0, 0.50, 0.10, true);
+        assert!((floor_start - 0.20).abs() < 1e-9);
     }
 
     #[test]
