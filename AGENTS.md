@@ -269,9 +269,11 @@ optional for the Android collection app.
   repository instructions.
 - Keep Android bring-up notes in `docs/ANDROID_APP_MAP.md` current as the app
   architecture and build workflow evolve.
-- Commit work often with clear, small commits.
-- Push to configured remotes frequently so work is backed up and available to
-  other agents.
+- Commit freely, often, and regularly. Do not wait to be asked. Make small,
+  clear commits as you complete each meaningful piece of work, so progress is
+  always captured and easy to review or revert.
+- Push to configured remotes whenever you need to, and by default whenever you
+  have committed work, so it is backed up and available to other agents.
 - Use the local `gh` CLI when needed to create or inspect the GitHub repository
   and remote configuration.
 - Prefer working inside the project Docker development container.
