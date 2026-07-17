@@ -7,7 +7,9 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-No active items. Pick the next item from Later when starting new work.
+- [ ] Test bulk scripted collection with real phone recordings and tune slice
+  padding, negative sampling, and review output. See
+  `docs/BULK_SCRIPTED_COLLECTION.md`.
 
 ## Later
 
@@ -22,6 +24,8 @@ No active items. Pick the next item from Later when starting new work.
   device.
 - [ ] Add audio validation for sample rate, channel count, duration, clipping,
   and silence.
+- [ ] Add prompt coverage reporting so future batches deliberately target
+  underrepresented labels, conditions, and phrase variants.
 
 ## Done
 
@@ -35,6 +39,52 @@ No active items. Pick the next item from Later when starting new work.
 - [x] Persist clip metadata for recorded prompt clips.
 - [x] Add local clip listing, replay, and delete flow.
 - [x] Add prompt-by-prompt advancement after each saved recording.
+- [x] Refresh prompt batches after completion and shorten generated prompt text
+  for focused wake-word clips.
+- [x] Split settings into a dedicated app page, add optional Whisper server URL
+  settings, and add a bulk-script recording mode entry point.
+- [x] Send saved Android sync and Whisper settings to the Rust sync server.
+- [x] Add first-pass bulk script recording export, Whisper word alignment, and
+  server-side positive and negative clip slicing.
+- [x] Tune bulk scripts toward natural read-aloud sentences and pad very early
+  wake-phrase slices.
+- [x] Add delete controls for saved bulk recordings in the Android app.
+- [x] Add app-side review for generated bulk slices with server streaming and
+  delete controls.
+- [x] Use dictionary words and phonetic hard negatives in bulk scripts, and keep
+  server alignment running across later bulk recordings after per-recording
+  failures.
+- [x] Skip already-processed bulk recordings during Android sync and highlight
+  true wake phrases versus near-miss negatives in bulk scripts.
+- [x] Make bulk script wake-word placement count configurable in Android
+  settings.
+- [x] Correct Whisper segment-relative word timestamps before slicing bulk
+  recordings.
+- [x] Add server project metadata loading so another device can review synced
+  bulk slices without downloading source recordings.
+- [x] Show compact slice IDs in Android bulk review rows for reporting examples.
+- [x] Tune generated negative slices to prefer sentence boundaries and avoid
+  cutting off sentence endings.
+- [x] Show full positive slice transcript context and highlight wake phrases in
+  bulk review.
+- [x] Skip hard-negative contexts when creating positive bulk slices and clear
+  stale generated slices during reprocessing.
+- [x] Temporarily make positive bulk review slices use tight Whisper timestamp
+  windows for alignment debugging.
+- [x] Add source-recording alignment replay with timed Whisper words and cut
+  markers in Android bulk review.
+- [x] Use content hash IDs for generated bulk review slices and prune stale
+  slice metadata during reprocessing.
+- [x] Add a dedicated Android `Split batch` button for running server-side bulk
+  alignment and slice generation from saved bulk recordings.
+- [x] Make the Android main workflow bulk-first and remove the short-prompt
+  collector from the primary screen.
+- [x] Add basic positive/negative/all filtering for generated bulk review
+  slices.
+- [x] Make review audio controls toggle between play and pause, and rename
+  per-slice alignment controls to source timing.
+- [x] Split Android bulk collection into overview, new-recording, and
+  per-recording detail pages.
 - [x] Add a cleaner Android collection UI with project sidebar navigation and
   direct prompt picking.
 - [x] Move Android project navigation behind a hamburger drawer and add a

@@ -27,6 +27,28 @@ class WavRecorder(private val context: Context) {
         ) { "record audio permission is required" }
 
         val output = clipFile(project)
+        startRecording(output, prompt)
+        return output
+    }
+
+    fun startBulk(project: WakeWordProject, script: String): File {
+        check(active == null) { "recording already active" }
+        check(
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED,
+        ) { "record audio permission is required" }
+
+        val output = bulkFile(project)
+        val prompt = RecordingPrompt(
+            label = ClipLabel.NEGATIVE,
+            spokenPhrase = script,
+            instruction = script,
+        )
+        startRecording(output, prompt)
+        return output
+    }
+
+    private fun startRecording(output: File, prompt: RecordingPrompt) {
         output.parentFile?.mkdirs()
 
         val running = AtomicBoolean(true)
@@ -41,7 +63,6 @@ class WavRecorder(private val context: Context) {
             prompt = prompt,
             startedAtMillis = System.currentTimeMillis(),
         )
-        return output
     }
 
     fun stop(): RecordingResult? {
@@ -63,6 +84,11 @@ class WavRecorder(private val context: Context) {
     private fun clipFile(project: WakeWordProject): File {
         val id = "clip_${System.currentTimeMillis()}_${UUID.randomUUID()}"
         return File(context.filesDir, "clips/${project.slug}/$id.wav")
+    }
+
+    private fun bulkFile(project: WakeWordProject): File {
+        val id = "bulk_${System.currentTimeMillis()}_${UUID.randomUUID()}"
+        return File(context.filesDir, "bulk/${project.slug}/$id.wav")
     }
 
     @SuppressLint("MissingPermission")

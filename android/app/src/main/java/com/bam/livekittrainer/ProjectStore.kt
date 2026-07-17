@@ -7,6 +7,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import org.json.JSONArray
 import org.json.JSONException
+import java.io.File
 
 class ProjectStore(context: Context) {
     private val appContext = context.applicationContext
@@ -64,6 +65,25 @@ class ProjectStore(context: Context) {
         }
     }
 
+    fun loadBulkRecordings(projectId: String): List<BulkRecording> {
+        val db = dbHelper.readableDatabase
+        return db.query(
+            TABLE_BULK_RECORDINGS,
+            null,
+            "project_id = ?",
+            arrayOf(projectId),
+            null,
+            null,
+            "recorded_at_millis DESC",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(cursor.toBulkRecording())
+                }
+            }
+        }
+    }
+
     fun addClip(clip: ClipRecord) {
         dbHelper.writableDatabase.insertWithOnConflict(
             TABLE_CLIPS,
@@ -73,8 +93,71 @@ class ProjectStore(context: Context) {
         )
     }
 
+    fun addBulkRecording(recording: BulkRecording) {
+        dbHelper.writableDatabase.insertWithOnConflict(
+            TABLE_BULK_RECORDINGS,
+            null,
+            recording.toContentValues(),
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
     fun deleteClip(clip: ClipRecord) {
         dbHelper.writableDatabase.delete(TABLE_CLIPS, "id = ?", arrayOf(clip.id))
+    }
+
+    fun deleteBulkRecording(recording: BulkRecording) {
+        dbHelper.writableDatabase.delete(TABLE_BULK_RECORDINGS, "id = ?", arrayOf(recording.id))
+    }
+
+    fun resetAllData(): Int {
+        val clips = loadAllClips()
+        clips.forEach { clip ->
+            File(clip.filePath).delete()
+        }
+
+        File(appContext.filesDir, "clips").deleteRecursively()
+        File(appContext.filesDir, "bulk").deleteRecursively()
+        File(appContext.filesDir, "exports").deleteRecursively()
+        File(appContext.cacheDir, "sync").deleteRecursively()
+
+        val db = dbHelper.writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete(TABLE_PROMPT_STATE, null, null)
+            db.delete(TABLE_BULK_RECORDINGS, null, null)
+            db.delete(TABLE_CLIPS, null, null)
+            db.delete(TABLE_PROJECTS, null, null)
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+
+        legacyPrefs.edit()
+            .clear()
+            .putBoolean(KEY_MIGRATED, true)
+            .apply()
+
+        return clips.size
+    }
+
+    private fun loadAllClips(): List<ClipRecord> {
+        val db = dbHelper.readableDatabase
+        return db.query(
+            TABLE_CLIPS,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(cursor.toClip())
+                }
+            }
+        }
     }
 
     fun promptIndex(projectId: String, promptCount: Int): Int {
@@ -96,19 +179,44 @@ class ProjectStore(context: Context) {
         return index.coerceIn(0, promptCount - 1)
     }
 
+    fun promptBatch(projectId: String): Int {
+        val db = dbHelper.readableDatabase
+        return db.query(
+            TABLE_PROMPT_STATE,
+            arrayOf("prompt_batch"),
+            "project_id = ?",
+            arrayOf(projectId),
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getIntValue("prompt_batch") else 0
+        }.coerceAtLeast(0)
+    }
+
     fun advancePrompt(projectId: String, promptCount: Int) {
         if (promptCount <= 0) return
-        val next = (promptIndex(projectId, promptCount) + 1) % promptCount
-        setPromptIndex(projectId, next)
+        val currentIndex = promptIndex(projectId, promptCount)
+        val currentBatch = promptBatch(projectId)
+        if (currentIndex + 1 >= promptCount) {
+            setPromptState(projectId, promptIndex = 0, promptBatch = currentBatch + 1)
+        } else {
+            setPromptState(projectId, promptIndex = currentIndex + 1, promptBatch = currentBatch)
+        }
     }
 
     fun setPromptIndex(projectId: String, promptIndex: Int) {
+        setPromptState(projectId, promptIndex, promptBatch(projectId))
+    }
+
+    private fun setPromptState(projectId: String, promptIndex: Int, promptBatch: Int) {
         dbHelper.writableDatabase.insertWithOnConflict(
             TABLE_PROMPT_STATE,
             null,
             ContentValues().apply {
                 put("project_id", projectId)
                 put("prompt_index", promptIndex.coerceAtLeast(0))
+                put("prompt_batch", promptBatch.coerceAtLeast(0))
             },
             SQLiteDatabase.CONFLICT_REPLACE,
         )
@@ -166,6 +274,7 @@ class ProjectStore(context: Context) {
                 sampleRateHz = item.getInt("sample_rate_hz"),
                 channels = item.getInt("channels"),
                 encoding = item.getString("encoding"),
+                conditions = emptyList(),
             )
             db.insertWithOnConflict(
                 TABLE_CLIPS,
@@ -217,6 +326,7 @@ class ProjectStore(context: Context) {
                     sample_rate_hz INTEGER NOT NULL,
                     channels INTEGER NOT NULL,
                     encoding TEXT NOT NULL,
+                    condition_tags TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
                 )
                 """.trimIndent(),
@@ -226,35 +336,65 @@ class ProjectStore(context: Context) {
                 CREATE TABLE $TABLE_PROMPT_STATE (
                     project_id TEXT PRIMARY KEY,
                     prompt_index INTEGER NOT NULL,
+                    prompt_batch INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
                 )
                 """.trimIndent(),
             )
+            createBulkRecordingsTable(db)
             db.execSQL("CREATE INDEX clips_project_id_idx ON $TABLE_CLIPS(project_id)")
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            db.execSQL("DROP TABLE IF EXISTS $TABLE_PROMPT_STATE")
-            db.execSQL("DROP TABLE IF EXISTS $TABLE_CLIPS")
-            db.execSQL("DROP TABLE IF EXISTS $TABLE_PROJECTS")
-            onCreate(db)
+            if (oldVersion < 2) {
+                db.execSQL("ALTER TABLE $TABLE_CLIPS ADD COLUMN condition_tags TEXT NOT NULL DEFAULT ''")
+            }
+            if (oldVersion < 3) {
+                db.execSQL("ALTER TABLE $TABLE_PROMPT_STATE ADD COLUMN prompt_batch INTEGER NOT NULL DEFAULT 0")
+            }
+            if (oldVersion < 4) {
+                createBulkRecordingsTable(db)
+            }
         }
 
         override fun onConfigure(db: SQLiteDatabase) {
             super.onConfigure(db)
             db.setForeignKeyConstraintsEnabled(true)
         }
+
+        private fun createBulkRecordingsTable(db: SQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS $TABLE_BULK_RECORDINGS (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    project_slug TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    script TEXT NOT NULL,
+                    recorded_at_millis INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    sample_rate_hz INTEGER NOT NULL,
+                    channels INTEGER NOT NULL,
+                    encoding TEXT NOT NULL,
+                    condition_tags TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS bulk_recordings_project_id_idx ON $TABLE_BULK_RECORDINGS(project_id)")
+        }
     }
 
     private companion object {
         const val DATABASE_NAME = "wake_word_collection.db"
-        const val DATABASE_VERSION = 1
+        const val DATABASE_VERSION = 4
         const val LEGACY_PREFS = "wake_word_projects"
         const val KEY_PROJECTS = "projects"
         const val KEY_MIGRATED = "sqlite_migrated"
         const val TABLE_PROJECTS = "projects"
         const val TABLE_CLIPS = "clips"
         const val TABLE_PROMPT_STATE = "prompt_state"
+        const val TABLE_BULK_RECORDINGS = "bulk_recordings"
 
         fun legacyClipsKey(projectId: String): String = "clips_$projectId"
 
@@ -284,6 +424,22 @@ private fun ClipRecord.toContentValues(): ContentValues =
         put("sample_rate_hz", sampleRateHz)
         put("channels", channels)
         put("encoding", encoding)
+        put("condition_tags", conditions.joinToString(",") { it.name })
+    }
+
+private fun BulkRecording.toContentValues(): ContentValues =
+    ContentValues().apply {
+        put("id", id)
+        put("project_id", projectId)
+        put("project_slug", projectSlug)
+        put("file_path", filePath)
+        put("script", script)
+        put("recorded_at_millis", recordedAtMillis)
+        put("duration_ms", durationMs)
+        put("sample_rate_hz", sampleRateHz)
+        put("channels", channels)
+        put("encoding", encoding)
+        put("condition_tags", conditions.joinToString(",") { it.name })
     }
 
 private fun Cursor.toProject(): WakeWordProject =
@@ -307,11 +463,40 @@ private fun Cursor.toClip(): ClipRecord =
         durationMs = getLongValue("duration_ms"),
         sampleRateHz = getIntValue("sample_rate_hz"),
         channels = getIntValue("channels"),
+    encoding = getStringValue("encoding"),
+    conditions = getOptionalStringValue("condition_tags")
+        .split(',')
+        .mapNotNull { raw ->
+            raw.takeIf { it.isNotBlank() }?.let { runCatching { ClipCondition.valueOf(it) }.getOrNull() }
+        },
+)
+
+private fun Cursor.toBulkRecording(): BulkRecording =
+    BulkRecording(
+        id = getStringValue("id"),
+        projectId = getStringValue("project_id"),
+        projectSlug = getStringValue("project_slug"),
+        filePath = getStringValue("file_path"),
+        script = getStringValue("script"),
+        recordedAtMillis = getLongValue("recorded_at_millis"),
+        durationMs = getLongValue("duration_ms"),
+        sampleRateHz = getIntValue("sample_rate_hz"),
+        channels = getIntValue("channels"),
         encoding = getStringValue("encoding"),
+        conditions = getOptionalStringValue("condition_tags")
+            .split(',')
+            .mapNotNull { raw ->
+                raw.takeIf { it.isNotBlank() }?.let { runCatching { ClipCondition.valueOf(it) }.getOrNull() }
+            },
     )
 
 private fun Cursor.getStringValue(column: String): String =
     getString(getColumnIndexOrThrow(column))
+
+private fun Cursor.getOptionalStringValue(column: String): String {
+    val index = getColumnIndex(column)
+    return if (index >= 0) getString(index) ?: "" else ""
+}
 
 private fun Cursor.getIntValue(column: String): Int =
     getInt(getColumnIndexOrThrow(column))

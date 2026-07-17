@@ -10,6 +10,8 @@ the LiveKit training layout without guessing.
   manifest.json
   audio/
     <clip_id>.wav
+  bulk_audio/
+    <bulk_recording_id>.wav
 ```
 
 Bundles may be zipped for transfer, but the unzipped shape should match this
@@ -98,6 +100,20 @@ Initial schema version: `1`.
       "channels": 1,
       "encoding": "pcm_s16le",
       "session_id": "session_20260715_2140",
+      "notes": ""
+    }
+  ],
+  "bulk_recordings": [
+    {
+      "id": "bulk_20260716_134501_001",
+      "file": "bulk_audio/bulk_20260716_134501_001.wav",
+      "script": "Exact text shown to the speaker, including wake phrases.",
+      "recorded_at": "2026-07-16T13:45:01Z",
+      "duration_ms": 45000,
+      "sample_rate_hz": 16000,
+      "channels": 1,
+      "encoding": "pcm_s16le",
+      "session_id": "bulk",
       "notes": ""
     }
   ]

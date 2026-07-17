@@ -72,11 +72,26 @@ Current scaffold:
   `wake_word_collection.db`.
 - The SQLite store includes a one-time migration from the original
   `SharedPreferences` metadata format.
-- Prompt generation creates a deterministic mixed batch per project.
+- Prompt generation creates deterministic mixed batches per project and batch
+  number. Completing a batch advances to a fresh lexicon-backed batch instead of
+  looping the same prompts forever.
+- The primary collection workflow is now bulk-script recording, server-side
+  split generation, and review of generated slices. The old one-prompt-at-a-time
+  collector is no longer part of the primary project screen.
 - The UI has a top-left hamburger button that opens the project drawer, plus a
-  top-right settings gear for server URL and appearance controls.
+  top-right settings gear that navigates to a dedicated settings page.
+- Settings include the sync server URL, an optional Whisper server URL,
+  appearance controls, and reset controls.
 - Prompt recording supports direct prompt picking, previous, and skip controls
   so the user is not forced to restart or follow the generated order exactly.
+- The project page has a recording-mode selector for short prompted collection
+  and bulk scripted collection. Bulk mode records one long script WAV and exports
+  the exact script for server-side Whisper alignment and slicing. Bulk scripts
+  use generated natural read-aloud sentences with dictionary content words,
+  phonetic near-miss phrases, and neutral lead-in before the first wake phrase.
+  The displayed script highlights true wake phrases in bold green and near-miss
+  hard negatives in bold red. Settings include a configurable wake-placement
+  count for controlling bulk script length.
 - Basic recording currently writes 16 kHz mono PCM WAV files into app-private
   storage under `filesDir/clips/<wake_word_slug>/`.
 - Bundle export currently writes unzipped training bundles into app-private
@@ -96,14 +111,16 @@ android/app/build/outputs/apk/debug/app-debug.apk
 ## First App Features
 
 1. Create a wake-word project with a phrase and slug.
-2. Generate a randomized prompt batch.
+2. Generate a randomized short prompt batch.
 3. Pick any prompt from the batch and record clips in the order that makes
    sense during collection.
-4. Label clips as `positive`, `negative`, `hard_negative`, `background`,
+4. Switch to bulk script mode to record a generated long read-aloud script for
+   server-side Whisper alignment and slicing.
+5. Label clips as `positive`, `negative`, `hard_negative`, `background`,
    `false_positive`, or `false_negative`.
-5. Review, replay, and delete clips.
-6. Show collection counts by label and phrase.
-7. Export a training bundle.
+6. Review, replay, and delete clips.
+7. Show collection counts by label and phrase.
+8. Export a training bundle.
 
 ## Export Contract
 
@@ -157,6 +174,56 @@ The container exposes `POST /sync` on port `8765`, stores the raw upload under
 `incoming/bundles/`, validates the bundle, and imports clips into
 `data/real/<wake_word_slug>/`. Repeated syncs are idempotent for already-imported
 clip files.
+
+When settings are saved, the Android app sends the sync server URL and optional
+Whisper server URL to `POST /settings`; the sync server persists them in
+`data/server_settings.json`. When configured, the app also sends the optional
+Whisper server URL in the `X-Whisper-Server-Url` request header during
+`POST /sync`, and the sync server echoes that value in the sync response so
+alignment tooling can be connected next.
+
+Settings can also load server projects with `GET /projects`. This imports only
+wake-word project metadata into the local SQLite database, so a tablet can
+select a project created on a phone and load server-side bulk review slices
+without downloading the original phone recordings.
+
+If a bundle includes `bulk_recordings`, the sync server posts the long WAV to
+the configured Whisper server with `response_format=verbose_json` and
+`word_timestamps=true`. It slices positive clips around aligned wake-phrase
+occurrences and negative clips from nearby non-wake speech, then writes them
+into the normal `data/real/<wake_word_slug>/` layout with provenance metadata.
+When a wake phrase is too close to the start of the recording for full pre-roll
+padding, the server adds extra trailing context so the positive slice is still
+long enough to train on.
+The server treats each bulk recording independently, so a Whisper or slicing
+failure on one long recording is reported as a warning and does not stop later
+bulk recordings from being processed.
+
+Before uploading, the Android app calls `GET /bulk/<wake_word_slug>/recordings`
+and leaves out long bulk WAVs whose IDs already have generated server slices.
+
+Bulk mode can also load generated slice review data back from the sync server.
+The project overview has a `Split batch` button that uploads all saved bulk
+recordings for the selected project to `POST /sync`, runs server-side Whisper
+alignment and slicing, then reloads generated review clips. Recording a new bulk
+script is a separate page, and each saved bulk recording opens a detail page
+with the original script, source timing, and generated slices from that
+recording. The app also calls
+`GET /review/<wake_word_slug>/bulk`, lists the generated positive and negative
+slices with Whisper transcript text, timing, duration, and average word
+confidence, shows the first six characters of each generated slice hash for
+reporting bad examples, highlights the wake phrase green in positive slices and
+red in negative slices, streams each slice from
+`GET /review/<slug>/<category>/<file>`, and can reject a bad slice with
+`DELETE /review/<slug>/<category>/<file>`. Review slices can be filtered between
+all, positive, and negative clips.
+
+Each review row can also open source timing for its source recording. The app
+loads `GET /review/<slug>/bulk/<recording_id>/alignment`, streams the original
+bulk WAV from `GET /review/<slug>/bulk/<recording_id>/audio`, highlights the
+current Whisper word during playback, and shows generated cut markers inline.
+Slice and source playback buttons toggle between play and pause while their
+audio is active.
 
 ## Build And Test Loop
 
