@@ -9,6 +9,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaPlayer
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -23,6 +24,7 @@ import android.text.style.StyleSpan
 import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
@@ -53,6 +55,7 @@ class MainActivity : Activity() {
     private var bulkScriptRevision: Int = 0
     private var reprocessing: Boolean = false
     private var darkMode: Boolean = false
+    private var appearanceMode: String = APPEARANCE_SYSTEM
     private var selectedProjectId: String? = null
     private var selectedBulkRecordingId: String? = null
     private var activeProject: WakeWordProject? = null
@@ -85,8 +88,10 @@ class MainActivity : Activity() {
         recorder = WavRecorder(this)
         exporter = BundleExporter(this)
         lexicon = PromptLexicon(this)
-        darkMode = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_DARK_MODE, false)
+        val prefs = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+        appearanceMode = prefs.getString(KEY_APPEARANCE, null)
+            ?: if (prefs.getBoolean(KEY_DARK_MODE, false)) APPEARANCE_DARK else APPEARANCE_SYSTEM
+        darkMode = resolveDarkMode()
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
@@ -137,6 +142,7 @@ class MainActivity : Activity() {
 
         window.statusBarColor = surfaceColor()
         window.navigationBarColor = navColor()
+        applyBarAppearance()
         root.setBackgroundColor(surfaceColor())
         workspaceScroll.setBackgroundColor(surfaceColor())
 
@@ -417,8 +423,9 @@ class MainActivity : Activity() {
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton("Light", if (!darkMode) ButtonStyle.Primary else ButtonStyle.Secondary) { setDarkMode(false) })
-                    addView(actionButton("Dark", if (darkMode) ButtonStyle.Primary else ButtonStyle.Secondary) { setDarkMode(true) }.withLeft(dp(8)))
+                    addView(actionButton("System", if (appearanceMode == APPEARANCE_SYSTEM) ButtonStyle.Primary else ButtonStyle.Secondary) { setAppearance(APPEARANCE_SYSTEM) })
+                    addView(actionButton("Light", if (appearanceMode == APPEARANCE_LIGHT) ButtonStyle.Primary else ButtonStyle.Secondary) { setAppearance(APPEARANCE_LIGHT) }.withLeft(dp(8)))
+                    addView(actionButton("Dark", if (appearanceMode == APPEARANCE_DARK) ButtonStyle.Primary else ButtonStyle.Secondary) { setAppearance(APPEARANCE_DARK) }.withLeft(dp(8)))
                 }.withTop(dp(8)),
             )
             addView(text("Training data", 15f, mutedColor()).withTop(dp(18)))
@@ -1271,13 +1278,45 @@ class MainActivity : Activity() {
         render()
     }
 
-    private fun setDarkMode(enabled: Boolean) {
-        darkMode = enabled
+    private fun setAppearance(mode: String) {
+        appearanceMode = mode
+        darkMode = resolveDarkMode()
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(KEY_DARK_MODE, enabled)
+            .putString(KEY_APPEARANCE, mode)
+            .remove(KEY_DARK_MODE)
             .apply()
         render()
+    }
+
+    private fun systemInDarkMode(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+
+    private fun resolveDarkMode(): Boolean = when (appearanceMode) {
+        APPEARANCE_LIGHT -> false
+        APPEARANCE_DARK -> true
+        else -> systemInDarkMode()
+    }
+
+    // Keep the status- and navigation-bar icons legible: light (dark-on-light)
+    // icons for the light theme, and light-colored icons for the dark theme.
+    private fun applyBarAppearance() {
+        val lightBars = !darkMode
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            window.insetsController?.setSystemBarsAppearance(if (lightBars) mask else 0, mask)
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                var flags = window.decorView.systemUiVisibility
+                val bits = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
+                    View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                flags = if (lightBars) flags or bits else flags and bits.inv()
+                window.decorView.systemUiVisibility = flags
+            }
+        }
     }
 
     private fun confirmResetTrainingData() {
@@ -1833,6 +1872,10 @@ class MainActivity : Activity() {
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
         const val KEY_BULK_POSITIVE_DENSE = "bulk_positive_dense"
         const val KEY_DARK_MODE = "dark_mode"
+        const val KEY_APPEARANCE = "appearance_mode"
+        const val APPEARANCE_SYSTEM = "system"
+        const val APPEARANCE_LIGHT = "light"
+        const val APPEARANCE_DARK = "dark"
         const val DEFAULT_SYNC_SERVER_URL = "http://100.64.0.2:8765"
         val ACCENT: Int = Color.rgb(37, 110, 112)
     }
