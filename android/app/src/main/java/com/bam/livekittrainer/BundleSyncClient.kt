@@ -181,6 +181,46 @@ class BundleSyncClient(
         )
     }
 
+    /** Re-run alignment and slicing on the server from already-uploaded audio. */
+    fun reprocessProject(wakeWordSlug: String): String {
+        return postReprocess(serverUrl.trimEnd('/') + "/reprocess/${urlPart(wakeWordSlug)}")
+    }
+
+    /** Re-run alignment and slicing for a single already-uploaded recording. */
+    fun reprocessRecording(wakeWordSlug: String, sourceRecording: String): String {
+        return postReprocess(
+            serverUrl.trimEnd('/') +
+                "/reprocess/${urlPart(wakeWordSlug)}/${urlPart(sourceRecording)}",
+        )
+    }
+
+    private fun postReprocess(url: String): String {
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 120_000
+        if (whisperServerUrl.isNotBlank()) {
+            connection.setRequestProperty("X-Whisper-Server-Url", whisperServerUrl)
+        }
+        // Some servers require a content length for POST; send an empty body.
+        connection.doOutput = true
+        connection.setFixedLengthStreamingMode(0)
+        val response = readResponse(connection, "Reprocess failed")
+        return JSONObject(response).optString("alignment_output", response)
+    }
+
+    /** Delete a recording, its slices, and stored source WAV on the server. */
+    fun deleteRecording(wakeWordSlug: String, sourceRecording: String): String {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') + "/bulk/${urlPart(wakeWordSlug)}/${urlPart(sourceRecording)}",
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "DELETE"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        return readResponse(connection, "Delete recording failed")
+    }
+
     fun deleteBulkReviewClip(wakeWordSlug: String, clip: BulkReviewClip): String {
         val endpoint = URL(reviewClipUrl(wakeWordSlug, clip.category, clip.fileName))
         val connection = endpoint.openConnection() as HttpURLConnection

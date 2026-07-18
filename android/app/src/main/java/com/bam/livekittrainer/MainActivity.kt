@@ -38,16 +38,15 @@ class MainActivity : Activity() {
     private lateinit var exporter: BundleExporter
     private lateinit var lexicon: PromptLexicon
     private lateinit var root: LinearLayout
-    private lateinit var sidebar: LinearLayout
+    private lateinit var bottomNav: LinearLayout
     private lateinit var workspaceScroll: ScrollView
     private lateinit var workspace: LinearLayout
-    private lateinit var phraseInput: EditText
     private lateinit var serverUrlInput: EditText
     private lateinit var whisperServerUrlInput: EditText
     private lateinit var bulkWakePlacementsInput: EditText
-    private var drawerOpen: Boolean = false
-    private var currentPage: AppPage = AppPage.Project
+    private var currentPage: AppPage = AppPage.Record
     private var bulkScriptRevision: Int = 0
+    private var reprocessing: Boolean = false
     private var darkMode: Boolean = false
     private var selectedProjectId: String? = null
     private var selectedBulkRecordingId: String? = null
@@ -85,7 +84,7 @@ class MainActivity : Activity() {
         window.navigationBarColor = surfaceColor()
 
         root = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(surfaceColor())
         }
         root.setOnApplyWindowInsetsListener { view, insets ->
@@ -94,28 +93,26 @@ class MainActivity : Activity() {
             insets
         }
 
-        sidebar = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(18), dp(14), dp(18))
-            setBackgroundColor(sidebarColor())
-            layoutParams = LinearLayout.LayoutParams(dp(184), LinearLayout.LayoutParams.MATCH_PARENT)
-        }
-
         workspace = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(14), dp(16), dp(18))
+            setPadding(dp(18), dp(14), dp(18), dp(24))
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         }
 
         workspaceScroll = ScrollView(this).apply {
             addView(workspace)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
             isFillViewport = false
             setBackgroundColor(surfaceColor())
         }
 
-        root.addView(sidebar)
+        bottomNav = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+
         root.addView(workspaceScroll)
+        root.addView(bottomNav)
         setContentView(root)
         render()
     }
@@ -127,169 +124,206 @@ class MainActivity : Activity() {
         }
 
         window.statusBarColor = surfaceColor()
-        window.navigationBarColor = surfaceColor()
+        window.navigationBarColor = navColor()
         root.setBackgroundColor(surfaceColor())
-        renderSidebar(projects)
-        sidebar.visibility = if (drawerOpen && currentPage == AppPage.Project) View.VISIBLE else View.GONE
-        sidebar.layoutParams = LinearLayout.LayoutParams(
-            if (drawerOpen) LinearLayout.LayoutParams.MATCH_PARENT else dp(184),
-            LinearLayout.LayoutParams.MATCH_PARENT,
-        )
-        workspaceScroll.visibility = if (drawerOpen && currentPage == AppPage.Project) View.GONE else View.VISIBLE
-        sidebar.setBackgroundColor(sidebarColor())
+        workspaceScroll.setBackgroundColor(surfaceColor())
+        workspaceScroll.scrollTo(0, 0)
+        val project = projects.firstOrNull { it.id == selectedProjectId }
         when (currentPage) {
-            AppPage.Project -> renderWorkspace(projects.firstOrNull { it.id == selectedProjectId })
-            AppPage.BulkRecord -> renderBulkRecordPage(projects.firstOrNull { it.id == selectedProjectId })
-            AppPage.BulkDetail -> renderBulkDetailPage(projects.firstOrNull { it.id == selectedProjectId })
+            AppPage.Record -> renderRecordPage(project)
+            AppPage.Review -> renderReviewPage(project)
+            AppPage.Detail -> renderDetailPage(project)
             AppPage.Settings -> renderSettingsPage()
         }
+        renderBottomNav()
     }
 
-    private fun renderSidebar(projects: List<WakeWordProject>) {
-        sidebar.removeAllViews()
-        sidebar.addView(text("Projects", 21f, textColor(), Typeface.BOLD))
-        sidebar.addView(text("${projects.size} wake words", 13f, mutedColor()).withBottom(dp(16)))
+    private fun renderBottomNav() {
+        bottomNav.removeAllViews()
+        bottomNav.background = topBorder(navColor(), strokeColor())
+        bottomNav.setPadding(dp(6), dp(6), dp(6), dp(6))
+        bottomNav.addView(navTab("Record", "●", AppPage.Record))
+        bottomNav.addView(navTab("Review", "≡", AppPage.Review))
+        bottomNav.addView(navTab("Settings", "⚙", AppPage.Settings))
+    }
 
-        projects.forEach { project ->
-            val bulkCount = store.loadBulkRecordings(project.id).size
-            sidebar.addView(
-                menuRow(project.phrase, "$bulkCount bulk recordings", project.id == selectedProjectId).apply {
-                    setOnClickListener {
-                        selectedProjectId = project.id
-                        drawerOpen = false
-                        render()
-                    }
-                }.withBottom(dp(8)),
+    private fun navTab(label: String, glyph: String, page: AppPage): View {
+        val active = currentPage == page || (page == AppPage.Review && currentPage == AppPage.Detail)
+        val tint = if (active) ACCENT else mutedColor()
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+            background = rounded(if (active) navActiveColor() else Color.TRANSPARENT, dp(14), 0)
+            addView(text(glyph, 19f, tint).apply { gravity = Gravity.CENTER })
+            addView(
+                text(label, 12f, tint, if (active) Typeface.BOLD else Typeface.NORMAL)
+                    .apply { gravity = Gravity.CENTER }.withTop(dp(2)),
             )
+            setOnClickListener {
+                if (currentPage != page) {
+                    statusMessage = ""
+                    currentPage = page
+                    render()
+                }
+            }
         }
     }
 
-    private fun renderWorkspace(project: WakeWordProject?) {
-        workspace.removeAllViews()
-        workspace.addView(topBar())
-
-        if (project == null) {
-            workspace.addView(text("Collect, review, and sync wake-word clips.", 15f, mutedColor()).withBottom(dp(14)))
-            workspace.addView(createProjectCard())
-            workspace.addView(emptyCard("Create a wake word project to start recording.").withTop(dp(14)))
-            return
-        }
-
-        val bulkRecordings = store.loadBulkRecordings(project.id)
-
-        workspace.addView(projectHeader(project, bulkRecordings).withTop(dp(4)))
-        workspace.addView(bulkOverviewCard(project, bulkRecordings).withTop(dp(12)))
-        workspace.addView(createProjectCard().withTop(dp(14)))
-
-        if (statusMessage.isNotBlank()) {
-            workspace.addView(emptyCard(statusMessage).withTop(dp(14)))
-        }
-    }
-
-    private fun topBar(): View {
+    private fun topBar(title: String, showBack: Boolean = false): View {
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, dp(12))
-            addView(
-                iconButton(if (currentPage == AppPage.Settings) "‹" else "☰").apply {
-                    setOnClickListener {
-                        if (currentPage != AppPage.Project) {
-                            currentPage = AppPage.Project
-                            drawerOpen = false
-                        } else {
-                            drawerOpen = !drawerOpen
+            setPadding(0, dp(2), 0, dp(16))
+            if (showBack) {
+                addView(
+                    iconButton("‹").apply {
+                        setOnClickListener {
+                            currentPage = AppPage.Review
+                            render()
                         }
-                        render()
-                    }
-                },
-            )
+                        (layoutParams as LinearLayout.LayoutParams).rightMargin = dp(6)
+                    },
+                )
+            }
             addView(
-                text(pageTitle(), 24f, textColor(), Typeface.BOLD).apply {
-                    gravity = Gravity.CENTER_VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                        leftMargin = dp(10)
-                    }
+                text(title, 27f, textColor(), Typeface.BOLD).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 },
             )
-            addView(
-                iconButton("⚙").apply {
-                    visibility = if (currentPage == AppPage.Project) View.VISIBLE else View.GONE
-                    setOnClickListener {
-                        currentPage = AppPage.Settings
-                        drawerOpen = false
-                        render()
-                    }
-                },
-            )
+            addView(projectChip())
         }
     }
 
-    private fun pageTitle(): String {
-        return when (currentPage) {
-            AppPage.Project -> "Wake Word Trainer"
-            AppPage.BulkRecord -> "New bulk recording"
-            AppPage.BulkDetail -> "Bulk recording"
-            AppPage.Settings -> "Settings"
+    private fun projectChip(): View {
+        val label = activeProjectOrNull()?.phrase ?: "No project"
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(13), dp(9), dp(13), dp(9))
+            background = rounded(promptColor(), dp(20), strokeColor())
+            addView(text(label, 13f, textColor(), Typeface.BOLD))
+            addView(text("  ▾", 12f, mutedColor()))
+            setOnClickListener { showProjectPicker() }
         }
     }
 
-    private fun createProjectCard(): View {
-        phraseInput = EditText(this).apply {
-            hint = "New wake phrase"
+    private fun activeProjectOrNull(): WakeWordProject? {
+        return store.loadProjects().firstOrNull { it.id == selectedProjectId }
+    }
+
+    private fun showProjectPicker() {
+        val projects = store.loadProjects()
+        val labels = projects.map { it.phrase }.toMutableList()
+        labels.add("+  New project…")
+        AlertDialog.Builder(this)
+            .setTitle("Projects")
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which == projects.size) {
+                    promptNewProject()
+                } else {
+                    selectedProjectId = projects[which].id
+                    statusMessage = ""
+                    render()
+                }
+            }
+            .show()
+    }
+
+    private fun promptNewProject() {
+        val input = EditText(this).apply {
+            hint = "Wake phrase"
             setSingleLine()
             imeOptions = EditorInfo.IME_ACTION_DONE
-            textSize = 16f
             styleInput()
         }
-
-        return card().apply {
-            addView(text("New project", 17f, textColor(), Typeface.BOLD))
-            addView(phraseInput.withTop(dp(8)))
-            addView(actionButton("Create project", ButtonStyle.Secondary) { createProject() }.withTop(dp(8)))
+        val wrap = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(input)
         }
+        AlertDialog.Builder(this)
+            .setTitle("New wake word project")
+            .setMessage("The phrase this model should wake on.")
+            .setView(wrap)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Create") { _, _ ->
+                val phrase = input.text.toString().trim()
+                if (phrase.isNotBlank()) {
+                    val project = WakeWordProject(
+                        id = UUID.randomUUID().toString(),
+                        phrase = phrase,
+                        slug = slugifyPhrase(phrase),
+                        createdAtMillis = System.currentTimeMillis(),
+                    )
+                    store.addProject(project)
+                    selectedProjectId = project.id
+                    currentPage = AppPage.Record
+                    statusMessage = "Created project “$phrase”"
+                    render()
+                }
+            }
+            .show()
     }
 
-    private fun renderSettingsPage() {
-        workspace.removeAllViews()
-        workspace.addView(topBar())
-        workspace.addView(settingsCard().withTop(dp(4)))
+    private fun maybeStatus() {
         if (statusMessage.isNotBlank()) {
-            workspace.addView(emptyCard(statusMessage).withTop(dp(14)))
+            workspace.addView(statusStrip(statusMessage).withTop(dp(12)))
         }
     }
 
-    private fun renderBulkRecordPage(project: WakeWordProject?) {
+    private fun renderRecordPage(project: WakeWordProject?) {
         workspace.removeAllViews()
-        workspace.addView(topBar())
+        workspace.addView(topBar("Record"))
         if (project == null) {
-            workspace.addView(emptyCard("Create a wake word project before recording bulk audio.").withTop(dp(8)))
+            workspace.addView(emptyCard("Create a wake word project to start recording. Tap the project chip above."))
+            maybeStatus()
             return
         }
         val bulkRecordings = store.loadBulkRecordings(project.id)
-        workspace.addView(bulkScriptCard(project, bulkRecordings).withTop(dp(4)))
-        if (statusMessage.isNotBlank()) {
-            workspace.addView(emptyCard(statusMessage).withTop(dp(14)))
-        }
+        workspace.addView(bulkScriptCard(project, bulkRecordings))
+        maybeStatus()
     }
 
-    private fun renderBulkDetailPage(project: WakeWordProject?) {
+    private fun renderReviewPage(project: WakeWordProject?) {
         workspace.removeAllViews()
-        workspace.addView(topBar())
+        workspace.addView(topBar("Review"))
         if (project == null) {
-            workspace.addView(emptyCard("Create a wake word project before reviewing bulk audio.").withTop(dp(8)))
+            workspace.addView(emptyCard("Create a project and record a bulk take first."))
+            maybeStatus()
+            return
+        }
+        val bulkRecordings = store.loadBulkRecordings(project.id)
+        workspace.addView(syncCard(project, bulkRecordings))
+        workspace.addView(recordingsCard(project, bulkRecordings).withTop(dp(12)))
+        maybeStatus()
+    }
+
+    private fun renderDetailPage(project: WakeWordProject?) {
+        workspace.removeAllViews()
+        workspace.addView(topBar("Recording", showBack = true))
+        if (project == null) {
+            workspace.addView(emptyCard("Project not found."))
+            maybeStatus()
             return
         }
         val recording = store.loadBulkRecordings(project.id)
             .firstOrNull { it.id == selectedBulkRecordingId }
         if (recording == null) {
-            workspace.addView(emptyCard("Bulk recording not found.").withTop(dp(8)))
+            workspace.addView(emptyCard("Bulk recording not found."))
+            maybeStatus()
             return
         }
-        workspace.addView(bulkRecordingDetailCard(project, recording).withTop(dp(4)))
-        if (statusMessage.isNotBlank()) {
-            workspace.addView(emptyCard(statusMessage).withTop(dp(14)))
-        }
+        workspace.addView(bulkRecordingDetailCard(project, recording))
+        maybeStatus()
+    }
+
+    private fun renderSettingsPage() {
+        workspace.removeAllViews()
+        workspace.addView(topBar("Settings"))
+        workspace.addView(settingsCard())
+        maybeStatus()
     }
 
     private fun settingsCard(): View {
@@ -356,32 +390,58 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun bulkOverviewCard(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
+    private fun syncCard(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
         val reviewClips = if (bulkReviewProjectSlug == project.slug) bulkReviewClips else emptyList()
         val reviewCounts = reviewClips.groupingBy { it.label }.eachCount()
+        val busy = processingBulkSplit || reprocessing
         return card().apply {
-            addView(text("Bulk recordings", 20f, textColor(), Typeface.BOLD))
+            addView(text("Sync & process", 20f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "Upload your bulk takes; the server transcribes and slices them into training clips.",
+                    14f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                actionButton(if (processingBulkSplit) "Syncing…" else "Sync & process", ButtonStyle.Primary) {
+                    syncAndProcess(project, bulkRecordings)
+                }.apply { isEnabled = !busy }.tall().withTop(dp(12)),
+            )
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton("New recording", ButtonStyle.Primary) {
-                        currentPage = AppPage.BulkRecord
-                        drawerOpen = false
-                        render()
-                    })
-                    addView(actionButton(if (processingBulkSplit) "Splitting" else "Split batch", ButtonStyle.Secondary) {
-                        splitBulkBatch(project, bulkRecordings)
-                    }.apply { isEnabled = !processingBulkSplit }.withLeft(dp(8)))
-                    addView(actionButton(if (loadingBulkReview) "Loading" else "Load review", ButtonStyle.Secondary) {
-                        loadBulkReview(project)
-                    }.apply { isEnabled = !loadingBulkReview }.withLeft(dp(8)))
+                    addView(
+                        actionButton(if (reprocessing) "Reprocessing…" else "Reprocess", ButtonStyle.Secondary) {
+                            reprocessProject(project)
+                        }.apply { isEnabled = !busy }.weight1(),
+                    )
+                    addView(
+                        actionButton(if (loadingBulkReview) "Loading…" else "Refresh slices", ButtonStyle.Secondary) {
+                            loadBulkReview(project)
+                        }.apply { isEnabled = !loadingBulkReview }.weight1().withLeft(dp(8)),
+                    )
                 }.withTop(dp(8)),
             )
-            if (reviewClips.isNotEmpty()) {
-                addView(text("${reviewCounts["positive"] ?: 0} positive, ${reviewCounts["negative"] ?: 0} negative", 14f, mutedColor()).withTop(dp(8)))
-            }
+            addView(
+                text(
+                    if (reviewClips.isNotEmpty()) {
+                        "${reviewCounts["positive"] ?: 0} positive · ${reviewCounts["negative"] ?: 0} negative clips"
+                    } else {
+                        "Reprocess re-slices audio already on the server without re-uploading."
+                    },
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(10)),
+            )
+        }
+    }
+
+    private fun recordingsCard(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
+        return card().apply {
+            addView(text("Bulk recordings  ${bulkRecordings.size}", 18f, textColor(), Typeface.BOLD))
             if (bulkRecordings.isEmpty()) {
-                addView(text("No bulk recordings yet.", 14f, mutedColor()).withTop(dp(10)))
+                addView(text("No bulk recordings yet. Record one on the Record tab.", 14f, mutedColor()).withTop(dp(8)))
             } else {
                 bulkRecordings.forEach { recording ->
                     addView(bulkRecordingRow(recording).withTop(dp(8)))
@@ -398,6 +458,7 @@ class MainActivity : Activity() {
         }
         val alignment = bulkAlignment
             ?.takeIf { bulkAlignmentProjectSlug == project.slug && it.sourceRecording == recording.id }
+        val busy = processingBulkSplit || reprocessing
         return card().apply {
             addView(text("Bulk recording  ${recording.durationMs / 1000}s", 20f, textColor(), Typeface.BOLD))
             addView(text(File(recording.filePath).name, 12f, mutedColor()).withTop(dp(2)))
@@ -406,21 +467,38 @@ class MainActivity : Activity() {
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton(if (loadingBulkAlignment) "Loading timing" else "Load source timing", ButtonStyle.Secondary) {
-                        loadBulkAlignment(project, recording.id)
-                    }.apply { isEnabled = !loadingBulkAlignment })
-                    addView(actionButton(if (loadingBulkReview) "Loading slices" else "Load slices", ButtonStyle.Secondary) {
-                        loadBulkReview(project)
-                    }.apply { isEnabled = !loadingBulkReview }.withLeft(dp(8)))
-                    addView(actionButton("Delete recording", ButtonStyle.Ghost) { deleteBulkRecording(recording) }.withLeft(dp(8)))
+                    addView(
+                        actionButton(if (reprocessing) "Reprocessing…" else "Reprocess", ButtonStyle.Primary) {
+                            reprocessRecording(project, recording)
+                        }.apply { isEnabled = !busy }.weight1(),
+                    )
+                    addView(
+                        actionButton(if (loadingBulkReview) "Loading…" else "Refresh slices", ButtonStyle.Secondary) {
+                            loadBulkReview(project)
+                        }.apply { isEnabled = !loadingBulkReview }.weight1().withLeft(dp(8)),
+                    )
                 }.withTop(dp(12)),
             )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton(if (loadingBulkAlignment) "Loading timing" else "Source timing", ButtonStyle.Secondary) {
+                            loadBulkAlignment(project, recording.id)
+                        }.apply { isEnabled = !loadingBulkAlignment }.weight1(),
+                    )
+                    addView(
+                        actionButton("Delete", ButtonStyle.Danger) { confirmDeleteRecording(recording) }
+                            .weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(8)),
+            )
             if (alignment != null || loadingBulkAlignment) {
-                addView(bulkAlignmentCard(project, alignment).withTop(dp(10)))
+                addView(bulkAlignmentCard(project, alignment).withTop(dp(12)))
             }
-            addView(text("Slices", 18f, textColor(), Typeface.BOLD).withTop(dp(14)))
+            addView(text("Slices  ${reviewClips.size}", 18f, textColor(), Typeface.BOLD).withTop(dp(16)))
             if (reviewClips.isEmpty()) {
-                addView(text("No slices loaded for this recording.", 14f, mutedColor()).withTop(dp(6)))
+                addView(text("No slices for this recording yet. Reprocess or refresh slices.", 14f, mutedColor()).withTop(dp(6)))
             } else {
                 reviewClips.forEach { clip ->
                     addView(bulkReviewRow(project, clip).withTop(dp(8)))
@@ -439,60 +517,36 @@ class MainActivity : Activity() {
             wakePlacements,
         )
         val script = scriptContent.text
+        val recordingThisProject = recorder.isRecording && activeProject?.id == project.id
         return card().apply {
-            addView(text("Bulk collection", 20f, textColor(), Typeface.BOLD))
-            addView(bulkScriptText(scriptContent, project.phrase).withTop(dp(10)))
-            addView(text("$wakePlacements wake placements, ${bulkRecordings.size} saved bulk recordings", 14f, mutedColor()).withTop(dp(8)))
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton("Refresh", ButtonStyle.Secondary) {
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        text("Bulk script", 20f, textColor(), Typeface.BOLD).apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        },
+                    )
+                    addView(actionButton("Shuffle", ButtonStyle.Secondary) {
                         bulkScriptRevision += 1
                         statusMessage = "Generated a new bulk script"
                         render()
                     })
-                    val recordingThisProject = recorder.isRecording && activeProject?.id == project.id
-                    addView(actionButton(if (recordingThisProject) "Stop" else "Record script", if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Primary) {
-                        toggleBulkRecording(project, script)
-                    }.withLeft(dp(8)))
-                }.withTop(dp(12)),
-            )
-        }
-    }
-
-    private fun projectHeader(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
-        val reviewClips = if (bulkReviewProjectSlug == project.slug) bulkReviewClips else emptyList()
-        return card().apply {
-            addView(text(project.phrase, 26f, textColor(), Typeface.BOLD))
-            addView(text(project.slug, 14f, mutedColor()).withBottom(dp(12)))
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    addView(statChip("Bulk WAVs", bulkRecordings.size))
-                    addView(statChip("Review slices", reviewClips.size).withLeft(dp(8)))
-                    addView(statChip("Wake placements", savedBulkWakePlacements()).withLeft(dp(8)))
                 },
             )
+            addView(text("Read the whole script in one take. Bold green is the wake phrase; red are near-misses.", 13f, mutedColor()).withTop(dp(4)))
+            addView(bulkScriptText(scriptContent, project.phrase).withTop(dp(12)))
+            addView(text("$wakePlacements wake placements · ${bulkRecordings.size} saved takes", 13f, mutedColor()).withTop(dp(10)))
+            addView(
+                actionButton(
+                    if (recordingThisProject) "◼  Stop recording" else "●  Record script",
+                    if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Primary,
+                ) {
+                    toggleBulkRecording(project, script)
+                }.tall().withTop(dp(14)),
+            )
         }
-    }
-
-    private fun createProject() {
-        val phrase = phraseInput.text.toString().trim()
-        if (phrase.isBlank()) {
-            phraseInput.error = "Phrase required"
-            return
-        }
-
-        val project = WakeWordProject(
-            id = UUID.randomUUID().toString(),
-            phrase = phrase,
-            slug = slugifyPhrase(phrase),
-            createdAtMillis = System.currentTimeMillis(),
-        )
-        store.addProject(project)
-        selectedProjectId = project.id
-        phraseInput.text.clear()
-        render()
     }
 
     private fun toggleBulkRecording(project: WakeWordProject, script: String) {
@@ -533,20 +587,44 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun confirmDeleteRecording(recording: BulkRecording) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete this recording?")
+            .setMessage("Removes the local take and its slices from the server. This cannot be undone.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ -> deleteBulkRecording(recording) }
+            .show()
+    }
+
     private fun deleteBulkRecording(recording: BulkRecording) {
         player?.release()
         player = null
         activePlaybackKey = null
         File(recording.filePath).delete()
         store.deleteBulkRecording(recording)
+        // Drop any loaded slices for this recording so the UI updates at once.
+        bulkReviewClips = bulkReviewClips.filterNot { it.sourceRecording == recording.id }
+        val serverUrl = savedServerUrl()
+        currentPage = AppPage.Review
         statusMessage = "Deleted bulk recording"
         render()
+
+        if (serverUrl.isNotBlank()) {
+            Thread {
+                try {
+                    BundleSyncClient(serverUrl, savedWhisperServerUrl())
+                        .deleteRecording(recording.projectSlug, recording.id)
+                } catch (_: Exception) {
+                    // Local delete already happened; a stale server copy is harmless.
+                }
+            }.start()
+        }
     }
 
-    private fun splitBulkBatch(project: WakeWordProject, bulkRecordings: List<BulkRecording>) {
+    private fun syncAndProcess(project: WakeWordProject, bulkRecordings: List<BulkRecording>) {
         val serverUrl = savedServerUrl()
         if (serverUrl.isBlank()) {
-            statusMessage = "Server URL required"
+            statusMessage = "Set a sync server URL in Settings first"
             currentPage = AppPage.Settings
             render()
             return
@@ -558,7 +636,7 @@ class MainActivity : Activity() {
         }
 
         processingBulkSplit = true
-        statusMessage = "Splitting ${bulkRecordings.size} bulk recordings"
+        statusMessage = "Syncing ${bulkRecordings.size} bulk recordings…"
         render()
 
         Thread {
@@ -575,16 +653,68 @@ class MainActivity : Activity() {
                     processingBulkSplit = false
                     val alignmentMessage = syncAlignmentMessage(response)
                     statusMessage = if (clips.isEmpty()) {
-                        "No generated slices. $alignmentMessage"
+                        "No clips generated. $alignmentMessage"
                     } else {
-                        "Split batch; loaded ${clips.size} slices"
+                        "Synced and sliced ${clips.size} clips"
                     }
                     render()
                 }
             } catch (error: Exception) {
                 runOnUiThread {
                     processingBulkSplit = false
-                    statusMessage = error.message ?: "Split batch failed"
+                    statusMessage = error.message ?: "Sync failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    private fun reprocessProject(project: WakeWordProject) {
+        runReprocess(project, "Reprocessing all recordings…") { client ->
+            client.reprocessProject(project.slug)
+        }
+    }
+
+    private fun reprocessRecording(project: WakeWordProject, recording: BulkRecording) {
+        runReprocess(project, "Reprocessing recording…") { client ->
+            client.reprocessRecording(project.slug, recording.id)
+        }
+    }
+
+    private fun runReprocess(
+        project: WakeWordProject,
+        pending: String,
+        call: (BundleSyncClient) -> String,
+    ) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        reprocessing = true
+        statusMessage = pending
+        render()
+
+        Thread {
+            try {
+                val client = BundleSyncClient(serverUrl, savedWhisperServerUrl())
+                val message = call(client)
+                val clips = client.loadBulkReview(project.slug)
+                runOnUiThread {
+                    bulkReviewProjectSlug = project.slug
+                    bulkReviewClips = clips
+                    bulkAlignmentProjectSlug = null
+                    bulkAlignment = null
+                    reprocessing = false
+                    statusMessage = message.ifBlank { "Reprocessed ${clips.size} clips" }
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    reprocessing = false
+                    statusMessage = error.message ?: "Reprocess failed"
                     render()
                 }
             }
@@ -611,9 +741,9 @@ class MainActivity : Activity() {
                     bulkReviewClips = clips
                     loadingBulkReview = false
                     statusMessage = if (clips.isEmpty()) {
-                        "No generated slices. Press Split batch, and check the Whisper server URL."
+                        "No clips yet. Tap Sync & process, and check the Whisper server URL."
                     } else {
-                        "Loaded ${clips.size} generated slices"
+                        "Loaded ${clips.size} clips"
                     }
                     render()
                 }
@@ -880,7 +1010,7 @@ class MainActivity : Activity() {
                         selectedProjectId = projects.firstOrNull()?.id
                     }
                     statusMessage = "Loaded ${projects.size} server projects"
-                    currentPage = AppPage.Project
+                    currentPage = AppPage.Record
                     render()
                 }
             } catch (error: Exception) {
@@ -948,8 +1078,7 @@ class MainActivity : Activity() {
         selectedProjectId = null
         val clipCount = store.resetAllData()
         statusMessage = "Deleted all training data and $clipCount clips"
-        currentPage = AppPage.Project
-        drawerOpen = false
+        currentPage = AppPage.Record
         render()
     }
 
@@ -964,8 +1093,8 @@ class MainActivity : Activity() {
     private fun card(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = rounded(cardColor(), dp(12), strokeColor())
+            setPadding(dp(18), dp(18), dp(18), dp(18))
+            background = rounded(cardColor(), dp(18), strokeColor())
         }
     }
 
@@ -986,7 +1115,7 @@ class MainActivity : Activity() {
             stateListAnimator = null
             setPadding(dp(14), 0, dp(14), 0)
             setTextColor(buttonTextColor(style))
-            background = rounded(buttonFillColor(style), dp(12), buttonStrokeColor(style))
+            background = rounded(buttonFillColor(style), dp(14), buttonStrokeColor(style))
             setOnClickListener { onClick() }
         }
     }
@@ -1007,45 +1136,41 @@ class MainActivity : Activity() {
         background = rounded(inputColor(), dp(12), strokeColor())
     }
 
-    private fun menuRow(title: String, subtitle: String, selected: Boolean): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = rounded(if (selected) ACCENT else Color.TRANSPARENT, dp(12), 0)
-            addView(text(title, 14f, if (selected) Color.WHITE else textColor(), Typeface.BOLD))
-            addView(text(subtitle, 12f, if (selected) Color.rgb(221, 245, 242) else mutedColor()).withTop(dp(2)))
-        }
-    }
-
-    private fun statChip(label: String, count: Int): View {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = rounded(promptColor(), dp(12), 0)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            addView(text(count.toString(), 20f, textColor(), Typeface.BOLD).apply { gravity = Gravity.CENTER })
-            addView(text(label, 12f, mutedColor()).apply { gravity = Gravity.CENTER })
-        }
-    }
-
     private fun bulkRecordingRow(recording: BulkRecording): View {
+        val counts = if (bulkReviewProjectSlug == activeProjectOrNull()?.slug) {
+            bulkReviewClips.filter { it.sourceRecording == recording.id }.groupingBy { it.label }.eachCount()
+        } else {
+            emptyMap()
+        }
+        val open = {
+            selectedBulkRecordingId = recording.id
+            statusMessage = ""
+            currentPage = AppPage.Detail
+            render()
+        }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = rounded(promptColor(), dp(12), 0)
-            addView(text("Bulk recording  ${recording.durationMs / 1000}s", 14f, textColor(), Typeface.BOLD))
-            addView(text(File(recording.filePath).name, 12f, mutedColor()).withTop(dp(2)))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(promptColor(), dp(14), 0)
+            setOnClickListener { open() }
+            addView(text("Take  ${recording.durationMs / 1000}s", 15f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    if (counts.isEmpty()) {
+                        "Not synced yet"
+                    } else {
+                        "${counts["positive"] ?: 0} positive · ${counts["negative"] ?: 0} negative"
+                    },
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(2)),
+            )
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton("Open", ButtonStyle.Secondary) {
-                        selectedBulkRecordingId = recording.id
-                        currentPage = AppPage.BulkDetail
-                        drawerOpen = false
-                        render()
-                    })
-                    addView(actionButton("Delete", ButtonStyle.Ghost) { deleteBulkRecording(recording) }.withLeft(dp(8)))
-                }.withTop(dp(6)),
+                    addView(actionButton("Open", ButtonStyle.Secondary) { open() }.weight1())
+                    addView(actionButton("Delete", ButtonStyle.Ghost) { confirmDeleteRecording(recording) }.weight1().withLeft(dp(8)))
+                }.withTop(dp(8)),
             )
         }
     }
@@ -1241,9 +1366,30 @@ class MainActivity : Activity() {
         }
     }
 
+    /** A flat fill with only a top hairline, for the bottom navigation bar. */
+    private fun topBorder(fill: Int, stroke: Int): android.graphics.drawable.Drawable {
+        val line = GradientDrawable().apply { setColor(stroke) }
+        val body = GradientDrawable().apply { setColor(fill) }
+        return android.graphics.drawable.LayerDrawable(arrayOf(line, body)).apply {
+            // Inset the fill 1px from the top so only the stroke layer shows there.
+            setLayerInset(1, 0, dp(1), 0, 0)
+        }
+    }
+
+    private fun statusStrip(message: String): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(promptColor(), dp(14), strokeColor())
+            addView(text(message, 14f, textColor()))
+        }
+    }
+
     private fun surfaceColor(): Int = if (darkMode) Color.rgb(24, 28, 30) else Color.rgb(247, 248, 250)
 
-    private fun sidebarColor(): Int = if (darkMode) Color.rgb(31, 37, 40) else Color.rgb(235, 240, 240)
+    private fun navColor(): Int = if (darkMode) Color.rgb(30, 35, 38) else Color.WHITE
+
+    private fun navActiveColor(): Int = if (darkMode) Color.rgb(38, 52, 52) else Color.rgb(224, 238, 237)
 
     private fun cardColor(): Int = if (darkMode) Color.rgb(36, 42, 45) else Color.WHITE
 
@@ -1301,6 +1447,27 @@ class MainActivity : Activity() {
         return this
     }
 
+    /** Full-width, taller emphasis for a primary button. */
+    private fun Button.tall(): Button {
+        minHeight = dp(56)
+        textSize = 16f
+        val params = (layoutParams as? LinearLayout.LayoutParams)
+            ?: LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        params.width = LinearLayout.LayoutParams.MATCH_PARENT
+        layoutParams = params
+        return this
+    }
+
+    /** Equal-share width inside a horizontal row. */
+    private fun View.weight1(): View {
+        val params = (layoutParams as? LinearLayout.LayoutParams)
+            ?: LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT)
+        params.width = 0
+        params.weight = 1f
+        layoutParams = params
+        return this
+    }
+
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private companion object {
@@ -1311,14 +1478,14 @@ class MainActivity : Activity() {
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
         const val KEY_DARK_MODE = "dark_mode"
         const val DEFAULT_SYNC_SERVER_URL = "http://100.64.0.2:8765"
-        const val DEFAULT_WHISPER_SERVER_URL = "http://pickle.bam.net:8571"
+        const val DEFAULT_WHISPER_SERVER_URL = "http://pickle.bam.net:8572"
         val ACCENT: Int = Color.rgb(37, 110, 112)
     }
 
     private enum class AppPage {
-        Project,
-        BulkRecord,
-        BulkDetail,
+        Record,
+        Review,
+        Detail,
         Settings,
     }
 
