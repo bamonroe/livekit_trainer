@@ -13,6 +13,23 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Make the server the master record for recordings, manageable from any
+  device. New `GET /bulk/:slug/recordings/detail` returns every recording with
+  active slice counts and capture device; the app's Review page lists server
+  recordings (not just local takes), labels each by capturing device ("This
+  device" / "From <model>"), and lets any device delete any recording (local
+  copy removed too). Local takes not yet uploaded show as pending. Verified on
+  the emulator: an `all set` project with zero local takes shows all server
+  takes attributed to the Pixel 8a. `db::recording_details` + `ServerRecording`
+  + `loadServerRecordings`, with a server unit test.
+- [x] Fixed the pool-count vs visible-takes mismatch: old synced takes lingered
+  on the server with no way to see or delete them from the phone. Purged the
+  five orphaned `all_set` takes (server back to 34 positives across 3 takes).
+- [x] Follow the system light/dark theme (System/Light/Dark) and fix the
+  status-bar icons staying dark-on-dark in dark mode.
+- [x] Fixed a startup crash from the version-6 capture-column migration
+  re-adding columns the background table's CREATE already had (idempotent now).
+
 - [x] Personalization tooling so one user's voice can actually shape the model
   against the trainer's large synthetic pool (see `docs/PERSONALIZATION.md`).
   Three levers: (1) app **Dense** bulk-script style (Settings → Bulk script
