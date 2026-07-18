@@ -39,6 +39,16 @@ const CUT_LEAD_PADDING_SECONDS: f64 = 0.08;
 const POSITIVE_TAIL_PADDING_SECONDS: f64 = 0.28;
 const NEGATIVE_TAIL_PADDING_SECONDS: f64 = 0.10;
 const NEGATIVE_TARGET_SECONDS: f64 = 1.5;
+// Ambient background recordings carry no speech to align, so they are chopped
+// into fixed windows sized to the trainer's clip_duration (2.0s). Each window
+// becomes an independent background training example; a trailing remnant shorter
+// than the minimum is dropped rather than padded into a misleadingly short clip.
+const BACKGROUND_CHUNK_SECONDS: f64 = 2.0;
+const BACKGROUND_MIN_CHUNK_SECONDS: f64 = 1.0;
+// Sentinel stored in a recording's `script` column to mark it as a background
+// noise take rather than a scripted bulk read. Reprocess branches on this so
+// background sources are re-chunked deterministically instead of Whisper-aligned.
+const BACKGROUND_SCRIPT_MARKER: &str = "__background_noise__";
 
 #[derive(Clone)]
 struct AppState {
@@ -167,6 +177,8 @@ struct ReprocessResponse {
     recording_count: usize,
     positives: usize,
     negatives: usize,
+    hard_negatives: usize,
+    background: usize,
     dropped_positives: usize,
     alignment_output: String,
     warnings: Vec<String>,
@@ -187,6 +199,8 @@ struct Manifest {
     clips: Vec<Clip>,
     #[serde(default)]
     bulk_recordings: Vec<BulkRecording>,
+    #[serde(default)]
+    background_recordings: Vec<BackgroundRecording>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -230,6 +244,20 @@ struct BulkRecording {
     extra: Value,
 }
 
+/// A long ambient/background noise take. Unlike a bulk recording it is not
+/// transcribed; the server slices it into fixed-length background clips.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct BackgroundRecording {
+    id: String,
+    file: String,
+    #[serde(default)]
+    recorded_at: String,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(flatten)]
+    extra: Value,
+}
+
 #[derive(Debug, Deserialize)]
 struct WhisperResponse {
     #[serde(default)]
@@ -262,8 +290,24 @@ struct AlignmentSummary {
     recordings: usize,
     positives: usize,
     negatives: usize,
+    hard_negatives: usize,
+    background: usize,
     dropped_positives: usize,
     warnings: Vec<String>,
+}
+
+impl AlignmentSummary {
+    /// Fold another summary's counts and warnings into this one. Used to combine
+    /// the bulk-alignment and background-slicing passes over a single upload.
+    fn absorb(&mut self, other: AlignmentSummary) {
+        self.recordings += other.recordings;
+        self.positives += other.positives;
+        self.negatives += other.negatives;
+        self.hard_negatives += other.hard_negatives;
+        self.background += other.background;
+        self.dropped_positives += other.dropped_positives;
+        self.warnings.extend(other.warnings);
+    }
 }
 
 #[tokio::main]
@@ -426,7 +470,7 @@ async fn sync(
         let warnings = validate_wavs(&extract_root, &manifest)?;
         let imported_count =
             import_bundle(&extract_root, &manifest, &state.data_root, &state.db)?;
-        let alignment = align_bulk_recordings(
+        let mut alignment = align_bulk_recordings(
             &extract_root,
             &manifest,
             &state.data_root,
@@ -434,6 +478,10 @@ async fn sync(
             whisper_server_url.as_deref(),
         )
         .await?;
+        let background =
+            align_background_recordings(&extract_root, &manifest, &state.data_root, &state.db)
+                .await?;
+        alignment.absorb(background);
         let archive_name = archive
             .file_name()
             .and_then(|name| name.to_str())
@@ -528,44 +576,53 @@ async fn run_reprocess(
     let dest_root = state.data_root.join(slug);
     let mut summary = AlignmentSummary::default();
 
-    match whisper_server_url
+    let whisper = whisper_server_url
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        None => summary
-            .warnings
-            .push("no Whisper server URL configured".to_string()),
-        Some(whisper_url) => {
-            for meta in &recordings {
-                let source = dest_root
-                    .join("bulk_source")
-                    .join(format!("{}.wav", safe_filename(&meta.id)));
-                if !source.is_file() {
+        .filter(|value| !value.is_empty());
+    for meta in &recordings {
+        let source = dest_root
+            .join("bulk_source")
+            .join(format!("{}.wav", safe_filename(&meta.id)));
+        if !source.is_file() {
+            summary.recordings += 1;
+            summary.warnings.push(format!(
+                "{}: stored source WAV missing; re-sync this recording",
+                meta.id
+            ));
+            continue;
+        }
+        // Background takes re-chunk deterministically and need no Whisper; only
+        // scripted bulk reads require an alignment server.
+        let whisper_url = if meta.script == BACKGROUND_SCRIPT_MARKER {
+            ""
+        } else {
+            match whisper {
+                Some(url) => url,
+                None => {
                     summary.recordings += 1;
-                    summary.warnings.push(format!(
-                        "{}: stored source WAV missing; re-sync this recording",
-                        meta.id
-                    ));
+                    summary
+                        .warnings
+                        .push(format!("{}: no Whisper server URL configured", meta.id));
                     continue;
                 }
-                align_one_recording(
-                    &meta.id,
-                    &meta.script,
-                    &meta.recorded_at,
-                    meta.duration_ms.max(0) as u64,
-                    &source,
-                    slug,
-                    &phrase,
-                    external_id.as_deref(),
-                    &dest_root,
-                    &state.db,
-                    whisper_url,
-                    &mut summary,
-                )
-                .await?;
             }
-        }
+        };
+        align_one_recording(
+            &meta.id,
+            &meta.script,
+            &meta.recorded_at,
+            meta.duration_ms.max(0) as u64,
+            &source,
+            slug,
+            &phrase,
+            external_id.as_deref(),
+            &dest_root,
+            &state.db,
+            whisper_url,
+            &mut summary,
+        )
+        .await?;
     }
 
     Ok(Json(ReprocessResponse {
@@ -574,6 +631,8 @@ async fn run_reprocess(
         recording_count: recordings.len(),
         positives: summary.positives,
         negatives: summary.negatives,
+        hard_negatives: summary.hard_negatives,
+        background: summary.background,
         dropped_positives: summary.dropped_positives,
         alignment_output: alignment_summary(&summary),
         warnings: summary.warnings.clone(),
@@ -862,6 +921,18 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), AppError> {
             )));
         }
     }
+    for (index, recording) in manifest.background_recordings.iter().enumerate() {
+        if recording.id.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "background recording {index} missing id"
+            )));
+        }
+        if recording.file.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "background recording {index} missing file"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -943,6 +1014,34 @@ fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<String>, AppE
         if spec.sample_rate != 16_000 {
             warnings.push(format!(
                 "{}: expected 16000 Hz bulk recording, got {}",
+                recording.id, spec.sample_rate
+            ));
+        }
+    }
+    for recording in &manifest.background_recordings {
+        let path = safe_join(bundle, &recording.file)?;
+        let reader = WavReader::open(&path).map_err(|error| {
+            AppError::bad_request(format!(
+                "{}: cannot read background WAV: {error}",
+                recording.id
+            ))
+        })?;
+        let spec = reader.spec();
+        if spec.channels != 1 {
+            warnings.push(format!(
+                "{}: expected mono background recording, got {} channels",
+                recording.id, spec.channels
+            ));
+        }
+        if spec.bits_per_sample != 16 {
+            warnings.push(format!(
+                "{}: expected 16-bit PCM background recording, got {} bits",
+                recording.id, spec.bits_per_sample
+            ));
+        }
+        if spec.sample_rate != 16_000 {
+            warnings.push(format!(
+                "{}: expected 16000 Hz background recording, got {}",
                 recording.id, spec.sample_rate
             ));
         }
@@ -1075,6 +1174,59 @@ async fn align_bulk_recordings(
     Ok(summary)
 }
 
+/// Slice every background take in the bundle into fixed-length background clips.
+/// Independent of Whisper, so it runs even when no Whisper URL is configured.
+async fn align_background_recordings(
+    bundle: &Path,
+    manifest: &Manifest,
+    data_root: &Path,
+    db: &Mutex<Connection>,
+) -> Result<AlignmentSummary, AppError> {
+    let mut summary = AlignmentSummary::default();
+    if manifest.background_recordings.is_empty() {
+        return Ok(summary);
+    }
+
+    let slug = manifest.wake_word.slug.clone();
+    let phrase = manifest.wake_word.phrase();
+    let external_id = manifest
+        .wake_word
+        .extra
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let dest_root = data_root.join(&slug);
+
+    for recording in &manifest.background_recordings {
+        let source = match safe_join(bundle, &recording.file) {
+            Ok(source) => source,
+            Err(error) => {
+                summary.recordings += 1;
+                summary
+                    .warnings
+                    .push(format!("{}: {}", recording.id, error.message));
+                continue;
+            }
+        };
+        summary.recordings += 1;
+        slice_background_recording(
+            &recording.id,
+            &recording.recorded_at,
+            recording.duration_ms,
+            &source,
+            &slug,
+            &phrase,
+            external_id.as_deref(),
+            &dest_root,
+            db,
+            &mut summary,
+        )?;
+    }
+
+    Ok(summary)
+}
+
 /// Align and slice one already-materialized source WAV. Shared by the upload
 /// path (source from the bundle) and the reprocess path (source is the stored
 /// bulk_source WAV), so both cut slices identically.
@@ -1093,6 +1245,23 @@ async fn align_one_recording(
     summary: &mut AlignmentSummary,
 ) -> Result<(), AppError> {
     summary.recordings += 1;
+    if script == BACKGROUND_SCRIPT_MARKER {
+        // Background takes carry no speech to align; chop into fixed windows and
+        // skip Whisper entirely. This branch also fires on reprocess, since the
+        // marker is persisted in the recording's script column.
+        return slice_background_recording(
+            recording_id,
+            recorded_at,
+            duration_ms,
+            source,
+            slug,
+            phrase,
+            external_id,
+            dest_root,
+            db,
+            summary,
+        );
+    }
     let whisper = match transcribe_with_words(whisper_url, source, None).await {
         Ok(whisper) => whisper,
         Err(error) => {
@@ -1120,10 +1289,15 @@ async fn align_one_recording(
         return Ok(());
     }
 
-    let positive_ranges = phrase_ranges(&words, &phrase_words)
-        .into_iter()
-        .filter(|(first, last)| !is_hard_negative_context(&words, *first, *last))
-        .collect::<Vec<_>>();
+    // A wake phrase spoken inside a near-miss context ("...not the wake phrase
+    // X...") must never train as a positive, but it is a valuable hard negative:
+    // the true phrase in an explicitly-negative frame. Split the aligned phrase
+    // occurrences into positives (kept) and hard negatives (filed under the
+    // negative category, tagged distinctly) instead of discarding the latter.
+    let (positive_ranges, hard_negative_ranges): (Vec<_>, Vec<_>) =
+        phrase_ranges(&words, &phrase_words)
+            .into_iter()
+            .partition(|(first, last)| !is_hard_negative_context(&words, *first, *last));
     if positive_ranges.is_empty() {
         summary.warnings.push(format!(
             "{}: no aligned wake phrase occurrences found in transcript {:?}",
@@ -1209,6 +1383,7 @@ async fn align_one_recording(
                         slice_rows.push(build_slice_row(
                             &clip_id,
                             "positive",
+                            "positive",
                             &dest,
                             &file_name,
                             start,
@@ -1218,6 +1393,61 @@ async fn align_one_recording(
                         summary.positives += 1;
                     }
                 }
+            }
+            occupied.push((start, end));
+        }
+
+        // Hard negatives: the wake phrase captured in a near-miss frame. Cut with
+        // the same generous bounds as a positive so the whole phrase is present,
+        // but file it under the negative category with a distinct label, and mark
+        // it occupied so the generic negative pass does not re-cut the same words.
+        for (first, last) in hard_negative_ranges.iter() {
+            let context_first = positive_context_first(&words, *first, *last);
+            let (start, end) = padded_bounds(
+                &words,
+                context_first,
+                *last,
+                source_end,
+                CUT_LEAD_PADDING_SECONDS,
+                POSITIVE_TAIL_PADDING_SECONDS,
+                false,
+            );
+            let (start, end) = clamp_slice_span(start, end, true);
+            let (visible_first, visible_last) =
+                visible_range(&words, context_first, *last, start, end);
+            let slice_words = &words[visible_first..=visible_last];
+            let clip_id = bulk_clip_hash_id(
+                recording_id,
+                recorded_at,
+                duration_ms,
+                "hard_negative",
+                start,
+                end,
+                slice_words,
+            );
+            let phrase_text = slice_words
+                .iter()
+                .map(|word| word.word.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let file_name = format!(
+                "{}_{}.wav",
+                safe_filename(&clip_id),
+                safe_filename(&phrase_text)
+            );
+            let dest = dest_root.join("negative").join(&file_name);
+            if write_wav_slice(source, &dest, start, end)? {
+                slice_rows.push(build_slice_row(
+                    &clip_id,
+                    "hard_negative",
+                    "negative",
+                    &dest,
+                    &file_name,
+                    start,
+                    end,
+                    slice_words,
+                ));
+                summary.hard_negatives += 1;
             }
             occupied.push((start, end));
         }
@@ -1260,6 +1490,7 @@ async fn align_one_recording(
             if write_wav_slice(source, &dest, start, end)? {
                 slice_rows.push(build_slice_row(
                     &clip_id,
+                    "negative",
                     "negative",
                     &dest,
                     &file_name,
@@ -1311,8 +1542,128 @@ async fn align_one_recording(
     Ok(())
 }
 
+/// Fixed-length background windows covering `[0, total)` seconds. A trailing
+/// remnant shorter than the minimum is dropped rather than kept as a stub clip
+/// the trainer would pad. Pure so the chunking is unit-testable without audio IO.
+fn background_chunk_bounds(total: f64) -> Vec<(f64, f64)> {
+    let mut bounds = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let start = index as f64 * BACKGROUND_CHUNK_SECONDS;
+        if start >= total {
+            break;
+        }
+        let end = (start + BACKGROUND_CHUNK_SECONDS).min(total);
+        if end - start < BACKGROUND_MIN_CHUNK_SECONDS {
+            break;
+        }
+        bounds.push((start, end));
+        index += 1;
+    }
+    bounds
+}
+
+/// Slice one ambient background take into fixed-length background clips without
+/// transcription. Shared by the upload path and reprocess (which re-enters via
+/// `align_one_recording` on the background script marker), so both chunk a stored
+/// source WAV identically. Persists a recording row carrying the marker script so
+/// later reprocesses keep treating it as background.
+fn slice_background_recording(
+    recording_id: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    slug: &str,
+    phrase: &str,
+    external_id: Option<&str>,
+    dest_root: &Path,
+    db: &Mutex<Connection>,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    let source_wav = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(path) => path,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
+        }
+    };
+    // Remove any slice files a previous pass produced before writing the new set.
+    let old_paths = {
+        let conn = db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
+    };
+    for old in old_paths {
+        let old = PathBuf::from(old);
+        if old.is_file() {
+            let _ = fs::remove_file(old);
+        }
+    }
+
+    let total = wav_duration_seconds(source).unwrap_or(0.0);
+    if total < BACKGROUND_MIN_CHUNK_SECONDS {
+        summary.warnings.push(format!(
+            "{}: background recording too short to slice ({:.2}s)",
+            recording_id, total
+        ));
+    }
+
+    let mut slice_rows = Vec::new();
+    for (start, end) in background_chunk_bounds(total) {
+        let clip_id = bulk_clip_hash_id(
+            recording_id,
+            recorded_at,
+            duration_ms,
+            "background",
+            start,
+            end,
+            &[],
+        );
+        let file_name = format!("{}_background.wav", safe_filename(&clip_id));
+        let dest = dest_root.join("background").join(&file_name);
+        if write_wav_slice(source, &dest, start, end)? {
+            slice_rows.push(build_slice_row(
+                &clip_id,
+                "background",
+                "background",
+                &dest,
+                &file_name,
+                start,
+                end,
+                &[],
+            ));
+            summary.background += 1;
+        }
+    }
+
+    let alignment = db::RecordingAlignment {
+        recording_id: recording_id.to_string(),
+        project_slug: slug.to_string(),
+        phrase: phrase.to_string(),
+        external_id: external_id.map(ToString::to_string),
+        script: BACKGROUND_SCRIPT_MARKER.to_string(),
+        recorded_at: recorded_at.to_string(),
+        duration_ms: duration_ms as i64,
+        source_wav: source_wav.to_string_lossy().to_string(),
+        bundle: None,
+        transcript_text: String::new(),
+        whisper_url: None,
+        words: Vec::new(),
+        prompts: Vec::new(),
+        slices: slice_rows,
+    };
+    {
+        let mut conn = db.lock().expect("db lock poisoned");
+        db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
+    }
+
+    Ok(())
+}
+
 fn build_slice_row(
     clip_id: &str,
+    label: &str,
     category: &str,
     dest: &Path,
     file_name: &str,
@@ -1332,7 +1683,7 @@ fn build_slice_row(
     };
     db::SliceRow {
         id: clip_id.to_string(),
-        label: category.to_string(),
+        label: label.to_string(),
         category: category.to_string(),
         spoken_phrase,
         source_start_ms: (start_sec * 1000.0).round() as i64,
@@ -1728,9 +2079,18 @@ fn alignment_summary(summary: &AlignmentSummary) -> String {
         return "No bulk recordings".to_string();
     }
     let mut output = format!(
-        "Aligned {} bulk recordings into {} positives and {} negatives",
+        "Aligned {} recordings into {} positives and {} negatives",
         summary.recordings, summary.positives, summary.negatives
     );
+    if summary.hard_negatives > 0 {
+        output.push_str(&format!(
+            " (incl. {} hard negatives)",
+            summary.hard_negatives
+        ));
+    }
+    if summary.background > 0 {
+        output.push_str(&format!(", plus {} background clips", summary.background));
+    }
     if summary.dropped_positives > 0 {
         output.push_str(&format!(
             " ({} positives dropped: wake phrase not heard)",
@@ -2092,6 +2452,48 @@ mod tests {
         assert_ne!(a, c);
         let d = bulk_clip_hash_id("rec-1", "2026-01-01", 5000, "negative", 1.2, 1.9, &words);
         assert_ne!(a, d);
+    }
+
+    #[test]
+    fn hard_negative_context_flags_near_miss_frames() {
+        // A wake phrase spoken after an explicit near-miss cue must be treated as
+        // a hard negative, not a positive.
+        let words = vec![
+            test_word("this", 0.0, 0.2),
+            test_word("is", 0.25, 0.4),
+            test_word("not", 0.45, 0.6),
+            test_word("the", 0.65, 0.75),
+            test_word("wake", 0.8, 1.0),
+            test_word("phrase", 1.05, 1.3),
+            test_word("all", 1.5, 1.7),
+            test_word("set", 1.75, 2.0),
+        ];
+        // "all set" at indices 6..=7 sits inside a "not the wake phrase" frame.
+        assert!(is_hard_negative_context(&words, 6, 7));
+
+        // The same phrase with an ordinary lead-in is a clean positive.
+        let clean = vec![
+            test_word("please", 0.0, 0.3),
+            test_word("say", 0.35, 0.6),
+            test_word("all", 0.7, 0.9),
+            test_word("set", 0.95, 1.2),
+        ];
+        assert!(!is_hard_negative_context(&clean, 2, 3));
+    }
+
+    #[test]
+    fn background_chunks_cover_source_and_drop_short_tail() {
+        // Too short to yield any usable window.
+        assert!(background_chunk_bounds(0.5).is_empty());
+        // Exact single window.
+        assert_eq!(background_chunk_bounds(2.0), vec![(0.0, 2.0)]);
+        // A 1.0s tail meets the minimum and is kept.
+        assert_eq!(
+            background_chunk_bounds(5.0),
+            vec![(0.0, 2.0), (2.0, 4.0), (4.0, 5.0)]
+        );
+        // A 0.5s remnant is below the minimum and dropped.
+        assert_eq!(background_chunk_bounds(4.5), vec![(0.0, 2.0), (2.0, 4.0)]);
     }
 
     fn test_word(word: &str, start: f64, end: f64) -> WhisperWord {
