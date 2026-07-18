@@ -13,6 +13,12 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Add a dataset summary report: `scripts/dataset_report.py` reads the sync
+  server SQLite DB and prints, per wake word and pooled, active slice counts by
+  category and by the richer label (hard negatives shown separately), source
+  recording counts, and — when the capture provenance columns are present —
+  breakdowns by device, input route, and session. Tolerates older DBs without
+  the capture columns. Tests in `tests/test_dataset_report.py`.
 - [x] Surface background takes in the app's Review page: a "Background takes"
   card lists each ambient take with local playback (Play/Pause) and a Delete
   that removes the local file, the SQLite row, and the server-side clips (reusing
@@ -83,8 +89,6 @@ discovered. Prefer small, actionable items with clear status.
   and app-private WAV file retention.
 - [ ] Add evaluation tooling that creates follow-up false-positive and
   false-negative collection batches.
-- [ ] Add dataset summary reports by wake word, label, phrase, session, and
-  device.
 - [ ] Add audio validation for sample rate, channel count, duration, clipping,
   and silence.
 - [ ] Add prompt coverage reporting so future batches deliberately target
