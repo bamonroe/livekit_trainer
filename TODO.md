@@ -13,6 +13,18 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Surface background takes in the app's Review page: a "Background takes"
+  card lists each ambient take with local playback (Play/Pause) and a Delete
+  that removes the local file, the SQLite row, and the server-side clips (reusing
+  `DELETE /bulk/:slug/:recording_id`, which already accepts background ids).
+- [x] Emit distinct `false_positive` / `false_negative` labels from evaluation
+  mistakes: new `scripts/import_corrections.py` reads a correction batch
+  (`corrections.json` + `audio/`), compares each clip's score to the detection
+  threshold, and files only the mistakes into `data/real/<slug>/{positive,
+  negative}/` with the mistake label preserved in `metadata.jsonl`. Misses
+  (`false_negative`) train as positives, wrongful fires (`false_positive`) as
+  negatives; correct clips are skipped. Format in
+  `docs/CORRECTION_BATCH_FORMAT.md`; tests in `tests/test_import_corrections.py`.
 - [x] Capture richer per-recording metadata the server used to drop. Each bulk
   and background take now carries a `capture` object (device manufacturer/model,
   OS version, app version, resolved input route, the mic's native
@@ -62,12 +74,9 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Later
 
-- [ ] Surface background takes in the app's Review page for per-take replay and
-  delete (they already round-trip through the server slices/review machinery;
-  the app just doesn't list them yet).
-- [ ] Emit distinct `false_positive` / `false_negative` labels from evaluation
-  mistakes into correction batches (labels are already accepted end to end).
-- [ ] Add optional runtime scorer service or test harness under `runtime/`.
+- [ ] Add optional runtime scorer service or test harness under `runtime/`. When
+  it lands it should emit `corrections.json` (see `docs/CORRECTION_BATCH_FORMAT.md`)
+  so live detection mistakes flow straight back into training.
 - [ ] Add a post-sync cleanup policy for app-private clips after server import
   is acknowledged.
 - [ ] Add emulator or instrumentation coverage for SQLite metadata migration

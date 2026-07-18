@@ -321,8 +321,12 @@ class MainActivity : Activity() {
             return
         }
         val bulkRecordings = store.loadBulkRecordings(project.id)
+        val backgroundRecordings = store.loadBackgroundRecordings(project.id)
         workspace.addView(syncCard(project, bulkRecordings))
         workspace.addView(recordingsCard(project, bulkRecordings).withTop(dp(12)))
+        if (backgroundRecordings.isNotEmpty()) {
+            workspace.addView(backgroundRecordingsCard(backgroundRecordings).withTop(dp(12)))
+        }
         maybeStatus()
     }
 
@@ -1357,6 +1361,136 @@ class MainActivity : Activity() {
                     addView(actionButton("Delete", ButtonStyle.Ghost) { confirmDeleteRecording(recording) }.weight1().withLeft(dp(8)))
                 }.withTop(dp(8)),
             )
+        }
+    }
+
+    private fun backgroundRecordingsCard(backgroundRecordings: List<BackgroundRecording>): View {
+        val totalSeconds = backgroundRecordings.sumOf { it.durationMs } / 1000
+        return card().apply {
+            addView(
+                text(
+                    "Background takes  ${backgroundRecordings.size}",
+                    18f,
+                    textColor(),
+                    Typeface.BOLD,
+                ),
+            )
+            addView(
+                text(
+                    "${totalSeconds}s of ambient audio. The server chops each take into short background clips pooled across every wake word.",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            backgroundRecordings.forEach { recording ->
+                addView(backgroundRecordingRow(recording).withTop(dp(8)))
+            }
+        }
+    }
+
+    private fun backgroundRecordingRow(recording: BackgroundRecording): View {
+        val playbackKey = "background:${recording.id}"
+        val playing = activePlaybackKey == playbackKey && player?.isPlaying == true
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(promptColor(), dp(14), 0)
+            addView(text("Take  ${recording.durationMs / 1000}s", 15f, textColor(), Typeface.BOLD))
+            addView(text(formatRecordedAt(recording.recordedAtMillis), 12f, mutedColor()).withTop(dp(2)))
+            addView(text(File(recording.filePath).name, 12f, mutedColor()).withTop(dp(2)))
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton(if (playing) "Pause" else "Play", ButtonStyle.Secondary) {
+                            playBackgroundRecording(recording)
+                        }.weight1(),
+                    )
+                    addView(
+                        actionButton("Delete", ButtonStyle.Ghost) {
+                            confirmDeleteBackgroundRecording(recording)
+                        }.weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(8)),
+            )
+        }
+    }
+
+    private fun playBackgroundRecording(recording: BackgroundRecording) {
+        val playbackKey = "background:${recording.id}"
+        player?.let { current ->
+            if (activePlaybackKey == playbackKey) {
+                if (current.isPlaying) current.pause() else current.start()
+                render()
+                return
+            }
+        }
+        stopAlignmentTicker()
+        player?.release()
+        player = null
+        val source = File(recording.filePath)
+        if (!source.isFile) {
+            activePlaybackKey = null
+            statusMessage = "Background take file is missing"
+            render()
+            return
+        }
+        activePlaybackKey = playbackKey
+        try {
+            player = MediaPlayer().apply {
+                setDataSource(source.absolutePath)
+                setOnPreparedListener {
+                    it.start()
+                    render()
+                }
+                setOnCompletionListener {
+                    it.release()
+                    if (player === it) player = null
+                    activePlaybackKey = null
+                    render()
+                }
+                prepareAsync()
+            }
+            statusMessage = "Playing background take"
+        } catch (error: Exception) {
+            activePlaybackKey = null
+            player = null
+            statusMessage = error.message ?: "Could not play background take"
+        }
+        render()
+    }
+
+    private fun confirmDeleteBackgroundRecording(recording: BackgroundRecording) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete this background take?")
+            .setMessage("Removes the local take and its clips from the server. This cannot be undone.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ -> deleteBackgroundRecording(recording) }
+            .show()
+    }
+
+    private fun deleteBackgroundRecording(recording: BackgroundRecording) {
+        if (activePlaybackKey == "background:${recording.id}") {
+            player?.release()
+            player = null
+            activePlaybackKey = null
+        }
+        File(recording.filePath).delete()
+        store.deleteBackgroundRecording(recording)
+        bulkReviewClips = bulkReviewClips.filterNot { it.sourceRecording == recording.id }
+        val serverUrl = savedServerUrl()
+        statusMessage = "Deleted background take"
+        render()
+
+        if (serverUrl.isNotBlank()) {
+            Thread {
+                try {
+                    BundleSyncClient(serverUrl)
+                        .deleteRecording(recording.projectSlug, recording.id)
+                } catch (_: Exception) {
+                    // Local delete already happened; a stale server copy is harmless.
+                }
+            }.start()
         }
     }
 

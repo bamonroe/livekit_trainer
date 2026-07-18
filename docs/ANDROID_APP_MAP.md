@@ -225,6 +225,12 @@ current Whisper word during playback, and shows generated cut markers inline.
 Slice and source playback buttons toggle between play and pause while their
 audio is active.
 
+The Review page also lists saved **background takes** (the ambient/non-speech
+recordings from the Record page's "Record background" control) in their own card
+when any exist. Each row plays the local take back with a Play/Pause button and
+can delete it; delete removes the local WAV, its SQLite row, and the server-side
+background clips via `DELETE /bulk/<slug>/<recording_id>`.
+
 ## Build And Test Loop
 
 1. Build with `/data/android/build.sh /data/livekit_trainer/android`.
