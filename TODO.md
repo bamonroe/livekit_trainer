@@ -13,6 +13,19 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Personalization tooling so one user's voice can actually shape the model
+  against the trainer's large synthetic pool (see `docs/PERSONALIZATION.md`).
+  Three levers: (1) app **Dense** bulk-script style (Settings → Bulk script
+  style) generates short, prosodically varied wake-phrase repetitions with
+  frequent near misses, packing many positives/hard negatives per minute
+  (`PromptGenerator.denseBulkScript`); (2) `assemble_training_data.py
+  --positive-boost N` replicates the target's own positives N times to raise
+  their pool share; (3) `generate_config.py --personal` shrinks `n_samples` to
+  3000 and bumps per-batch positives to 100. Tests: `test_generate_config.py`
+  plus boost cases in `test_assemble_training_data.py`. Also removed the
+  duplicate upstream trainer clone and 28 GB of legacy corpora under
+  `/data/storage/livekit-wakeword` — our repo drives the pip-installed trainer,
+  so the clone was only a reference.
 - [x] Add a dataset summary report: `scripts/dataset_report.py` reads the sync
   server SQLite DB and prints, per wake word and pooled, active slice counts by
   category and by the richer label (hard negatives shown separately), source

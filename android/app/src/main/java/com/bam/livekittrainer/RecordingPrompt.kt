@@ -37,6 +37,7 @@ object PromptGenerator {
         batchNumber: Int = 0,
         revision: Int = 0,
         wakePlacements: Int = DEFAULT_BULK_WAKE_PLACEMENTS,
+        positiveDense: Boolean = false,
     ): BulkScriptContent {
         val phrase = project.phrase
         val placementCount = wakePlacements.coerceIn(1, 48)
@@ -46,6 +47,9 @@ object PromptGenerator {
             lexicon,
             stableRandom("${project.slug}:bulk:$batchNumber:$revision:hard-negatives"),
         ).shuffled(random).toMutableList()
+        if (positiveDense) {
+            return denseBulkScript(phrase, lexicon, random, placementCount, hardNegatives)
+        }
         val usedHardNegatives = mutableListOf<String>()
         val script = buildList {
             add(bulkNeutralSentence(lexicon, random, phrase))
@@ -65,6 +69,90 @@ object PromptGenerator {
             }
         }.joinToString(" ")
         return BulkScriptContent(script, usedHardNegatives)
+    }
+
+    /**
+     * A positive-dense script: mostly short, prosodically varied ways to say the
+     * wake phrase itself, with near-miss hard negatives folded in frequently and
+     * only a light sprinkle of neutral filler. This packs many true positives and
+     * hard negatives into far less speaking time than the prose script, while the
+     * rotating carrier styles keep the speaker off a fixed cadence. The trainer
+     * already floods itself with generic negatives, so ordinary filler is minimal.
+     */
+    private fun denseBulkScript(
+        phrase: String,
+        lexicon: PromptLexicon,
+        random: kotlin.random.Random,
+        placementCount: Int,
+        hardNegativeSeed: List<String>,
+    ): BulkScriptContent {
+        val usedHardNegatives = mutableListOf<String>()
+        // Cycle the limited near-miss pool, reshuffling when it runs dry so a long
+        // script keeps producing hard negatives instead of stopping after ~10.
+        val hardNegatives = hardNegativeSeed.toMutableList()
+        fun nextHardNegative(): String? {
+            if (hardNegatives.isEmpty()) {
+                if (hardNegativeSeed.isEmpty()) return null
+                hardNegatives.addAll(hardNegativeSeed.shuffled(random))
+            }
+            return hardNegatives.removeAt(0)
+        }
+        val script = buildList {
+            // One short warmup line so mic level settles before the first positive.
+            add(bulkNeutralSentence(lexicon, random, phrase))
+            repeat(placementCount) { index ->
+                add(compactWakeLine(phrase, random, index))
+                // A near-miss after roughly every other positive.
+                if (index % 2 == 1) {
+                    nextHardNegative()?.let { nearMiss ->
+                        usedHardNegatives.add(nearMiss)
+                        add(compactHardNegativeLine(nearMiss, random))
+                    }
+                }
+                // A little ordinary speech every fifth positive for variety.
+                if (index % 5 == 4) {
+                    add(bulkNeutralSentence(lexicon, random, phrase))
+                }
+            }
+        }.joinToString(" ")
+        return BulkScriptContent(script, usedHardNegatives.distinct())
+    }
+
+    private fun compactWakeLine(
+        phrase: String,
+        random: kotlin.random.Random,
+        index: Int,
+    ): String {
+        val templates = listOf(
+            phrase,
+            "Hey, $phrase.",
+            "$phrase?",
+            "Okay, $phrase.",
+            "$phrase, please.",
+            "$phrase!",
+            "Say $phrase.",
+            "Um, $phrase.",
+            "$phrase, right now.",
+            "Ready? $phrase.",
+            "$phrase, thanks.",
+            "Well, $phrase.",
+        )
+        return templates[(index + random.nextInt(templates.size)) % templates.size].compactCase()
+    }
+
+    private fun compactHardNegativeLine(
+        nearMiss: String,
+        random: kotlin.random.Random,
+    ): String {
+        val templates = listOf(
+            nearMiss,
+            "$nearMiss?",
+            "$nearMiss!",
+            "Not quite, $nearMiss.",
+            "$nearMiss, almost.",
+            "Hmm, $nearMiss.",
+        )
+        return templates[random.nextInt(templates.size)].compactCase()
     }
 
     const val DEFAULT_BULK_WAKE_PLACEMENTS = 8
@@ -386,5 +474,12 @@ object PromptGenerator {
             .replace(Regex("\\s+"), " ")
             .replaceFirstChar { it.uppercase() }
             .let { if (it.endsWith(".")) it else "$it." }
+    }
+
+    // Like sentenceCase but keeps existing terminal punctuation (? or !) so short
+    // carrier lines can vary their intonation instead of all ending in a period.
+    private fun String.compactCase(): String {
+        val trimmed = trim().replace(Regex("\\s+"), " ").replaceFirstChar { it.uppercase() }
+        return if (trimmed.isEmpty() || trimmed.last() in ".?!") trimmed else "$trimmed."
     }
 }

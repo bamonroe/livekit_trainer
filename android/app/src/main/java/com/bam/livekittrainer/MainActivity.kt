@@ -393,6 +393,26 @@ class MainActivity : Activity() {
             addView(actionButton("Load server projects", ButtonStyle.Secondary) {
                 loadServerProjects(serverUrlInput.text.toString().trim())
             }.withTop(dp(8)))
+            val dense = savedPositiveDense()
+            addView(text("Bulk script style", 15f, mutedColor()).withTop(dp(14)))
+            addView(
+                text(
+                    if (dense) {
+                        "Dense: short, varied ways to say the wake phrase back to back, with frequent near misses. Many positives per minute."
+                    } else {
+                        "Prose: wake phrase woven into full sentences. More natural negatives, but slower to gather positives."
+                    },
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(actionButton("Prose", if (!dense) ButtonStyle.Primary else ButtonStyle.Secondary) { setPositiveDense(false) }.weight1())
+                    addView(actionButton("Dense", if (dense) ButtonStyle.Primary else ButtonStyle.Secondary) { setPositiveDense(true) }.weight1().withLeft(dp(8)))
+                }.withTop(dp(8)),
+            )
             addView(text("Appearance", 15f, mutedColor()).withTop(dp(14)))
             addView(
                 LinearLayout(this@MainActivity).apply {
@@ -584,6 +604,7 @@ class MainActivity : Activity() {
             store.promptBatch(project.id),
             bulkScriptRevision,
             wakePlacements,
+            positiveDense = savedPositiveDense(),
         )
         val script = scriptContent.text
         val recordingThisProject =
@@ -1234,6 +1255,22 @@ class MainActivity : Activity() {
             .coerceIn(1, 48)
     }
 
+    private fun savedPositiveDense(): Boolean {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_BULK_POSITIVE_DENSE, false)
+    }
+
+    private fun setPositiveDense(enabled: Boolean) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_BULK_POSITIVE_DENSE, enabled)
+            .apply()
+        // Re-roll so the visible script switches style immediately.
+        bulkScriptRevision += 1
+        statusMessage = if (enabled) "Dense positive script" else "Prose script"
+        render()
+    }
+
     private fun setDarkMode(enabled: Boolean) {
         darkMode = enabled
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
@@ -1794,6 +1831,7 @@ class MainActivity : Activity() {
         const val SYNC_PREFS = "sync"
         const val KEY_SYNC_SERVER_URL = "server_url"
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
+        const val KEY_BULK_POSITIVE_DENSE = "bulk_positive_dense"
         const val KEY_DARK_MODE = "dark_mode"
         const val DEFAULT_SYNC_SERVER_URL = "http://100.64.0.2:8765"
         val ACCENT: Int = Color.rgb(37, 110, 112)

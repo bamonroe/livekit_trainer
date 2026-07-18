@@ -49,8 +49,21 @@ def main() -> int:
     parser.add_argument("--adversarial-negative-per-batch", type=int, default=50)
     parser.add_argument("--acav-per-batch", type=int, default=1024)
     parser.add_argument("--background-noise-per-batch", type=int, default=50)
-    parser.add_argument("--n-samples", type=int, default=20_000)
-    parser.add_argument("--n-samples-val", type=int, default=4_000)
+    parser.add_argument(
+        "--personal",
+        action="store_true",
+        help=(
+            "Preset for a personal, single-voice model: shrink the synthetic "
+            "positive pool (n_samples) and raise the per-batch positive count so "
+            "your own recorded positives — ideally replicated with "
+            "assemble_training_data.py --positive-boost — dominate training. Any "
+            "explicit --n-samples / --n-samples-val / --positive-per-batch wins."
+        ),
+    )
+    # Sample-count knobs default to None so --personal vs standard presets can
+    # supply the base value while an explicit flag still overrides either.
+    parser.add_argument("--n-samples", type=int, default=None)
+    parser.add_argument("--n-samples-val", type=int, default=None)
     parser.add_argument("--steps", type=int, default=50_000)
     parser.add_argument("--target-fp-per-hour", type=float, default=0.2)
     parser.add_argument("--model-size", default="medium")
@@ -84,14 +97,32 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     negatives.extend(args.negative)
     negatives = dedupe([item.strip() for item in negatives if item.strip()])
 
+    # Base sample counts from the chosen preset; explicit flags override below.
+    base_n_samples = 3_000 if args.personal else 20_000
+    base_n_samples_val = 600 if args.personal else 4_000
+    base_positive_per_batch = 100 if args.personal else None
+
+    n_samples = args.n_samples if args.n_samples is not None else base_n_samples
+    n_samples_val = args.n_samples_val if args.n_samples_val is not None else base_n_samples_val
+    positive_per_batch = (
+        args.positive_per_batch if args.positive_per_batch is not None else base_positive_per_batch
+    )
+
     batch_n_per_class = None
-    if args.positive_per_batch is not None:
+    if positive_per_batch is not None:
         batch_n_per_class = {
-            "positive": args.positive_per_batch,
+            "positive": positive_per_batch,
             "adversarial_negative": args.adversarial_negative_per_batch,
             "ACAV100M_sample": args.acav_per_batch,
             "background_noise": args.background_noise_per_batch,
         }
+
+    header_comment = None
+    if args.personal:
+        header_comment = (
+            "# personal preset: real recorded positives weighted against a reduced\n"
+            "# synthetic pool. Pair with assemble_training_data.py --positive-boost."
+        )
 
     return {
         "model_name": slug,
@@ -101,22 +132,29 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "output_dir": "./output",
         "real_samples_dir": (args.real_samples_dir or "").strip() or None,
         "batch_n_per_class": batch_n_per_class,
+        "header_comment": header_comment,
         "model": {
             "model_type": "conv_attention",
             "model_size": args.model_size,
         },
-        "n_samples": args.n_samples,
-        "n_samples_val": args.n_samples_val,
+        "n_samples": n_samples,
+        "n_samples_val": n_samples_val,
         "steps": args.steps,
         "target_fp_per_hour": args.target_fp_per_hour,
     }
 
 
 def render_yaml(config: dict[str, Any]) -> str:
-    lines = [
-        f"model_name: {yaml_string(config['model_name'])}",
-        "target_phrases:",
-    ]
+    lines: list[str] = []
+    if config.get("header_comment"):
+        lines.append(config["header_comment"])
+        lines.append("")
+    lines.extend(
+        [
+            f"model_name: {yaml_string(config['model_name'])}",
+            "target_phrases:",
+        ]
+    )
     lines.extend(f"  - {yaml_string(item)}" for item in config["target_phrases"])
     lines.append("")
     lines.append("custom_negative_phrases:")

@@ -63,10 +63,22 @@ def main() -> int:
         action="store_true",
         help="Copy clips instead of symlinking (slower, uses disk)",
     )
+    parser.add_argument(
+        "--positive-boost",
+        type=int,
+        default=1,
+        help=(
+            "Replicate the target's own positives N times so your real voice "
+            "carries more weight against the trainer's large synthetic positive "
+            "pool (default: 1 = no boost)"
+        ),
+    )
     args = parser.parse_args()
 
     if not SAFE_SLUG.fullmatch(args.slug):
         raise SystemExit(f"unsafe slug: {args.slug!r}")
+    if args.positive_boost < 1:
+        raise SystemExit("--positive-boost must be 1 or greater")
     if not (args.data_root / args.slug).is_dir():
         raise SystemExit(f"no data for slug {args.slug!r} under {args.data_root}")
 
@@ -77,11 +89,17 @@ def main() -> int:
         borrow_positives=not args.no_borrow_positives,
         borrow_background=not args.no_borrow_background,
         copy=args.copy,
+        positive_boost=args.positive_boost,
     )
 
     dest = args.out / args.slug
     print(f"Assembled {dest}")
-    print(f"  positive:   {summary['positive']} (own)")
+    boost_note = (
+        f" = {summary['positive_unique']} unique x{args.positive_boost}"
+        if args.positive_boost > 1
+        else ""
+    )
+    print(f"  positive:   {summary['positive']} (own{boost_note})")
     print(
         f"  negative:   {summary['negative']} "
         f"(own {summary['own_negative']}, borrowed negatives {summary['borrowed_negative']}, "
@@ -115,6 +133,7 @@ def assemble(
     borrow_positives: bool = True,
     borrow_background: bool = True,
     copy: bool = False,
+    positive_boost: int = 1,
 ) -> dict:
     dest = out_root / slug
     if dest.exists():
@@ -126,8 +145,12 @@ def assemble(
     counts = {k: 0 for k in ("own_negative", "borrowed_negative", "borrowed_positive", "own_background", "borrowed_background")}
     contributing: set[str] = set()
 
-    # Positives: own only.
-    n_pos = _link_category(data_root / slug / "positive", dest / "positive", slug, copy)
+    # Positives: own only, optionally replicated `positive_boost` times so the
+    # real clips are a larger fraction of the trainer's synthetic positive pool.
+    n_pos_unique = _count_wavs(data_root / slug / "positive")
+    n_pos = _link_category(
+        data_root / slug / "positive", dest / "positive", slug, copy, boost=positive_boost
+    )
 
     # Negatives: own negatives, then every other slug's negatives, then
     # (optionally) every other slug's positives reused as hard negatives.
@@ -154,6 +177,7 @@ def assemble(
 
     return {
         "positive": n_pos,
+        "positive_unique": n_pos_unique,
         "negative": counts["own_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"],
         "background": counts["own_background"] + counts["borrowed_background"],
         "own_negative": counts["own_negative"],
@@ -165,25 +189,36 @@ def assemble(
     }
 
 
-def _link_category(src_dir: Path, dest_dir: Path, src_slug: str, copy: bool) -> int:
+def _count_wavs(src_dir: Path) -> int:
+    return len(list(src_dir.glob("*.wav"))) if src_dir.is_dir() else 0
+
+
+def _link_category(
+    src_dir: Path, dest_dir: Path, src_slug: str, copy: bool, boost: int = 1
+) -> int:
     """Link/copy every ``*.wav`` in *src_dir* into *dest_dir*, namespaced by slug.
 
     Returns the number of clips placed. Names are prefixed with the source slug
-    so clips pooled from different wake words never collide in the flat dir.
+    so clips pooled from different wake words never collide in the flat dir. When
+    *boost* > 1 each source clip is placed *boost* times with a distinct suffix,
+    so the trainer treats every replica as its own clip and samples/augments it,
+    raising that source's weight in the pool.
     """
     if not src_dir.is_dir():
         return 0
     placed = 0
     for clip in sorted(src_dir.glob("*.wav")):
-        target = dest_dir / f"{src_slug}__{clip.name}"
-        if copy:
-            shutil.copyfile(clip, target)
-        else:
-            # Relative symlink so the pool resolves inside the trainer's
-            # /work bind mount regardless of the host path.
-            rel = os.path.relpath(clip.resolve(), dest_dir.resolve())
-            target.symlink_to(rel)
-        placed += 1
+        for replica in range(boost):
+            suffix = "" if boost == 1 else f"__x{replica}"
+            target = dest_dir / f"{src_slug}__{clip.stem}{suffix}{clip.suffix}"
+            if copy:
+                shutil.copyfile(clip, target)
+            else:
+                # Relative symlink so the pool resolves inside the trainer's
+                # /work bind mount regardless of the host path.
+                rel = os.path.relpath(clip.resolve(), dest_dir.resolve())
+                target.symlink_to(rel)
+            placed += 1
     return placed
 
 

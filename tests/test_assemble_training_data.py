@@ -77,6 +77,39 @@ class AssembleTrainingDataTest(unittest.TestCase):
             self.assertEqual(2, s["borrowed_negative"])
             self.assertEqual(1, s["background"])  # own only
 
+    def test_positive_boost_replicates_own_positives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data" / "real"
+            out_root = root / "data" / "train"
+            seed(data_root, "hey_tester", positives=3, negatives=2)
+            seed(data_root, "hey_jarvis", positives=4, negatives=1)
+
+            s = ata.assemble("hey_tester", data_root, out_root, positive_boost=4)
+
+            # 3 unique own positives replicated 4x = 12 placed clips.
+            self.assertEqual(3, s["positive_unique"])
+            self.assertEqual(12, s["positive"])
+            dest = out_root / "hey_tester"
+            self.assertEqual(12, len(list((dest / "positive").glob("*.wav"))))
+            # Each replica resolves to a real source file.
+            replica = next((dest / "positive").glob("hey_tester__p0__x0.wav"))
+            self.assertTrue(replica.resolve().is_file())
+            # Borrowing (negatives) is unaffected by the positive boost.
+            self.assertEqual(4, s["borrowed_positive"])
+
+    def test_positive_boost_one_keeps_plain_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data" / "real"
+            out_root = root / "data" / "train"
+            seed(data_root, "w1", positives=2)
+            s = ata.assemble("w1", data_root, out_root, positive_boost=1)
+            self.assertEqual(2, s["positive"])
+            dest = out_root / "w1"
+            # No __x suffix at boost 1.
+            self.assertTrue((dest / "positive" / "w1__p0.wav").exists())
+
     def test_rerun_is_clean(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
