@@ -125,6 +125,29 @@ class BundleSyncClient(
         }
     }
 
+    /**
+     * Map of recording id to the source-WAV SHA-256 the server holds. A null
+     * value means the server has that recording but recorded it before
+     * checksums existed (legacy). Ids absent from the map are not on the server.
+     */
+    fun loadServerChecksums(wakeWordSlug: String): Map<String, String?> {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/bulk/${urlPart(wakeWordSlug)}/recordings")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val response = readResponse(connection, "Load server checksums failed")
+        val root = JSONObject(response)
+        if (!root.has("checksums")) return emptyMap()
+        val checksums = root.getJSONArray("checksums")
+        return buildMap {
+            for (index in 0 until checksums.length()) {
+                val item = checksums.getJSONObject(index)
+                put(item.getString("id"), item.optStringOrNull("sha256"))
+            }
+        }
+    }
+
     fun loadServerRecordings(wakeWordSlug: String): List<ServerRecording> {
         val endpoint = URL(serverUrl.trimEnd('/') + "/bulk/${urlPart(wakeWordSlug)}/recordings/detail")
         val connection = endpoint.openConnection() as HttpURLConnection

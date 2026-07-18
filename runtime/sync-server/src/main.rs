@@ -129,6 +129,15 @@ struct BulkRecordingIdsResponse {
     status: &'static str,
     wake_word_slug: String,
     recording_ids: Vec<String>,
+    /// Each recording id paired with its source-WAV SHA-256 (null for legacy
+    /// rows), so a device can skip re-uploading takes the server already holds.
+    checksums: Vec<RecordingChecksum>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordingChecksum {
+    id: String,
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -748,14 +757,20 @@ async fn bulk_recording_ids(
             "unsafe wake word slug: {slug}"
         )));
     }
-    let recording_ids = {
+    let checksums = {
         let conn = state.db.lock().expect("db lock poisoned");
-        db::recording_ids(&conn, &slug).map_err(db_error)?
+        db::recording_checksums(&conn, &slug).map_err(db_error)?
     };
+    let recording_ids = checksums.iter().map(|(id, _)| id.clone()).collect();
+    let checksums = checksums
+        .into_iter()
+        .map(|(id, sha256)| RecordingChecksum { id, sha256 })
+        .collect();
     Ok(Json(BulkRecordingIdsResponse {
         status: "ok",
         wake_word_slug: slug.clone(),
         recording_ids,
+        checksums,
     }))
 }
 
@@ -1406,8 +1421,8 @@ async fn align_one_recording(
 
     // Persist the raw source recording, then remove any stale slice files
     // this recording produced on a previous pass before writing the new set.
-    let source_wav = match store_bulk_source(dest_root, recording_id, source) {
-        Ok(path) => path,
+    let (source_wav, source_sha256) = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(stored) => stored,
         Err(error) => {
             summary
                 .warnings
@@ -1625,6 +1640,7 @@ async fn align_one_recording(
             recorded_at: recorded_at.to_string(),
             duration_ms: duration_ms as i64,
             source_wav: source_wav.to_string_lossy().to_string(),
+            source_sha256: Some(source_sha256),
             bundle: None,
             transcript_text: whisper.text.trim().to_string(),
             whisper_url: Some(whisper_url.to_string()),
@@ -1680,8 +1696,8 @@ fn slice_background_recording(
     capture: &db::CaptureMeta,
     summary: &mut AlignmentSummary,
 ) -> Result<(), AppError> {
-    let source_wav = match store_bulk_source(dest_root, recording_id, source) {
-        Ok(path) => path,
+    let (source_wav, source_sha256) = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(stored) => stored,
         Err(error) => {
             summary
                 .warnings
@@ -1746,6 +1762,7 @@ fn slice_background_recording(
         recorded_at: recorded_at.to_string(),
         duration_ms: duration_ms as i64,
         source_wav: source_wav.to_string_lossy().to_string(),
+        source_sha256: Some(source_sha256),
         bundle: None,
         transcript_text: String::new(),
         whisper_url: None,
@@ -2093,11 +2110,14 @@ fn bulk_clip_hash_id(
     format!("{:x}", hasher.finalize())
 }
 
+/// Persist a recording's source WAV under `bulk_source/` and return both the
+/// stored path and its full-file SHA-256. The checksum lets a device ask which
+/// takes the server already holds and skip re-uploading unchanged ones.
 fn store_bulk_source(
     dest_root: &Path,
     recording_id: &str,
     source: &Path,
-) -> Result<PathBuf, AppError> {
+) -> Result<(PathBuf, String), AppError> {
     let dir = dest_root.join("bulk_source");
     fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{}.wav", safe_filename(recording_id)));
@@ -2110,7 +2130,17 @@ fn store_bulk_source(
     if !same {
         fs::copy(source, &dest)?;
     }
-    Ok(dest)
+    let sha256 = file_sha256(&dest)?;
+    Ok((dest, sha256))
+}
+
+/// Streaming SHA-256 of a file's raw bytes, hex-encoded. Matches the digest the
+/// Android client computes over the same WAV so the two can be compared.
+fn file_sha256(path: &Path) -> Result<String, AppError> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn write_wav_slice(

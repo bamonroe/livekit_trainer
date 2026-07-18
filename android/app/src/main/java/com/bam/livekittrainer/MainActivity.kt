@@ -32,6 +32,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -1002,13 +1003,34 @@ class MainActivity : Activity() {
         Thread {
             try {
                 val client = BundleSyncClient(serverUrl)
-                val zip = exporter.exportProjectZip(
-                    project,
-                    emptyList(),
-                    bulkRecordings,
-                    backgroundRecordings,
-                )
-                val response = client.upload(zip)
+                // Ask the server which takes it already holds and skip re-uploading
+                // any whose bytes are unchanged, so a sync only ships new audio.
+                val serverChecksums = try {
+                    client.loadServerChecksums(project.slug)
+                } catch (_: Exception) {
+                    emptyMap()
+                }
+                val bulkToUpload = bulkRecordings.filter {
+                    recordingNeedsUpload(it.id, it.filePath, serverChecksums)
+                }
+                val backgroundToUpload = backgroundRecordings.filter {
+                    recordingNeedsUpload(it.id, it.filePath, serverChecksums)
+                }
+                val skipped =
+                    (bulkRecordings.size - bulkToUpload.size) +
+                        (backgroundRecordings.size - backgroundToUpload.size)
+
+                val response = if (bulkToUpload.isEmpty() && backgroundToUpload.isEmpty()) {
+                    null
+                } else {
+                    val zip = exporter.exportProjectZip(
+                        project,
+                        emptyList(),
+                        bulkToUpload,
+                        backgroundToUpload,
+                    )
+                    client.upload(zip)
+                }
                 val clips = client.loadBulkReview(project.slug)
                 val recordings = try {
                     client.loadServerRecordings(project.slug)
@@ -1029,11 +1051,17 @@ class MainActivity : Activity() {
                     bulkAlignmentProjectSlug = null
                     bulkAlignment = null
                     processingBulkSplit = false
-                    val alignmentMessage = syncAlignmentMessage(response)
-                    statusMessage = if (clips.isEmpty()) {
-                        "No clips generated. $alignmentMessage"
+                    val skippedNote =
+                        if (skipped > 0) " ($skipped already on server, not re-uploaded)" else ""
+                    statusMessage = if (response == null) {
+                        "Already up to date — nothing new to upload$skippedNote"
                     } else {
-                        "Synced and sliced ${clips.size} clips"
+                        val alignmentMessage = syncAlignmentMessage(response)
+                        if (clips.isEmpty()) {
+                            "No clips generated. $alignmentMessage"
+                        } else {
+                            "Synced and sliced ${clips.size} clips$skippedNote"
+                        }
                     }
                     render()
                 }
@@ -1045,6 +1073,43 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
+    }
+
+    /**
+     * Whether a local recording still needs uploading. New to the server (id
+     * absent) → yes. Present with a matching checksum → no. Present but the
+     * server has no checksum (legacy row) → trust the id and skip. Present with a
+     * different checksum (re-recorded under the same id) → yes.
+     */
+    private fun recordingNeedsUpload(
+        id: String,
+        filePath: String,
+        serverChecksums: Map<String, String?>,
+    ): Boolean {
+        if (!serverChecksums.containsKey(id)) return true
+        val serverSha = serverChecksums[id] ?: return false
+        val localSha = sha256OfFile(filePath) ?: return true
+        return !serverSha.equals(localSha, ignoreCase = true)
+    }
+
+    /** Hex SHA-256 of a file's raw bytes, or null if it cannot be read. */
+    private fun sha256OfFile(filePath: String): String? {
+        val file = File(filePath)
+        if (!file.isFile) return null
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            file.inputStream().use { stream ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = stream.read(buffer)
+                    if (read < 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun reprocessProject(project: WakeWordProject) {

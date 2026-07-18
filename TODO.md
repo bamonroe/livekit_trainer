@@ -13,6 +13,16 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Checksum-based incremental sync: a sync no longer re-uploads and
+  re-transcribes every take. The server stores each recording's source-WAV
+  SHA-256 (`bulk_recordings.source_sha256`, schema v3) and returns an id→sha map
+  from `GET /bulk/:slug/recordings`. Before uploading, the app hashes each local
+  take and skips any the server already holds with a matching checksum (legacy
+  rows with no checksum fall back to id-matching; a changed take re-uploads).
+  When nothing is new the app says "Already up to date" and does no upload.
+  Existing server rows backfill their checksum on the next reprocess. Verified:
+  server unit test for the round-trip + reprocess preservation, and a live
+  reprocess whose stored SHA matched the file's `sha256sum`.
 - [x] Make the server the master record for recordings, manageable from any
   device. New `GET /bulk/:slug/recordings/detail` returns every recording with
   active slice counts and capture device; the app's Review page lists server

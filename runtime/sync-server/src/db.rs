@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Per-take capture provenance forwarded by the app: which device and input
 /// route recorded it, the mic's native format before the app's 16 kHz mono
@@ -68,6 +68,7 @@ pub struct RecordingAlignment {
     pub recorded_at: String,
     pub duration_ms: i64,
     pub source_wav: String,
+    pub source_sha256: Option<String>,
     pub bundle: Option<String>,
     pub transcript_text: String,
     pub whisper_url: Option<String>,
@@ -252,6 +253,10 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         ("capture_source_sample_rate_hz", "INTEGER"),
         ("capture_source_channels", "INTEGER"),
         ("capture_session_id", "TEXT"),
+        // Version 3: full-file SHA-256 of the source WAV, so a device can ask the
+        // server which takes it already holds and skip re-uploading unchanged
+        // recordings.
+        ("source_sha256", "TEXT"),
     ] {
         if !column_exists(conn, "bulk_recordings", name)? {
             conn.execute(
@@ -330,8 +335,8 @@ pub fn store_recording_alignment(
             (id, project_slug, script, recorded_at, duration_ms, source_wav, bundle, imported_at_ms,
              capture_device_manufacturer, capture_device_model, capture_os_version,
              capture_app_version, capture_input_route, capture_source_sample_rate_hz,
-             capture_source_channels, capture_session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             capture_source_channels, capture_session_id, source_sha256)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(id) DO UPDATE SET
             project_slug = excluded.project_slug,
             script = excluded.script,
@@ -339,6 +344,8 @@ pub fn store_recording_alignment(
             duration_ms = excluded.duration_ms,
             source_wav = excluded.source_wav,
             bundle = excluded.bundle,
+            -- Keep a prior checksum if this pass carries none (e.g. reprocess).
+            source_sha256 = COALESCE(excluded.source_sha256, bulk_recordings.source_sha256),
             -- Reprocess carries no manifest, so keep prior provenance when the
             -- incoming values are null instead of erasing it.
             capture_device_manufacturer = COALESCE(excluded.capture_device_manufacturer, bulk_recordings.capture_device_manufacturer),
@@ -366,6 +373,7 @@ pub fn store_recording_alignment(
             capture.source_sample_rate_hz,
             capture.source_channels,
             capture.session_id,
+            alignment.source_sha256,
         ],
     )?;
 
@@ -513,12 +521,19 @@ pub fn review_slices(conn: &Connection, slug: &str) -> Result<Vec<ReviewSlice>, 
     rows.collect()
 }
 
-/// Distinct recording ids that currently have any slices or a recording row.
-pub fn recording_ids(conn: &Connection, slug: &str) -> Result<Vec<String>, rusqlite::Error> {
+/// Every recording id in a project paired with its stored source-WAV SHA-256
+/// (None for legacy rows recorded before checksums existed). Lets a device
+/// decide which takes it can skip re-uploading.
+pub fn recording_checksums(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<(String, Option<String>)>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM bulk_recordings WHERE project_slug = ?1 ORDER BY id",
+        "SELECT id, source_sha256 FROM bulk_recordings WHERE project_slug = ?1 ORDER BY id",
     )?;
-    let rows = stmt.query_map(params![slug], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params![slug], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
     rows.collect()
 }
 
@@ -811,5 +826,41 @@ mod tests {
         assert_eq!(background.id, "background_200_b");
         assert_eq!(background.background_count, 1);
         assert_eq!(background.device_model.as_deref(), Some("SM-P620"));
+    }
+
+    #[test]
+    fn recording_checksums_round_trips_and_preserves_on_reprocess() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        migrate(&conn).expect("migrate");
+        let mut conn = conn;
+
+        let mut alignment = RecordingAlignment {
+            recording_id: "bulk_1".to_string(),
+            project_slug: "all_set".to_string(),
+            phrase: "all set".to_string(),
+            external_id: None,
+            script: "all set".to_string(),
+            recorded_at: "2026-07-18T00:00:00Z".to_string(),
+            duration_ms: 5000,
+            source_wav: "/x.wav".to_string(),
+            source_sha256: Some("abc123".to_string()),
+            bundle: None,
+            transcript_text: String::new(),
+            whisper_url: None,
+            words: Vec::new(),
+            prompts: Vec::new(),
+            slices: Vec::new(),
+            capture: CaptureMeta::default(),
+        };
+        store_recording_alignment(&mut conn, &alignment, 0).expect("store");
+
+        let sums = recording_checksums(&conn, "all_set").expect("checksums");
+        assert_eq!(sums, vec![("bulk_1".to_string(), Some("abc123".to_string()))]);
+
+        // Reprocess carries no checksum; the prior one must survive.
+        alignment.source_sha256 = None;
+        store_recording_alignment(&mut conn, &alignment, 1).expect("reprocess store");
+        let sums = recording_checksums(&conn, "all_set").expect("checksums");
+        assert_eq!(sums, vec![("bulk_1".to_string(), Some("abc123".to_string()))]);
     }
 }
