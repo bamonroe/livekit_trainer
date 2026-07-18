@@ -10,7 +10,25 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// Per-take capture provenance forwarded by the app: which device and input
+/// route recorded it, the mic's native format before the app's 16 kHz mono
+/// conversion, and the session that groups takes recorded together. Every field
+/// is optional so a reprocess (which has no fresh manifest) can leave prior
+/// values untouched. Stored on the `bulk_recordings` row, which also backs
+/// background takes.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureMeta {
+    pub device_manufacturer: Option<String>,
+    pub device_model: Option<String>,
+    pub os_version: Option<String>,
+    pub app_version: Option<String>,
+    pub input_route: Option<String>,
+    pub source_sample_rate_hz: Option<i64>,
+    pub source_channels: Option<i64>,
+    pub session_id: Option<String>,
+}
 
 /// A word with millisecond timing, as stored under a transcript.
 #[derive(Debug, Clone)]
@@ -56,6 +74,7 @@ pub struct RecordingAlignment {
     pub words: Vec<WordRow>,
     pub prompts: Vec<String>,
     pub slices: Vec<SliceRow>,
+    pub capture: CaptureMeta,
 }
 
 /// An imported single clip (non-bulk) tracked for training export.
@@ -220,8 +239,40 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_words_transcript ON transcript_words(transcript_id, ordinal);
         "#,
     )?;
+
+    // Version 2: per-take capture provenance on bulk_recordings. Added via
+    // guarded ALTERs so both fresh databases (columns absent from the CREATE
+    // above) and existing ones evolve to the same shape.
+    for (name, decl) in [
+        ("capture_device_manufacturer", "TEXT"),
+        ("capture_device_model", "TEXT"),
+        ("capture_os_version", "TEXT"),
+        ("capture_app_version", "TEXT"),
+        ("capture_input_route", "TEXT"),
+        ("capture_source_sample_rate_hz", "INTEGER"),
+        ("capture_source_channels", "INTEGER"),
+        ("capture_session_id", "TEXT"),
+    ] {
+        if !column_exists(conn, "bulk_recordings", name)? {
+            conn.execute(
+                &format!("ALTER TABLE bulk_recordings ADD COLUMN {name} {decl}"),
+                [],
+            )?;
+        }
+    }
+
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
+}
+
+/// Whether a column already exists on a table, so migrations can add it once.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        params![column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Ensure a project row exists, filling phrase/external_id and stamping the
@@ -273,17 +324,31 @@ pub fn store_recording_alignment(
         now_ms,
     )?;
 
+    let capture = &alignment.capture;
     tx.execute(
         "INSERT INTO bulk_recordings
-            (id, project_slug, script, recorded_at, duration_ms, source_wav, bundle, imported_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            (id, project_slug, script, recorded_at, duration_ms, source_wav, bundle, imported_at_ms,
+             capture_device_manufacturer, capture_device_model, capture_os_version,
+             capture_app_version, capture_input_route, capture_source_sample_rate_hz,
+             capture_source_channels, capture_session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id) DO UPDATE SET
             project_slug = excluded.project_slug,
             script = excluded.script,
             recorded_at = excluded.recorded_at,
             duration_ms = excluded.duration_ms,
             source_wav = excluded.source_wav,
-            bundle = excluded.bundle",
+            bundle = excluded.bundle,
+            -- Reprocess carries no manifest, so keep prior provenance when the
+            -- incoming values are null instead of erasing it.
+            capture_device_manufacturer = COALESCE(excluded.capture_device_manufacturer, bulk_recordings.capture_device_manufacturer),
+            capture_device_model = COALESCE(excluded.capture_device_model, bulk_recordings.capture_device_model),
+            capture_os_version = COALESCE(excluded.capture_os_version, bulk_recordings.capture_os_version),
+            capture_app_version = COALESCE(excluded.capture_app_version, bulk_recordings.capture_app_version),
+            capture_input_route = COALESCE(excluded.capture_input_route, bulk_recordings.capture_input_route),
+            capture_source_sample_rate_hz = COALESCE(excluded.capture_source_sample_rate_hz, bulk_recordings.capture_source_sample_rate_hz),
+            capture_source_channels = COALESCE(excluded.capture_source_channels, bulk_recordings.capture_source_channels),
+            capture_session_id = COALESCE(excluded.capture_session_id, bulk_recordings.capture_session_id)",
         params![
             alignment.recording_id,
             alignment.project_slug,
@@ -293,6 +358,14 @@ pub fn store_recording_alignment(
             alignment.source_wav,
             alignment.bundle,
             now_ms,
+            capture.device_manufacturer,
+            capture.device_model,
+            capture.os_version,
+            capture.app_version,
+            capture.input_route,
+            capture.source_sample_rate_hz,
+            capture.source_channels,
+            capture.session_id,
         ],
     )?;
 

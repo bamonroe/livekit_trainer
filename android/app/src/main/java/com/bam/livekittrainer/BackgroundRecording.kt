@@ -16,4 +16,5 @@ data class BackgroundRecording(
     val sampleRateHz: Int,
     val channels: Int,
     val encoding: String,
+    val capture: CaptureMetadata = CaptureMetadata.EMPTY,
 )

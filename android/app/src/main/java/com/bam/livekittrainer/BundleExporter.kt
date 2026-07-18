@@ -164,7 +164,8 @@ class BundleExporter(private val context: Context) {
                     conditions.forEach { condition -> put(condition.name.lowercase()) }
                 },
             )
-            .put("session_id", "bulk")
+            .put("capture", capture.toManifestJson())
+            .put("session_id", capture.sessionId)
             .put("notes", "")
     }
 
@@ -177,7 +178,8 @@ class BundleExporter(private val context: Context) {
             .put("sample_rate_hz", sampleRateHz)
             .put("channels", channels)
             .put("encoding", encoding)
-            .put("session_id", "background")
+            .put("capture", capture.toManifestJson())
+            .put("session_id", capture.sessionId)
             .put("notes", "")
     }
 

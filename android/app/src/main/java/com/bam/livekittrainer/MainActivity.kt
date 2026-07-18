@@ -9,6 +9,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.MediaPlayer
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -74,6 +75,9 @@ class MainActivity : Activity() {
     private val playbackHandler = Handler(Looper.getMainLooper())
     private var alignmentTicker: Runnable? = null
     private var statusMessage: String = ""
+    // Groups every take recorded in this app sitting under one id so the trainer
+    // can tell which clips were captured together. New process launch, new id.
+    private val sessionId: String = UUID.randomUUID().toString()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -629,6 +633,7 @@ class MainActivity : Activity() {
                         channels = result.channels,
                         encoding = result.encoding,
                         conditions = emptyList(),
+                        capture = captureMetadataFor(result),
                     ),
                 )
                 bulkScriptRevision += 1
@@ -647,6 +652,28 @@ class MainActivity : Activity() {
             statusMessage = error.message ?: "Could not start bulk recording"
             render()
         }
+    }
+
+    /**
+     * Combine the device/app/session context this activity knows with the audio
+     * route the recorder resolved, into the provenance stored on each take.
+     */
+    private fun captureMetadataFor(result: WavRecorder.RecordingResult): CaptureMetadata {
+        val appVersion = try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+        return CaptureMetadata(
+            deviceManufacturer = Build.MANUFACTURER ?: "",
+            deviceModel = Build.MODEL ?: "",
+            osVersion = "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
+            appVersion = appVersion,
+            inputRoute = result.inputRoute,
+            sourceSampleRateHz = result.sourceSampleRateHz,
+            sourceChannels = result.sourceChannels,
+            sessionId = sessionId,
+        )
     }
 
     private fun backgroundNoiseCard(
@@ -706,6 +733,7 @@ class MainActivity : Activity() {
                         sampleRateHz = result.sampleRateHz,
                         channels = result.channels,
                         encoding = result.encoding,
+                        capture = captureMetadataFor(result),
                     ),
                 )
                 statusMessage = "Saved background take ${result.output.name}"

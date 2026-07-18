@@ -13,6 +13,17 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Capture richer per-recording metadata the server used to drop. Each bulk
+  and background take now carries a `capture` object (device manufacturer/model,
+  OS version, app version, resolved input route, the mic's native
+  `source_sample_rate_hz`/`source_channels` before the 16 kHz mono conversion,
+  and a per-sitting `session_id`). The app records the route/native format from
+  `AudioRecord.routedDevice` (`WavRecorder.describeInput`), persists it in
+  SQLite (DB v6, `capture_*` columns on both recording tables), and emits it in
+  the manifest. The sync server parses it (`capture_from_extra`), stores it on
+  the `bulk_recordings` row (schema v2, COALESCE-preserved across reprocess).
+  Tests: `capture_from_extra_reads_nested_capture_and_skips_blanks`,
+  `capture_from_extra_absent_object_is_all_none`.
 - [x] Collect real background noise: new "Record background" control on the app's
   Record page records a long ambient take (no script, no transcription). The
   bundle carries a `background_recordings[]` array; the sync server chops each
@@ -54,9 +65,6 @@ discovered. Prefer small, actionable items with clear status.
 - [ ] Surface background takes in the app's Review page for per-take replay and
   delete (they already round-trip through the server slices/review machinery;
   the app just doesn't list them yet).
-- [ ] Capture richer per-recording metadata the server currently drops: device
-  model, mic/input route, session id, and pre-conversion sample rate/channels.
-  Needed for dataset condition reports and the mistake-correction loop.
 - [ ] Emit distinct `false_positive` / `false_negative` labels from evaluation
   mistakes into correction batches (labels are already accepted end to end).
 - [ ] Add optional runtime scorer service or test harness under `runtime/`.

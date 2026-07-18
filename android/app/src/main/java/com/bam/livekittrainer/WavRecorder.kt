@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -69,6 +70,10 @@ class WavRecorder(private val context: Context) {
         // unwedged) instead of crashing the worker thread.
         val recorder = openMicrophone(bufferSize)
 
+        // The mic is live now, so the OS has resolved the actual input route and
+        // its native hardware format; capture them before spawning the writer.
+        val route = describeInput(recorder)
+
         val running = AtomicBoolean(true)
         val pcmBytes = AtomicInteger(0)
         val worker = thread(name = "wav-recorder") {
@@ -82,7 +87,45 @@ class WavRecorder(private val context: Context) {
             prompt = prompt,
             startedAtMillis = System.currentTimeMillis(),
             pcmBytes = pcmBytes,
+            route = route,
         )
+    }
+
+    /**
+     * Describe the resolved input device: a human-readable route label plus the
+     * microphone's native sample rate and channel count, which sit upstream of
+     * the fixed 16 kHz mono PCM we actually write. Falls back to the capture
+     * format when the platform does not report a routed device or its formats.
+     */
+    private fun describeInput(recorder: AudioRecord): AudioRoute {
+        val device = recorder.routedDevice
+        val route = if (device != null) {
+            val type = audioDeviceTypeLabel(device.type)
+            val name = device.productName?.toString()?.trim().orEmpty()
+            if (name.isEmpty()) type else "$type: $name"
+        } else {
+            "unknown"
+        }
+        val sourceSampleRate = device?.sampleRates
+            ?.filter { it > 0 }
+            ?.maxOrNull()
+            ?: SAMPLE_RATE
+        val sourceChannels = device?.channelCounts
+            ?.filter { it > 0 }
+            ?.minOrNull()
+            ?: CHANNELS
+        return AudioRoute(route, sourceSampleRate, sourceChannels)
+    }
+
+    private fun audioDeviceTypeLabel(type: Int): String = when (type) {
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "builtin_mic"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth_sco"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "wired_headset"
+        AudioDeviceInfo.TYPE_USB_DEVICE -> "usb_device"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "usb_headset"
+        AudioDeviceInfo.TYPE_TELEPHONY -> "telephony"
+        AudioDeviceInfo.TYPE_BUS -> "bus"
+        else -> "type_$type"
     }
 
     @SuppressLint("MissingPermission")
@@ -130,6 +173,9 @@ class WavRecorder(private val context: Context) {
             sampleRateHz = SAMPLE_RATE,
             channels = CHANNELS,
             encoding = ENCODING,
+            inputRoute = recording.route.inputRoute,
+            sourceSampleRateHz = recording.route.sourceSampleRateHz,
+            sourceChannels = recording.route.sourceChannels,
         )
     }
 
@@ -219,6 +265,14 @@ class WavRecorder(private val context: Context) {
         val prompt: RecordingPrompt,
         val startedAtMillis: Long,
         val pcmBytes: AtomicInteger,
+        val route: AudioRoute,
+    )
+
+    /** Resolved input route and the mic's native format before conversion. */
+    data class AudioRoute(
+        val inputRoute: String,
+        val sourceSampleRateHz: Int,
+        val sourceChannels: Int,
     )
 
     data class RecordingResult(
@@ -229,6 +283,9 @@ class WavRecorder(private val context: Context) {
         val sampleRateHz: Int,
         val channels: Int,
         val encoding: String,
+        val inputRoute: String = "",
+        val sourceSampleRateHz: Int = 0,
+        val sourceChannels: Int = 0,
     )
 
     private companion object {

@@ -412,6 +412,10 @@ class ProjectStore(context: Context) {
             if (oldVersion < 5) {
                 createBackgroundRecordingsTable(db)
             }
+            if (oldVersion < 6) {
+                addCaptureColumns(db, TABLE_BULK_RECORDINGS)
+                addCaptureColumns(db, TABLE_BACKGROUND_RECORDINGS)
+            }
         }
 
         override fun onConfigure(db: SQLiteDatabase) {
@@ -434,6 +438,7 @@ class ProjectStore(context: Context) {
                     channels INTEGER NOT NULL,
                     encoding TEXT NOT NULL,
                     condition_tags TEXT NOT NULL DEFAULT '',
+                    $CAPTURE_COLUMNS_SQL,
                     FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
                 )
                 """.trimIndent(),
@@ -454,18 +459,41 @@ class ProjectStore(context: Context) {
                     sample_rate_hz INTEGER NOT NULL,
                     channels INTEGER NOT NULL,
                     encoding TEXT NOT NULL,
+                    $CAPTURE_COLUMNS_SQL,
                     FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
                 )
                 """.trimIndent(),
             )
             db.execSQL("CREATE INDEX IF NOT EXISTS background_recordings_project_id_idx ON $TABLE_BACKGROUND_RECORDINGS(project_id)")
         }
+
+        private fun addCaptureColumns(db: SQLiteDatabase, table: String) {
+            for ((name, type) in CAPTURE_COLUMNS) {
+                db.execSQL("ALTER TABLE $table ADD COLUMN $name $type")
+            }
+        }
     }
 
     private companion object {
         const val DATABASE_NAME = "wake_word_collection.db"
-        const val DATABASE_VERSION = 5
+        const val DATABASE_VERSION = 6
         const val LEGACY_PREFS = "wake_word_projects"
+
+        // Per-take provenance columns shared by the bulk and background tables.
+        // Kept in one place so the CREATE definitions and the version-6 ALTER
+        // migration stay in lockstep.
+        val CAPTURE_COLUMNS: List<Pair<String, String>> = listOf(
+            "capture_device_manufacturer" to "TEXT NOT NULL DEFAULT ''",
+            "capture_device_model" to "TEXT NOT NULL DEFAULT ''",
+            "capture_os_version" to "TEXT NOT NULL DEFAULT ''",
+            "capture_app_version" to "TEXT NOT NULL DEFAULT ''",
+            "capture_input_route" to "TEXT NOT NULL DEFAULT ''",
+            "capture_source_sample_rate_hz" to "INTEGER NOT NULL DEFAULT 0",
+            "capture_source_channels" to "INTEGER NOT NULL DEFAULT 0",
+            "capture_session_id" to "TEXT NOT NULL DEFAULT ''",
+        )
+        val CAPTURE_COLUMNS_SQL: String =
+            CAPTURE_COLUMNS.joinToString(",\n                    ") { (name, type) -> "$name $type" }
         const val KEY_PROJECTS = "projects"
         const val KEY_MIGRATED = "sqlite_migrated"
         const val TABLE_PROJECTS = "projects"
@@ -518,6 +546,7 @@ private fun BulkRecording.toContentValues(): ContentValues =
         put("channels", channels)
         put("encoding", encoding)
         put("condition_tags", conditions.joinToString(",") { it.name })
+        putCapture(capture)
     }
 
 private fun BackgroundRecording.toContentValues(): ContentValues =
@@ -531,7 +560,31 @@ private fun BackgroundRecording.toContentValues(): ContentValues =
         put("sample_rate_hz", sampleRateHz)
         put("channels", channels)
         put("encoding", encoding)
+        putCapture(capture)
     }
+
+private fun ContentValues.putCapture(capture: CaptureMetadata) {
+    put("capture_device_manufacturer", capture.deviceManufacturer)
+    put("capture_device_model", capture.deviceModel)
+    put("capture_os_version", capture.osVersion)
+    put("capture_app_version", capture.appVersion)
+    put("capture_input_route", capture.inputRoute)
+    put("capture_source_sample_rate_hz", capture.sourceSampleRateHz)
+    put("capture_source_channels", capture.sourceChannels)
+    put("capture_session_id", capture.sessionId)
+}
+
+private fun Cursor.toCaptureMetadata(): CaptureMetadata =
+    CaptureMetadata(
+        deviceManufacturer = getOptionalStringValue("capture_device_manufacturer"),
+        deviceModel = getOptionalStringValue("capture_device_model"),
+        osVersion = getOptionalStringValue("capture_os_version"),
+        appVersion = getOptionalStringValue("capture_app_version"),
+        inputRoute = getOptionalStringValue("capture_input_route"),
+        sourceSampleRateHz = getOptionalIntValue("capture_source_sample_rate_hz"),
+        sourceChannels = getOptionalIntValue("capture_source_channels"),
+        sessionId = getOptionalStringValue("capture_session_id"),
+    )
 
 private fun Cursor.toProject(): WakeWordProject =
     WakeWordProject(
@@ -579,6 +632,7 @@ private fun Cursor.toBulkRecording(): BulkRecording =
             .mapNotNull { raw ->
                 raw.takeIf { it.isNotBlank() }?.let { runCatching { ClipCondition.valueOf(it) }.getOrNull() }
             },
+        capture = toCaptureMetadata(),
     )
 
 private fun Cursor.toBackgroundRecording(): BackgroundRecording =
@@ -592,6 +646,7 @@ private fun Cursor.toBackgroundRecording(): BackgroundRecording =
         sampleRateHz = getIntValue("sample_rate_hz"),
         channels = getIntValue("channels"),
         encoding = getStringValue("encoding"),
+        capture = toCaptureMetadata(),
     )
 
 private fun Cursor.getStringValue(column: String): String =
@@ -604,6 +659,11 @@ private fun Cursor.getOptionalStringValue(column: String): String {
 
 private fun Cursor.getIntValue(column: String): Int =
     getInt(getColumnIndexOrThrow(column))
+
+private fun Cursor.getOptionalIntValue(column: String): Int {
+    val index = getColumnIndex(column)
+    return if (index >= 0) getInt(index) else 0
+}
 
 private fun Cursor.getLongValue(column: String): Long =
     getLong(getColumnIndexOrThrow(column))

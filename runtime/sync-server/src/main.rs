@@ -620,6 +620,8 @@ async fn run_reprocess(
             &dest_root,
             &state.db,
             whisper_url,
+            // Reprocess has no manifest; the upsert keeps existing provenance.
+            &db::CaptureMeta::default(),
             &mut summary,
         )
         .await?;
@@ -1114,6 +1116,37 @@ fn import_bundle(
     Ok(imported)
 }
 
+/// Pull per-take capture provenance out of a recording's flattened `extra`
+/// JSON. The app nests it under a `capture` object; missing or empty values
+/// become `None` so they never overwrite prior provenance on reprocess.
+fn capture_from_extra(extra: &Value) -> db::CaptureMeta {
+    let capture = extra.get("capture");
+    let text = |key: &str| {
+        capture
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    let number = |key: &str| {
+        capture
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+    };
+    db::CaptureMeta {
+        device_manufacturer: text("device_manufacturer"),
+        device_model: text("device_model"),
+        os_version: text("os_version"),
+        app_version: text("app_version"),
+        input_route: text("input_route"),
+        source_sample_rate_hz: number("source_sample_rate_hz"),
+        source_channels: number("source_channels"),
+        session_id: text("session_id"),
+    }
+}
+
 async fn align_bulk_recordings(
     bundle: &Path,
     manifest: &Manifest,
@@ -1166,6 +1199,7 @@ async fn align_bulk_recordings(
             &dest_root,
             db,
             whisper_url,
+            &capture_from_extra(&recording.extra),
             &mut summary,
         )
         .await?;
@@ -1220,6 +1254,7 @@ async fn align_background_recordings(
             external_id.as_deref(),
             &dest_root,
             db,
+            &capture_from_extra(&recording.extra),
             &mut summary,
         )?;
     }
@@ -1242,6 +1277,7 @@ async fn align_one_recording(
     dest_root: &Path,
     db: &Mutex<Connection>,
     whisper_url: &str,
+    capture: &db::CaptureMeta,
     summary: &mut AlignmentSummary,
 ) -> Result<(), AppError> {
     summary.recordings += 1;
@@ -1259,6 +1295,7 @@ async fn align_one_recording(
             external_id,
             dest_root,
             db,
+            capture,
             summary,
         );
     }
@@ -1533,6 +1570,7 @@ async fn align_one_recording(
             words: word_rows,
             prompts,
             slices: slice_rows,
+            capture: capture.clone(),
         };
         {
             let mut conn = db.lock().expect("db lock poisoned");
@@ -1578,6 +1616,7 @@ fn slice_background_recording(
     external_id: Option<&str>,
     dest_root: &Path,
     db: &Mutex<Connection>,
+    capture: &db::CaptureMeta,
     summary: &mut AlignmentSummary,
 ) -> Result<(), AppError> {
     let source_wav = match store_bulk_source(dest_root, recording_id, source) {
@@ -1652,6 +1691,7 @@ fn slice_background_recording(
         words: Vec::new(),
         prompts: Vec::new(),
         slices: slice_rows,
+        capture: capture.clone(),
     };
     {
         let mut conn = db.lock().expect("db lock poisoned");
@@ -2307,6 +2347,41 @@ mod tests {
         assert_eq!(category_for_label("false_positive"), Some("negative"));
         assert_eq!(category_for_label("background"), Some("background"));
         assert_eq!(category_for_label("other"), None);
+    }
+
+    #[test]
+    fn capture_from_extra_reads_nested_capture_and_skips_blanks() {
+        let extra = serde_json::json!({
+            "session_id": "top-level-ignored",
+            "capture": {
+                "device_manufacturer": "Google",
+                "device_model": "Pixel 7",
+                "input_route": "builtin_mic: Pixel 7",
+                "source_sample_rate_hz": 48000,
+                "source_channels": 1,
+                "session_id": "sess-abc",
+                "os_version": "",
+                "app_version": null,
+            }
+        });
+        let capture = capture_from_extra(&extra);
+        assert_eq!(capture.device_manufacturer.as_deref(), Some("Google"));
+        assert_eq!(capture.device_model.as_deref(), Some("Pixel 7"));
+        assert_eq!(capture.input_route.as_deref(), Some("builtin_mic: Pixel 7"));
+        assert_eq!(capture.source_sample_rate_hz, Some(48000));
+        assert_eq!(capture.source_channels, Some(1));
+        assert_eq!(capture.session_id.as_deref(), Some("sess-abc"));
+        // Empty string and null collapse to None so reprocess never clobbers.
+        assert_eq!(capture.os_version, None);
+        assert_eq!(capture.app_version, None);
+    }
+
+    #[test]
+    fn capture_from_extra_absent_object_is_all_none() {
+        let capture = capture_from_extra(&serde_json::json!({ "notes": "x" }));
+        assert!(capture.device_model.is_none());
+        assert!(capture.source_sample_rate_hz.is_none());
+        assert!(capture.session_id.is_none());
     }
 
     #[test]

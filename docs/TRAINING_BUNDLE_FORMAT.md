@@ -116,7 +116,17 @@ Initial schema version: `1`.
       "sample_rate_hz": 16000,
       "channels": 1,
       "encoding": "pcm_s16le",
-      "session_id": "bulk",
+      "capture": {
+        "device_manufacturer": "Google",
+        "device_model": "Pixel 7",
+        "os_version": "Android 14 (SDK 34)",
+        "app_version": "1.0",
+        "input_route": "builtin_mic: Pixel 7 built-in mic",
+        "source_sample_rate_hz": 48000,
+        "source_channels": 1,
+        "session_id": "b2e1c4a0-...-session"
+      },
+      "session_id": "b2e1c4a0-...-session",
       "notes": ""
     }
   ],
@@ -129,12 +139,31 @@ Initial schema version: `1`.
       "sample_rate_hz": 16000,
       "channels": 1,
       "encoding": "pcm_s16le",
-      "session_id": "background",
+      "capture": {
+        "device_manufacturer": "Google",
+        "device_model": "Pixel 7",
+        "os_version": "Android 14 (SDK 34)",
+        "app_version": "1.0",
+        "input_route": "builtin_mic: Pixel 7 built-in mic",
+        "source_sample_rate_hz": 48000,
+        "source_channels": 1,
+        "session_id": "b2e1c4a0-...-session"
+      },
+      "session_id": "b2e1c4a0-...-session",
       "notes": ""
     }
   ]
 }
 ```
+
+Each bulk and background take carries a `capture` object recording its
+provenance: the recording device and OS, the app version, the resolved input
+route, the microphone's native `source_sample_rate_hz`/`source_channels` before
+the app's 16 kHz mono conversion, and a `session_id` shared by every take
+recorded in one app sitting. The sync server persists these on the recording row
+(preserving them across reprocess) so the dataset can later be traced, filtered,
+or rebalanced by source. All fields are optional; missing or empty values are
+ignored rather than stored.
 
 `background_recordings` are long ambient/non-speech takes. They carry no
 `script` and are never transcribed; the sync server chops each into fixed-length

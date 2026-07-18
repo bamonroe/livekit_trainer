@@ -12,4 +12,5 @@ data class BulkRecording(
     val channels: Int,
     val encoding: String,
     val conditions: List<ClipCondition> = emptyList(),
+    val capture: CaptureMetadata = CaptureMetadata.EMPTY,
 )
