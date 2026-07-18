@@ -11,6 +11,19 @@ discovered. Prefer small, actionable items with clear status.
   padding, negative sampling, and review output. See
   `docs/BULK_SCRIPTED_COLLECTION.md`.
 
+## Recently done
+
+- [x] Hard-cap slices at 1.5s (word span + padding clamped; transcript trimmed
+  to audible words). Verified on `all_set`: all clips <= 1.5s, none dropped.
+- [x] Add server reprocess endpoints (`POST /reprocess/:slug`,
+  `POST /reprocess/:slug/:recording_id`) that re-slice stored `bulk_source`
+  audio with no re-upload, plus `DELETE /bulk/:slug/:recording_id` to remove a
+  recording, its slices, and files (cleans orphaned server-side takes).
+- [x] Redesign the Android app: bottom nav (Record / Review / Settings),
+  dedicated pages, clear "Sync & process" (was "Split batch"), project-wide and
+  per-recording Reprocess buttons, server-aware delete, project picker chip.
+  Default the app's Whisper URL to the WhisperX port to match the server.
+
 ## Later
 
 - [ ] Add optional runtime scorer service or test harness under `runtime/`.
