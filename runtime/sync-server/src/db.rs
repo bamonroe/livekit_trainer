@@ -106,6 +106,17 @@ pub struct ProjectRow {
     pub bulk_slice_count: i64,
 }
 
+/// Everything a reprocess pass needs about a stored recording to re-run
+/// alignment from its already-saved source WAV, without a fresh upload.
+#[derive(Debug, Clone)]
+pub struct RecordingMeta {
+    pub id: String,
+    pub project_slug: String,
+    pub script: String,
+    pub recorded_at: String,
+    pub duration_ms: i64,
+}
+
 /// Open (creating if needed) the database and apply the schema.
 pub fn open(path: &Path) -> Result<Connection, rusqlite::Error> {
     if let Some(parent) = path.parent() {
@@ -433,6 +444,74 @@ pub fn recording_ids(conn: &Connection, slug: &str) -> Result<Vec<String>, rusql
     )?;
     let rows = stmt.query_map(params![slug], |row| row.get::<_, String>(0))?;
     rows.collect()
+}
+
+/// Full reprocess metadata for every recording in a project, newest first.
+pub fn recordings_for_reprocess(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<RecordingMeta>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_slug, script, COALESCE(recorded_at, ''),
+                COALESCE(duration_ms, 0)
+         FROM bulk_recordings WHERE project_slug = ?1 ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map(params![slug], |row| {
+        Ok(RecordingMeta {
+            id: row.get(0)?,
+            project_slug: row.get(1)?,
+            script: row.get(2)?,
+            recorded_at: row.get(3)?,
+            duration_ms: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Reprocess metadata for a single recording, if it exists.
+pub fn recording_meta(
+    conn: &Connection,
+    recording_id: &str,
+) -> Result<Option<RecordingMeta>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT id, project_slug, script, COALESCE(recorded_at, ''),
+                COALESCE(duration_ms, 0)
+         FROM bulk_recordings WHERE id = ?1",
+        params![recording_id],
+        |row| {
+            Ok(RecordingMeta {
+                id: row.get(0)?,
+                project_slug: row.get(1)?,
+                script: row.get(2)?,
+                recorded_at: row.get(3)?,
+                duration_ms: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// A project's wake phrase and external id, if the project is known.
+pub fn project_phrase(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<(String, Option<String>)>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT phrase, external_id FROM projects WHERE slug = ?1",
+        params![slug],
+        |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+}
+
+/// Delete a recording and everything derived from it (transcripts, words,
+/// prompts, slices cascade). WAV files on disk are removed by the caller.
+pub fn delete_recording(conn: &Connection, recording_id: &str) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute(
+        "DELETE FROM bulk_recordings WHERE id = ?1",
+        params![recording_id],
+    )?;
+    Ok(changed > 0)
 }
 
 /// The script for a recording, if known.

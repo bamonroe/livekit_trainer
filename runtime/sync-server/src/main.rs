@@ -25,6 +25,11 @@ use zip::ZipArchive;
 mod db;
 
 const POSITIVE_MAX_SECONDS: f64 = 1.5;
+// Hard ceiling on the final padded slice length. The context/target budgets
+// above bound only the word span; lead/tail padding is added on top, so without
+// this every positive ran ~0.3s over. Positives keep their tail (the wake
+// phrase ends the clip) so the start is trimmed in; negatives keep their start.
+const MAX_SLICE_SECONDS: f64 = 1.5;
 // Whisper word timestamps drift from the true audio, so cutting exactly at
 // word.start/word.end clips onsets and (worst of all) chops the tail-aligned
 // wake phrase. Nudge each cut outward, bounded by the neighboring words, to keep
@@ -148,6 +153,26 @@ struct DeleteReviewClipResponse {
     deleted: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ReprocessResponse {
+    status: &'static str,
+    wake_word_slug: String,
+    recording_count: usize,
+    positives: usize,
+    negatives: usize,
+    dropped_positives: usize,
+    alignment_output: String,
+    warnings: Vec<String>,
+    whisper_server_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteRecordingResponse {
+    status: &'static str,
+    deleted: bool,
+    removed_files: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     schema_version: u64,
@@ -260,7 +285,13 @@ async fn main() {
         .route("/settings", get(get_settings).post(update_settings))
         .route("/projects", get(projects))
         .route("/sync", post(sync))
+        .route("/reprocess/:slug", post(reprocess_project))
+        .route("/reprocess/:slug/:recording_id", post(reprocess_recording))
         .route("/bulk/:slug/recordings", get(bulk_recording_ids))
+        .route(
+            "/bulk/:slug/:recording_id",
+            axum::routing::delete(delete_recording),
+        )
         .route("/review/:slug/bulk", get(bulk_review))
         .route(
             "/review/:slug/bulk/:recording_id/alignment",
@@ -414,6 +445,168 @@ async fn sync(
 
     let _ = fs::remove_dir_all(&extract_root);
     result.map(Json)
+}
+
+/// Resolve the Whisper server URL from the request header, falling back to the
+/// saved server setting. Shared by the upload and reprocess paths.
+fn resolve_whisper_url(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-whisper-server-url")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            state
+                .settings
+                .lock()
+                .expect("settings lock poisoned")
+                .whisper_server_url
+                .clone()
+        })
+}
+
+async fn reprocess_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<ReprocessResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!(
+            "unsafe wake word slug: {slug}"
+        )));
+    }
+    let recordings = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::recordings_for_reprocess(&conn, &slug).map_err(db_error)?
+    };
+    run_reprocess(&state, &headers, &slug, recordings).await
+}
+
+async fn reprocess_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((slug, recording_id)): AxumPath<(String, String)>,
+) -> Result<Json<ReprocessResponse>, AppError> {
+    if !is_safe_slug(&slug) || !is_safe_recording_id(&recording_id) {
+        return Err(AppError::bad_request("unsafe reprocess path"));
+    }
+    let recording = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::recording_meta(&conn, &recording_id).map_err(db_error)?
+    };
+    let recording = recording
+        .filter(|meta| meta.project_slug == slug)
+        .ok_or_else(|| AppError::bad_request(format!("unknown recording: {recording_id}")))?;
+    run_reprocess(&state, &headers, &slug, vec![recording]).await
+}
+
+/// Re-run alignment for a set of stored recordings from their already-saved
+/// source WAVs, without a fresh upload. Cuts identically to the sync path.
+async fn run_reprocess(
+    state: &AppState,
+    headers: &HeaderMap,
+    slug: &str,
+    recordings: Vec<db::RecordingMeta>,
+) -> Result<Json<ReprocessResponse>, AppError> {
+    let whisper_server_url = resolve_whisper_url(state, headers);
+    let (phrase, external_id) = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::project_phrase(&conn, slug).map_err(db_error)?
+    }
+    .ok_or_else(|| AppError::bad_request(format!("unknown project: {slug}")))?;
+
+    let dest_root = state.data_root.join(slug);
+    let mut summary = AlignmentSummary::default();
+
+    match whisper_server_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => summary
+            .warnings
+            .push("no Whisper server URL configured".to_string()),
+        Some(whisper_url) => {
+            for meta in &recordings {
+                let source = dest_root
+                    .join("bulk_source")
+                    .join(format!("{}.wav", safe_filename(&meta.id)));
+                if !source.is_file() {
+                    summary.recordings += 1;
+                    summary.warnings.push(format!(
+                        "{}: stored source WAV missing; re-sync this recording",
+                        meta.id
+                    ));
+                    continue;
+                }
+                align_one_recording(
+                    &meta.id,
+                    &meta.script,
+                    &meta.recorded_at,
+                    meta.duration_ms.max(0) as u64,
+                    &source,
+                    slug,
+                    &phrase,
+                    external_id.as_deref(),
+                    &dest_root,
+                    &state.db,
+                    whisper_url,
+                    &mut summary,
+                )
+                .await?;
+            }
+        }
+    }
+
+    Ok(Json(ReprocessResponse {
+        status: "reprocessed",
+        wake_word_slug: slug.to_string(),
+        recording_count: recordings.len(),
+        positives: summary.positives,
+        negatives: summary.negatives,
+        dropped_positives: summary.dropped_positives,
+        alignment_output: alignment_summary(&summary),
+        warnings: summary.warnings.clone(),
+        whisper_server_url,
+    }))
+}
+
+async fn delete_recording(
+    State(state): State<AppState>,
+    AxumPath((slug, recording_id)): AxumPath<(String, String)>,
+) -> Result<Json<DeleteRecordingResponse>, AppError> {
+    if !is_safe_slug(&slug) || !is_safe_recording_id(&recording_id) {
+        return Err(AppError::bad_request("unsafe delete path"));
+    }
+    let paths = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, &recording_id).map_err(db_error)?
+    };
+    let mut removed_files = 0usize;
+    for path in paths {
+        let path = PathBuf::from(path);
+        if path.is_file() && fs::remove_file(&path).is_ok() {
+            removed_files += 1;
+        }
+    }
+    let source = state
+        .data_root
+        .join(&slug)
+        .join("bulk_source")
+        .join(format!("{}.wav", safe_filename(&recording_id)));
+    if source.is_file() && fs::remove_file(&source).is_ok() {
+        removed_files += 1;
+    }
+    let deleted = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::delete_recording(&conn, &recording_id).map_err(db_error)?
+    };
+    Ok(Json(DeleteRecordingResponse {
+        status: "deleted",
+        deleted,
+        removed_files,
+    }))
 }
 
 async fn bulk_review(
@@ -843,79 +1036,117 @@ async fn align_bulk_recordings(
     let dest_root = data_root.join(&slug);
 
     for recording in &manifest.bulk_recordings {
-        summary.recordings += 1;
         let source = match safe_join(bundle, &recording.file) {
             Ok(source) => source,
             Err(error) => {
+                summary.recordings += 1;
                 summary
                     .warnings
                     .push(format!("{}: {}", recording.id, error.message));
                 continue;
             }
         };
-        let whisper = match transcribe_with_words(whisper_url, &source, None).await {
-            Ok(whisper) => whisper,
-            Err(error) => {
-                summary
-                    .warnings
-                    .push(format!("{}: {}", recording.id, error.message));
-                continue;
-            }
-        };
-        let words = whisper_words(&whisper);
-        if words.is_empty() {
-            summary.warnings.push(format!(
-                "{}: Whisper returned no word timestamps",
-                recording.id
-            ));
-            continue;
-        }
+        align_one_recording(
+            &recording.id,
+            &recording.script,
+            &recording.recorded_at,
+            recording.duration_ms,
+            &source,
+            &slug,
+            &phrase,
+            external_id.as_deref(),
+            &dest_root,
+            db,
+            whisper_url,
+            &mut summary,
+        )
+        .await?;
+    }
 
-        let phrase_words = normalized_words(&phrase);
-        if phrase_words.is_empty() {
-            summary.warnings.push(format!(
-                "{}: wake phrase has no alignable words",
-                recording.id
-            ));
-            continue;
-        }
+    Ok(summary)
+}
 
-        let positive_ranges = phrase_ranges(&words, &phrase_words)
-            .into_iter()
-            .filter(|(first, last)| !is_hard_negative_context(&words, *first, *last))
-            .collect::<Vec<_>>();
-        if positive_ranges.is_empty() {
-            summary.warnings.push(format!(
-                "{}: no aligned wake phrase occurrences found in transcript {:?}",
-                recording.id,
-                whisper.text.trim()
-            ));
+/// Align and slice one already-materialized source WAV. Shared by the upload
+/// path (source from the bundle) and the reprocess path (source is the stored
+/// bulk_source WAV), so both cut slices identically.
+async fn align_one_recording(
+    recording_id: &str,
+    script: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    slug: &str,
+    phrase: &str,
+    external_id: Option<&str>,
+    dest_root: &Path,
+    db: &Mutex<Connection>,
+    whisper_url: &str,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    summary.recordings += 1;
+    let whisper = match transcribe_with_words(whisper_url, source, None).await {
+        Ok(whisper) => whisper,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
         }
+    };
+    let words = whisper_words(&whisper);
+    if words.is_empty() {
+        summary.warnings.push(format!(
+            "{}: Whisper returned no word timestamps",
+            recording_id
+        ));
+        return Ok(());
+    }
 
-        // Persist the raw source recording, then remove any stale slice files
-        // this recording produced on a previous pass before writing the new set.
-        let source_wav = match store_bulk_source(&dest_root, &recording.id, &source) {
-            Ok(path) => path,
-            Err(error) => {
-                summary
-                    .warnings
-                    .push(format!("{}: {}", recording.id, error.message));
-                continue;
-            }
-        };
-        let old_paths = {
-            let conn = db.lock().expect("db lock poisoned");
-            db::active_slice_paths(&conn, &recording.id).map_err(db_error)?
-        };
-        for old in old_paths {
-            let old = PathBuf::from(old);
-            if old.is_file() {
-                let _ = fs::remove_file(old);
-            }
+    let phrase_words = normalized_words(phrase);
+    if phrase_words.is_empty() {
+        summary.warnings.push(format!(
+            "{}: wake phrase has no alignable words",
+            recording_id
+        ));
+        return Ok(());
+    }
+
+    let positive_ranges = phrase_ranges(&words, &phrase_words)
+        .into_iter()
+        .filter(|(first, last)| !is_hard_negative_context(&words, *first, *last))
+        .collect::<Vec<_>>();
+    if positive_ranges.is_empty() {
+        summary.warnings.push(format!(
+            "{}: no aligned wake phrase occurrences found in transcript {:?}",
+            recording_id,
+            whisper.text.trim()
+        ));
+    }
+
+    // Persist the raw source recording, then remove any stale slice files
+    // this recording produced on a previous pass before writing the new set.
+    let source_wav = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(path) => path,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
         }
+    };
+    let old_paths = {
+        let conn = db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
+    };
+    for old in old_paths {
+        let old = PathBuf::from(old);
+        if old.is_file() {
+            let _ = fs::remove_file(old);
+        }
+    }
 
-        let source_end = wav_duration_seconds(&source)
-            .unwrap_or_else(|_| words.last().map(|word| word.end).unwrap_or(0.0));
+    let source_end = wav_duration_seconds(source)
+        .unwrap_or_else(|_| words.last().map(|word| word.end).unwrap_or(0.0));
 
         let mut occupied = Vec::new();
         let mut slice_rows = Vec::new();
@@ -930,11 +1161,22 @@ async fn align_bulk_recordings(
                 POSITIVE_TAIL_PADDING_SECONDS,
                 false,
             );
-            let slice_words = &words[context_first..=*last];
-            let clip_id = bulk_clip_hash_id(recording, "positive", start, end, slice_words);
-            let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(&phrase));
+            let (start, end) = clamp_slice_span(start, end, true);
+            let (visible_first, visible_last) =
+                visible_range(&words, context_first, *last, start, end);
+            let slice_words = &words[visible_first..=visible_last];
+            let clip_id = bulk_clip_hash_id(
+                recording_id,
+                recorded_at,
+                duration_ms,
+                "positive",
+                start,
+                end,
+                slice_words,
+            );
+            let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(phrase));
             let dest = dest_root.join("positive").join(&file_name);
-            if write_wav_slice(&source, &dest, start, end)? {
+            if write_wav_slice(source, &dest, start, end)? {
                 // Verify the cut audio actually contains the wake phrase, judged
                 // on its own with no script prompt. Whisper word timings are
                 // unstable, so a phrase the alignment placed here may not really
@@ -949,7 +1191,7 @@ async fn align_bulk_recordings(
                         summary.dropped_positives += 1;
                         summary.warnings.push(format!(
                             "{}: dropped positive at {:.2}-{:.2}s; wake phrase not heard in slice",
-                            recording.id, start, end
+                            recording_id, start, end
                         ));
                     }
                     // Kept when the phrase is heard, or when verification itself
@@ -973,7 +1215,6 @@ async fn align_bulk_recordings(
 
         let negative_ranges = negative_ranges(&words, &occupied);
         for (_, _, word_start, word_end) in negative_ranges.iter() {
-            let slice_words = &words[*word_start..=*word_end];
             let (start, end) = padded_bounds(
                 &words,
                 *word_start,
@@ -983,7 +1224,19 @@ async fn align_bulk_recordings(
                 NEGATIVE_TAIL_PADDING_SECONDS,
                 true,
             );
-            let clip_id = bulk_clip_hash_id(recording, "negative", start, end, slice_words);
+            let (start, end) = clamp_slice_span(start, end, false);
+            let (visible_first, visible_last) =
+                visible_range(&words, *word_start, *word_end, start, end);
+            let slice_words = &words[visible_first..=visible_last];
+            let clip_id = bulk_clip_hash_id(
+                recording_id,
+                recorded_at,
+                duration_ms,
+                "negative",
+                start,
+                end,
+                slice_words,
+            );
             let phrase_text = slice_words
                 .iter()
                 .map(|word| word.word.trim())
@@ -995,7 +1248,7 @@ async fn align_bulk_recordings(
                 safe_filename(&phrase_text)
             );
             let dest = dest_root.join("negative").join(&file_name);
-            if write_wav_slice(&source, &dest, start, end)? {
+            if write_wav_slice(source, &dest, start, end)? {
                 slice_rows.push(build_slice_row(
                     &clip_id,
                     "negative",
@@ -1018,8 +1271,7 @@ async fn align_bulk_recordings(
                 probability: word.probability,
             })
             .collect();
-        let prompts = recording
-            .script
+        let prompts = script
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -1027,13 +1279,13 @@ async fn align_bulk_recordings(
             .collect();
 
         let alignment = db::RecordingAlignment {
-            recording_id: recording.id.clone(),
-            project_slug: slug.clone(),
-            phrase: phrase.clone(),
-            external_id: external_id.clone(),
-            script: recording.script.clone(),
-            recorded_at: recording.recorded_at.clone(),
-            duration_ms: recording.duration_ms as i64,
+            recording_id: recording_id.to_string(),
+            project_slug: slug.to_string(),
+            phrase: phrase.to_string(),
+            external_id: external_id.map(ToString::to_string),
+            script: script.to_string(),
+            recorded_at: recorded_at.to_string(),
+            duration_ms: duration_ms as i64,
             source_wav: source_wav.to_string_lossy().to_string(),
             bundle: None,
             transcript_text: whisper.text.trim().to_string(),
@@ -1046,9 +1298,8 @@ async fn align_bulk_recordings(
             let mut conn = db.lock().expect("db lock poisoned");
             db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
         }
-    }
 
-    Ok(summary)
+    Ok(())
 }
 
 fn build_slice_row(
@@ -1236,6 +1487,42 @@ fn padded_bounds(
     (start, end)
 }
 
+/// Enforce the hard maximum slice length on already-padded bounds. Positives
+/// pass `keep_tail = true` so the wake phrase (which ends the clip) is never
+/// trimmed — the start moves in instead; negatives keep their start and move
+/// the end in.
+fn clamp_slice_span(start: f64, end: f64, keep_tail: bool) -> (f64, f64) {
+    if end - start <= MAX_SLICE_SECONDS {
+        return (start, end);
+    }
+    if keep_tail {
+        (end - MAX_SLICE_SECONDS, end)
+    } else {
+        (start, start + MAX_SLICE_SECONDS)
+    }
+}
+
+/// The still-audible sub-range of `first..=last` after the bounds were clamped,
+/// so the stored transcript/word timings match what the slice actually contains
+/// instead of over-claiming words that got trimmed off.
+fn visible_range(
+    words: &[WhisperWord],
+    first: usize,
+    last: usize,
+    start: f64,
+    end: f64,
+) -> (usize, usize) {
+    let mut visible_first = first;
+    while visible_first < last && words[visible_first].end <= start {
+        visible_first += 1;
+    }
+    let mut visible_last = last;
+    while visible_last > visible_first && words[visible_last].start >= end {
+        visible_last -= 1;
+    }
+    (visible_first, visible_last)
+}
+
 fn wav_duration_seconds(path: &Path) -> Result<f64, AppError> {
     let reader = WavReader::open(path)
         .map_err(|error| AppError::bad_request(format!("cannot read WAV duration: {error}")))?;
@@ -1309,7 +1596,9 @@ fn word_overlaps_ranges(word: &WhisperWord, ranges: &[(f64, f64)]) -> bool {
 }
 
 fn bulk_clip_hash_id(
-    recording: &BulkRecording,
+    recording_id: &str,
+    recorded_at: &str,
+    recording_duration_ms: u64,
     category: &str,
     start_sec: f64,
     end_sec: f64,
@@ -1322,10 +1611,9 @@ fn bulk_clip_hash_id(
         .join(" ");
     let duration_ms = ((end_sec - start_sec).max(0.0) * 1000.0).round() as u64;
     let input = json!({
-        "recording_id": recording.id,
-        "recording_file": recording.file,
-        "recorded_at": recording.recorded_at,
-        "recording_duration_ms": recording.duration_ms,
+        "recording_id": recording_id,
+        "recorded_at": recorded_at,
+        "recording_duration_ms": recording_duration_ms,
         "category": category,
         "source_start_ms": (start_sec * 1000.0).round() as i64,
         "source_end_ms": (end_sec * 1000.0).round() as i64,
@@ -1352,7 +1640,15 @@ fn store_bulk_source(
     let dir = dest_root.join("bulk_source");
     fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{}.wav", safe_filename(recording_id)));
-    fs::copy(source, &dest)?;
+    // Reprocess passes the already-stored source as the input; copying a file
+    // onto itself would truncate it to zero bytes, so skip when they match.
+    let same = match (source.canonicalize(), dest.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same {
+        fs::copy(source, &dest)?;
+    }
     Ok(dest)
 }
 
@@ -1737,6 +2033,56 @@ mod tests {
             ranges,
             vec![(0.0, 0.7, 0, 1), (2.7, 3.6, 4, 5), (4.1, 4.3, 6, 6)]
         );
+    }
+
+    #[test]
+    fn clamp_slice_span_enforces_hard_max() {
+        // Within the cap: bounds are untouched.
+        let (start, end) = clamp_slice_span(0.5, 1.5, true);
+        assert!((start - 0.5).abs() < 1e-9 && (end - 1.5).abs() < 1e-9);
+
+        // Positive over the cap: keep the tail, trim the start in.
+        let (start, end) = clamp_slice_span(0.0, 1.8, true);
+        assert!((start - 0.3).abs() < 1e-9);
+        assert!((end - 1.8).abs() < 1e-9);
+        assert!(end - start <= MAX_SLICE_SECONDS + 1e-9);
+
+        // Negative over the cap: keep the start, trim the end in.
+        let (start, end) = clamp_slice_span(0.0, 1.8, false);
+        assert!((start - 0.0).abs() < 1e-9);
+        assert!((end - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn visible_range_drops_trimmed_words() {
+        let words = vec![
+            test_word("alpha", 0.00, 0.20),
+            test_word("bravo", 0.35, 0.55),
+            test_word("wake", 1.30, 1.55),
+            test_word("word", 1.65, 1.90),
+        ];
+
+        // A clamped start past the first words drops them from the transcript.
+        assert_eq!(visible_range(&words, 0, 3, 0.60, 2.00), (2, 3));
+        // A clamped end drops trailing words instead.
+        assert_eq!(visible_range(&words, 0, 3, 0.00, 1.20), (0, 1));
+        // No trimming needed: the full range stays.
+        assert_eq!(visible_range(&words, 0, 3, 0.00, 2.00), (0, 3));
+    }
+
+    #[test]
+    fn bulk_clip_hash_id_is_stable_across_reprocess() {
+        let words = vec![test_word("all", 1.30, 1.55), test_word("set", 1.65, 1.90)];
+        // Same recording identity + cut + words => same id, so re-syncing or
+        // reprocessing the stored source produces identical slice ids.
+        let a = bulk_clip_hash_id("rec-1", "2026-01-01", 5000, "positive", 1.2, 1.9, &words);
+        let b = bulk_clip_hash_id("rec-1", "2026-01-01", 5000, "positive", 1.2, 1.9, &words);
+        assert_eq!(a, b);
+        // A different recording or cut yields a different id.
+        let c = bulk_clip_hash_id("rec-2", "2026-01-01", 5000, "positive", 1.2, 1.9, &words);
+        assert_ne!(a, c);
+        let d = bulk_clip_hash_id("rec-1", "2026-01-01", 5000, "negative", 1.2, 1.9, &words);
+        assert_ne!(a, d);
     }
 
     fn test_word(word: &str, start: f64, end: f64) -> WhisperWord {
