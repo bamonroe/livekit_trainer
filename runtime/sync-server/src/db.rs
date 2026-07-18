@@ -567,6 +567,64 @@ pub fn recording_meta(
     .optional()
 }
 
+/// Per-recording metadata, active slice tallies, and capture provenance for
+/// every recording the server holds for a wake word. This is what lets any
+/// device list and manage recordings it never created itself (e.g. takes that
+/// were synced from a different phone or tablet).
+#[derive(Debug, Clone)]
+pub struct RecordingDetail {
+    pub id: String,
+    pub recorded_at: String,
+    pub duration_ms: i64,
+    pub positive_count: i64,
+    pub negative_count: i64,
+    pub background_count: i64,
+    pub device_manufacturer: Option<String>,
+    pub device_model: Option<String>,
+    pub app_version: Option<String>,
+    pub input_route: Option<String>,
+    pub session_id: Option<String>,
+}
+
+/// Every recording for a wake word with its active slice counts and the device
+/// that captured it, newest first. Background takes share this table and are
+/// distinguished by the caller via the `background_` id prefix.
+pub fn recording_details(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<RecordingDetail>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT b.id, COALESCE(b.recorded_at, ''), COALESCE(b.duration_ms, 0),
+                (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
+                    AND s.status = 'active' AND s.category = 'positive'),
+                (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
+                    AND s.status = 'active' AND s.category = 'negative'),
+                (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
+                    AND s.status = 'active' AND s.category = 'background'),
+                b.capture_device_manufacturer, b.capture_device_model,
+                b.capture_app_version, b.capture_input_route, b.capture_session_id
+         FROM bulk_recordings b
+         WHERE b.project_slug = ?1
+         ORDER BY b.id DESC",
+    )?;
+    let rows = stmt.query_map(params![slug], |row| {
+        Ok(RecordingDetail {
+            id: row.get(0)?,
+            recorded_at: row.get(1)?,
+            duration_ms: row.get(2)?,
+            positive_count: row.get(3)?,
+            negative_count: row.get(4)?,
+            background_count: row.get(5)?,
+            device_manufacturer: row.get(6)?,
+            device_model: row.get(7)?,
+            app_version: row.get(8)?,
+            input_route: row.get(9)?,
+            session_id: row.get(10)?,
+        })
+    })?;
+    rows.collect()
+}
+
 /// A project's wake phrase and external id, if the project is known.
 pub fn project_phrase(
     conn: &Connection,
@@ -687,4 +745,71 @@ pub fn delete_slice_by_file(
         params![slug, category, file_name],
     )?;
     Ok(changed > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        migrate(&conn).expect("migrate");
+        conn
+    }
+
+    fn insert_recording(conn: &Connection, id: &str, slug: &str, duration_ms: i64, device: &str) {
+        conn.execute(
+            "INSERT INTO bulk_recordings
+                (id, project_slug, script, recorded_at, duration_ms, source_wav,
+                 imported_at_ms, capture_device_model)
+             VALUES (?1, ?2, '', '2026-07-18T00:00:00Z', ?3, '/x.wav', 0, ?4)",
+            params![id, slug, duration_ms, device],
+        )
+        .expect("insert recording");
+    }
+
+    fn insert_slice(conn: &Connection, id: &str, rec: &str, slug: &str, category: &str, status: &str) {
+        conn.execute(
+            "INSERT INTO slices
+                (id, recording_id, project_slug, label, category, source_start_ms,
+                 source_end_ms, duration_ms, wav_path, file_name, status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4, 0, 100, 100, '/s.wav', ?1, ?5, 0)",
+            params![id, rec, slug, category, status],
+        )
+        .expect("insert slice");
+    }
+
+    #[test]
+    fn recording_details_reports_counts_device_and_background_flag() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (slug, phrase, created_at_ms) VALUES ('all_set', 'all set', 0)",
+            [],
+        )
+        .unwrap();
+        insert_recording(&conn, "bulk_100_a", "all_set", 43000, "Pixel 8a");
+        insert_recording(&conn, "background_200_b", "all_set", 60000, "SM-P620");
+        // Two active positives, one active negative, one deleted positive (ignored).
+        insert_slice(&conn, "s1", "bulk_100_a", "all_set", "positive", "active");
+        insert_slice(&conn, "s2", "bulk_100_a", "all_set", "positive", "active");
+        insert_slice(&conn, "s3", "bulk_100_a", "all_set", "negative", "active");
+        insert_slice(&conn, "s4", "bulk_100_a", "all_set", "positive", "deleted");
+        insert_slice(&conn, "s5", "background_200_b", "all_set", "background", "active");
+
+        let details = recording_details(&conn, "all_set").expect("details");
+        assert_eq!(details.len(), 2);
+        // Ordered by id DESC: "bulk_..." sorts after "background_...".
+        let bulk = &details[0];
+        assert_eq!(bulk.id, "bulk_100_a");
+        assert_eq!(bulk.positive_count, 2);
+        assert_eq!(bulk.negative_count, 1);
+        assert_eq!(bulk.background_count, 0);
+        assert_eq!(bulk.duration_ms, 43000);
+        assert_eq!(bulk.device_model.as_deref(), Some("Pixel 8a"));
+
+        let background = &details[1];
+        assert_eq!(background.id, "background_200_b");
+        assert_eq!(background.background_count, 1);
+        assert_eq!(background.device_model.as_deref(), Some("SM-P620"));
+    }
 }

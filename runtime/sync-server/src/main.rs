@@ -131,6 +131,29 @@ struct BulkRecordingIdsResponse {
     recording_ids: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RecordingDetailItem {
+    id: String,
+    is_background: bool,
+    recorded_at: String,
+    duration_ms: i64,
+    positive_count: i64,
+    negative_count: i64,
+    background_count: i64,
+    device_manufacturer: Option<String>,
+    device_model: Option<String>,
+    app_version: Option<String>,
+    input_route: Option<String>,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordingDetailsResponse {
+    status: &'static str,
+    wake_word_slug: String,
+    recordings: Vec<RecordingDetailItem>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct BulkAlignmentResponse {
     status: String,
@@ -349,6 +372,7 @@ async fn main() {
         .route("/reprocess/:slug", post(reprocess_project))
         .route("/reprocess/:slug/:recording_id", post(reprocess_recording))
         .route("/bulk/:slug/recordings", get(bulk_recording_ids))
+        .route("/bulk/:slug/recordings/detail", get(bulk_recording_details))
         .route(
             "/bulk/:slug/:recording_id",
             axum::routing::delete(delete_recording),
@@ -732,6 +756,43 @@ async fn bulk_recording_ids(
         status: "ok",
         wake_word_slug: slug.clone(),
         recording_ids,
+    }))
+}
+
+async fn bulk_recording_details(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<RecordingDetailsResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!(
+            "unsafe wake word slug: {slug}"
+        )));
+    }
+    let details = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::recording_details(&conn, &slug).map_err(db_error)?
+    };
+    let recordings = details
+        .into_iter()
+        .map(|d| RecordingDetailItem {
+            is_background: d.id.starts_with("background_"),
+            id: d.id,
+            recorded_at: d.recorded_at,
+            duration_ms: d.duration_ms,
+            positive_count: d.positive_count,
+            negative_count: d.negative_count,
+            background_count: d.background_count,
+            device_manufacturer: d.device_manufacturer,
+            device_model: d.device_model,
+            app_version: d.app_version,
+            input_route: d.input_route,
+            session_id: d.session_id,
+        })
+        .collect();
+    Ok(Json(RecordingDetailsResponse {
+        status: "ok",
+        wake_word_slug: slug,
+        recordings,
     }))
 }
 
