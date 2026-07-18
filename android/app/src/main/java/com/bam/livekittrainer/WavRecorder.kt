@@ -37,6 +37,23 @@ class WavRecorder(private val context: Context) {
         return output
     }
 
+    fun startBackground(project: WakeWordProject): File {
+        check(active == null) { "recording already active" }
+        check(
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED,
+        ) { "record audio permission is required" }
+
+        val output = backgroundFile(project)
+        val prompt = RecordingPrompt(
+            label = ClipLabel.BACKGROUND,
+            spokenPhrase = "",
+            instruction = "background noise",
+        )
+        startRecording(output, prompt)
+        return output
+    }
+
     private fun startRecording(output: File, prompt: RecordingPrompt) {
         output.parentFile?.mkdirs()
 
@@ -119,6 +136,11 @@ class WavRecorder(private val context: Context) {
     private fun bulkFile(project: WakeWordProject): File {
         val id = "bulk_${System.currentTimeMillis()}_${UUID.randomUUID()}"
         return File(context.filesDir, "bulk/${project.slug}/$id.wav")
+    }
+
+    private fun backgroundFile(project: WakeWordProject): File {
+        val id = "background_${System.currentTimeMillis()}_${UUID.randomUUID()}"
+        return File(context.filesDir, "background/${project.slug}/$id.wav")
     }
 
     private fun writeRecording(

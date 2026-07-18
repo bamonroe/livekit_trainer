@@ -55,7 +55,10 @@ Importer category mapping:
 | `background` | `background` |
 
 The importer should preserve the original label in metadata even when mapping it
-into a simpler LiveKit category.
+into a simpler LiveKit category. The bulk slicer does this too: a wake phrase
+spoken inside a near-miss frame is filed under the `negative` category (so the
+trainer treats it as a negative) but stored with the distinct `hard_negative`
+label, so later tools can rebalance or inspect hard negatives specifically.
 
 ## Manifest Schema
 
@@ -116,9 +119,27 @@ Initial schema version: `1`.
       "session_id": "bulk",
       "notes": ""
     }
+  ],
+  "background_recordings": [
+    {
+      "id": "background_20260716_140233_001",
+      "file": "background_audio/background_20260716_140233_001.wav",
+      "recorded_at": "2026-07-16T14:02:33Z",
+      "duration_ms": 60000,
+      "sample_rate_hz": 16000,
+      "channels": 1,
+      "encoding": "pcm_s16le",
+      "session_id": "background",
+      "notes": ""
+    }
   ]
 }
 ```
+
+`background_recordings` are long ambient/non-speech takes. They carry no
+`script` and are never transcribed; the sync server chops each into fixed-length
+(~2s) clips written to `data/real/<slug>/background/`. They are optional and
+independent of `bulk_recordings`.
 
 ## Validation Rules
 

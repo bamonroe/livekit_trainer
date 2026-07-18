@@ -16,6 +16,7 @@ class BundleExporter(private val context: Context) {
         project: WakeWordProject,
         clips: List<ClipRecord>,
         bulkRecordings: List<BulkRecording> = emptyList(),
+        backgroundRecordings: List<BackgroundRecording> = emptyList(),
     ): File {
         val exportRoot = File(
             context.filesDir,
@@ -23,8 +24,10 @@ class BundleExporter(private val context: Context) {
         )
         val audioDir = File(exportRoot, "audio")
         val bulkAudioDir = File(exportRoot, "bulk_audio")
+        val backgroundAudioDir = File(exportRoot, "background_audio")
         audioDir.mkdirs()
         bulkAudioDir.mkdirs()
+        backgroundAudioDir.mkdirs()
 
         val exportedClips = JSONArray()
         clips.filter { File(it.filePath).isFile }.forEach { clip ->
@@ -44,8 +47,22 @@ class BundleExporter(private val context: Context) {
             exportedBulkRecordings.put(recording.toManifestJson("bulk_audio/$exportedName"))
         }
 
+        val exportedBackgroundRecordings = JSONArray()
+        backgroundRecordings.filter { File(it.filePath).isFile }.forEach { recording ->
+            val source = File(recording.filePath)
+            val exportedName = "${recording.id}.wav"
+            val exportedFile = File(backgroundAudioDir, exportedName)
+            source.copyTo(exportedFile, overwrite = true)
+            exportedBackgroundRecordings.put(recording.toManifestJson("background_audio/$exportedName"))
+        }
+
         File(exportRoot, "manifest.json").writeText(
-            manifest(project, exportedClips, exportedBulkRecordings).toString(2),
+            manifest(
+                project,
+                exportedClips,
+                exportedBulkRecordings,
+                exportedBackgroundRecordings,
+            ).toString(2),
             Charsets.UTF_8,
         )
         return exportRoot
@@ -55,15 +72,21 @@ class BundleExporter(private val context: Context) {
         project: WakeWordProject,
         clips: List<ClipRecord>,
         bulkRecordings: List<BulkRecording> = emptyList(),
+        backgroundRecordings: List<BackgroundRecording> = emptyList(),
     ): File {
-        val exportRoot = exportProject(project, clips, bulkRecordings)
+        val exportRoot = exportProject(project, clips, bulkRecordings, backgroundRecordings)
         val syncDir = File(context.cacheDir, "sync").apply { mkdirs() }
         val zip = File(syncDir, "${exportRoot.name}.zip")
         zipDirectory(exportRoot, zip)
         return zip
     }
 
-    private fun manifest(project: WakeWordProject, clips: JSONArray, bulkRecordings: JSONArray): JSONObject {
+    private fun manifest(
+        project: WakeWordProject,
+        clips: JSONArray,
+        bulkRecordings: JSONArray,
+        backgroundRecordings: JSONArray,
+    ): JSONObject {
         val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
         return JSONObject()
             .put("schema_version", 1)
@@ -100,6 +123,7 @@ class BundleExporter(private val context: Context) {
             )
             .put("clips", clips)
             .put("bulk_recordings", bulkRecordings)
+            .put("background_recordings", backgroundRecordings)
     }
 
     private fun ClipRecord.toManifestJson(file: String): JSONObject {
@@ -141,6 +165,19 @@ class BundleExporter(private val context: Context) {
                 },
             )
             .put("session_id", "bulk")
+            .put("notes", "")
+    }
+
+    private fun BackgroundRecording.toManifestJson(file: String): JSONObject {
+        return JSONObject()
+            .put("id", id)
+            .put("file", file)
+            .put("recorded_at", Instant.ofEpochMilli(recordedAtMillis).toString())
+            .put("duration_ms", durationMs)
+            .put("sample_rate_hz", sampleRateHz)
+            .put("channels", channels)
+            .put("encoding", encoding)
+            .put("session_id", "background")
             .put("notes", "")
     }
 

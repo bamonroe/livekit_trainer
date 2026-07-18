@@ -55,6 +55,9 @@ class MainActivity : Activity() {
     private var selectedProjectId: String? = null
     private var selectedBulkRecordingId: String? = null
     private var activeProject: WakeWordProject? = null
+    // True while the shared recorder is capturing a background-noise take rather
+    // than a bulk script, so the two record buttons show independent state.
+    private var backgroundRecordingActive: Boolean = false
     private var bulkReviewProjectSlug: String? = null
     private var bulkReviewClips: List<BulkReviewClip> = emptyList()
     private var projectCounts: Map<String, ProjectCounts> = emptyMap()
@@ -300,6 +303,8 @@ class MainActivity : Activity() {
         }
         val bulkRecordings = store.loadBulkRecordings(project.id)
         workspace.addView(bulkScriptCard(project, bulkRecordings))
+        val backgroundRecordings = store.loadBackgroundRecordings(project.id)
+        workspace.addView(backgroundNoiseCard(project, backgroundRecordings).withTop(dp(12)))
         maybeStatus()
     }
 
@@ -403,7 +408,7 @@ class MainActivity : Activity() {
             addView(text("Sync & process", 20f, textColor(), Typeface.BOLD))
             addView(
                 text(
-                    "Upload your bulk takes; the server transcribes and slices them into training clips.",
+                    "Upload your bulk and background takes; the server transcribes and slices them into training clips.",
                     14f,
                     mutedColor(),
                 ).withTop(dp(4)),
@@ -573,7 +578,8 @@ class MainActivity : Activity() {
             wakePlacements,
         )
         val script = scriptContent.text
-        val recordingThisProject = recorder.isRecording && activeProject?.id == project.id
+        val recordingThisProject =
+            recorder.isRecording && !backgroundRecordingActive && activeProject?.id == project.id
         return card().apply {
             addView(
                 LinearLayout(this@MainActivity).apply {
@@ -643,6 +649,83 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun backgroundNoiseCard(
+        project: WakeWordProject,
+        backgroundRecordings: List<BackgroundRecording>,
+    ): View {
+        val recordingThisProject =
+            recorder.isRecording && backgroundRecordingActive && activeProject?.id == project.id
+        val totalSeconds = backgroundRecordings.sumOf { it.durationMs } / 1000
+        return card().apply {
+            addView(text("Background noise", 20f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "Record the room, silence, appliances, typing, TV — anything that is not speech. The server slices it into short background clips the model trains against.",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                text(
+                    "${backgroundRecordings.size} saved takes · ${totalSeconds}s captured",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(10)),
+            )
+            addView(
+                actionButton(
+                    if (recordingThisProject) "◼  Stop noise capture" else "●  Record background",
+                    if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Secondary,
+                ) {
+                    toggleBackgroundRecording(project)
+                }.tall().withTop(dp(14)),
+            )
+        }
+    }
+
+    private fun toggleBackgroundRecording(project: WakeWordProject) {
+        if (recorder.isRecording) {
+            // Ignore taps on the noise button while a bulk take is capturing.
+            if (!backgroundRecordingActive) {
+                statusMessage = "Finish the bulk recording before capturing background noise"
+                render()
+                return
+            }
+            val result = recorder.stop()
+            activeProject = null
+            backgroundRecordingActive = false
+            if (result != null) {
+                store.addBackgroundRecording(
+                    BackgroundRecording(
+                        id = result.output.nameWithoutExtension,
+                        projectId = project.id,
+                        projectSlug = project.slug,
+                        filePath = result.output.absolutePath,
+                        recordedAtMillis = result.recordedAtMillis,
+                        durationMs = result.durationMs,
+                        sampleRateHz = result.sampleRateHz,
+                        channels = result.channels,
+                        encoding = result.encoding,
+                    ),
+                )
+                statusMessage = "Saved background take ${result.output.name}"
+            }
+            render()
+            return
+        }
+
+        try {
+            recorder.startBackground(project)
+            activeProject = project
+            backgroundRecordingActive = true
+            statusMessage = "Recording background noise"
+            render()
+        } catch (error: IllegalStateException) {
+            statusMessage = error.message ?: "Could not start background recording"
+            render()
+        }
+    }
+
     private fun confirmDeleteRecording(recording: BulkRecording) {
         AlertDialog.Builder(this)
             .setTitle("Delete this recording?")
@@ -685,20 +768,28 @@ class MainActivity : Activity() {
             render()
             return
         }
-        if (bulkRecordings.isEmpty()) {
-            statusMessage = "Record a bulk script first"
+        val backgroundRecordings = store.loadBackgroundRecordings(project.id)
+        if (bulkRecordings.isEmpty() && backgroundRecordings.isEmpty()) {
+            statusMessage = "Record a bulk script or background noise first"
             render()
             return
         }
 
         processingBulkSplit = true
-        statusMessage = "Syncing ${bulkRecordings.size} bulk recordings…"
+        val backgroundNote =
+            if (backgroundRecordings.isEmpty()) "" else " + ${backgroundRecordings.size} background"
+        statusMessage = "Syncing ${bulkRecordings.size} bulk recordings$backgroundNote…"
         render()
 
         Thread {
             try {
                 val client = BundleSyncClient(serverUrl)
-                val zip = exporter.exportProjectZip(project, emptyList(), bulkRecordings)
+                val zip = exporter.exportProjectZip(
+                    project,
+                    emptyList(),
+                    bulkRecordings,
+                    backgroundRecordings,
+                )
                 val response = client.upload(zip)
                 val clips = client.loadBulkReview(project.slug)
                 val counts = try {

@@ -179,12 +179,18 @@ tools can rebalance or inspect the dataset.
 
 Build the Android app as a real collection tool, not a demo.
 
-The app is **bulk-import only**. Data is collected by recording a single long
-scripted bulk WAV per take, then letting the sync server transcribe and slice it
-into positive and negative clips using Whisper word timestamps. There is no
-one-at-a-time short-prompt recording flow, no per-clip label picker, and no
-manual Export/Sync of individual clips; that orphaned path was removed. Do not
-reintroduce it without an explicit decision to change direction.
+The app is **bulk-import only** for speech. Data is collected by recording a
+single long scripted bulk WAV per take, then letting the sync server transcribe
+and slice it into positive and negative clips using Whisper word timestamps.
+There is no one-at-a-time short-prompt recording flow, no per-clip label picker,
+and no manual Export/Sync of individual clips; that orphaned path was removed. Do
+not reintroduce it without an explicit decision to change direction.
+
+There is one additional recording mode: **background noise capture**. A separate
+"Record background" control records a long ambient/non-speech take (room tone,
+silence, appliances, typing). It is *not* transcribed; the sync server chops it
+into fixed-length background clips. This is an intentional second long-take mode,
+not the removed per-clip flow — keep it.
 
 Core workflows:
 

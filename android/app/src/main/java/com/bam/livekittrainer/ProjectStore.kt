@@ -102,6 +102,42 @@ class ProjectStore(context: Context) {
         )
     }
 
+    fun loadBackgroundRecordings(projectId: String): List<BackgroundRecording> {
+        val db = dbHelper.readableDatabase
+        return db.query(
+            TABLE_BACKGROUND_RECORDINGS,
+            null,
+            "project_id = ?",
+            arrayOf(projectId),
+            null,
+            null,
+            "recorded_at_millis DESC",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(cursor.toBackgroundRecording())
+                }
+            }
+        }
+    }
+
+    fun addBackgroundRecording(recording: BackgroundRecording) {
+        dbHelper.writableDatabase.insertWithOnConflict(
+            TABLE_BACKGROUND_RECORDINGS,
+            null,
+            recording.toContentValues(),
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    fun deleteBackgroundRecording(recording: BackgroundRecording) {
+        dbHelper.writableDatabase.delete(
+            TABLE_BACKGROUND_RECORDINGS,
+            "id = ?",
+            arrayOf(recording.id),
+        )
+    }
+
     fun deleteClip(clip: ClipRecord) {
         dbHelper.writableDatabase.delete(TABLE_CLIPS, "id = ?", arrayOf(clip.id))
     }
@@ -118,6 +154,7 @@ class ProjectStore(context: Context) {
 
         File(appContext.filesDir, "clips").deleteRecursively()
         File(appContext.filesDir, "bulk").deleteRecursively()
+        File(appContext.filesDir, "background").deleteRecursively()
         File(appContext.filesDir, "exports").deleteRecursively()
         File(appContext.cacheDir, "sync").deleteRecursively()
 
@@ -125,6 +162,7 @@ class ProjectStore(context: Context) {
         db.beginTransaction()
         try {
             db.delete(TABLE_PROMPT_STATE, null, null)
+            db.delete(TABLE_BACKGROUND_RECORDINGS, null, null)
             db.delete(TABLE_BULK_RECORDINGS, null, null)
             db.delete(TABLE_CLIPS, null, null)
             db.delete(TABLE_PROJECTS, null, null)
@@ -357,6 +395,7 @@ class ProjectStore(context: Context) {
                 """.trimIndent(),
             )
             createBulkRecordingsTable(db)
+            createBackgroundRecordingsTable(db)
             db.execSQL("CREATE INDEX clips_project_id_idx ON $TABLE_CLIPS(project_id)")
         }
 
@@ -369,6 +408,9 @@ class ProjectStore(context: Context) {
             }
             if (oldVersion < 4) {
                 createBulkRecordingsTable(db)
+            }
+            if (oldVersion < 5) {
+                createBackgroundRecordingsTable(db)
             }
         }
 
@@ -398,11 +440,31 @@ class ProjectStore(context: Context) {
             )
             db.execSQL("CREATE INDEX IF NOT EXISTS bulk_recordings_project_id_idx ON $TABLE_BULK_RECORDINGS(project_id)")
         }
+
+        private fun createBackgroundRecordingsTable(db: SQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS $TABLE_BACKGROUND_RECORDINGS (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    project_slug TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    recorded_at_millis INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    sample_rate_hz INTEGER NOT NULL,
+                    channels INTEGER NOT NULL,
+                    encoding TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS background_recordings_project_id_idx ON $TABLE_BACKGROUND_RECORDINGS(project_id)")
+        }
     }
 
     private companion object {
         const val DATABASE_NAME = "wake_word_collection.db"
-        const val DATABASE_VERSION = 4
+        const val DATABASE_VERSION = 5
         const val LEGACY_PREFS = "wake_word_projects"
         const val KEY_PROJECTS = "projects"
         const val KEY_MIGRATED = "sqlite_migrated"
@@ -410,6 +472,7 @@ class ProjectStore(context: Context) {
         const val TABLE_CLIPS = "clips"
         const val TABLE_PROMPT_STATE = "prompt_state"
         const val TABLE_BULK_RECORDINGS = "bulk_recordings"
+        const val TABLE_BACKGROUND_RECORDINGS = "background_recordings"
 
         fun legacyClipsKey(projectId: String): String = "clips_$projectId"
 
@@ -455,6 +518,19 @@ private fun BulkRecording.toContentValues(): ContentValues =
         put("channels", channels)
         put("encoding", encoding)
         put("condition_tags", conditions.joinToString(",") { it.name })
+    }
+
+private fun BackgroundRecording.toContentValues(): ContentValues =
+    ContentValues().apply {
+        put("id", id)
+        put("project_id", projectId)
+        put("project_slug", projectSlug)
+        put("file_path", filePath)
+        put("recorded_at_millis", recordedAtMillis)
+        put("duration_ms", durationMs)
+        put("sample_rate_hz", sampleRateHz)
+        put("channels", channels)
+        put("encoding", encoding)
     }
 
 private fun Cursor.toProject(): WakeWordProject =
@@ -503,6 +579,19 @@ private fun Cursor.toBulkRecording(): BulkRecording =
             .mapNotNull { raw ->
                 raw.takeIf { it.isNotBlank() }?.let { runCatching { ClipCondition.valueOf(it) }.getOrNull() }
             },
+    )
+
+private fun Cursor.toBackgroundRecording(): BackgroundRecording =
+    BackgroundRecording(
+        id = getStringValue("id"),
+        projectId = getStringValue("project_id"),
+        projectSlug = getStringValue("project_slug"),
+        filePath = getStringValue("file_path"),
+        recordedAtMillis = getLongValue("recorded_at_millis"),
+        durationMs = getLongValue("duration_ms"),
+        sampleRateHz = getIntValue("sample_rate_hz"),
+        channels = getIntValue("channels"),
+        encoding = getStringValue("encoding"),
     )
 
 private fun Cursor.getStringValue(column: String): String =

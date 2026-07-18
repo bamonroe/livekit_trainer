@@ -13,6 +13,19 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Collect real background noise: new "Record background" control on the app's
+  Record page records a long ambient take (no script, no transcription). The
+  bundle carries a `background_recordings[]` array; the sync server chops each
+  take into fixed-length (~2s) clips under `data/real/<slug>/background/`
+  (`slice_background_recording` / `align_background_recordings`, marker script so
+  reprocess re-chunks without Whisper). Pooled into every wake word by
+  `assemble_training_data.py`. Tests: `background_chunks_cover_source_and_drop_short_tail`.
+- [x] Preserve hard negatives: the bulk slicer no longer discards wake phrases
+  spoken in a near-miss frame. They are filed under the `negative` category (so
+  the trainer treats them as negatives) but tagged with the distinct
+  `hard_negative` label in the DB. `build_slice_row` now takes label + category
+  separately. Test: `hard_negative_context_flags_near_miss_frames`.
+
 - [x] Surface pooled clip counts in the app: `/projects` now returns per-slug
   positive/negative/background counts plus `pooled_negative_count` (other words'
   negatives + their positives reused as negatives); the Review "Sync & process"
@@ -38,6 +51,14 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Later
 
+- [ ] Surface background takes in the app's Review page for per-take replay and
+  delete (they already round-trip through the server slices/review machinery;
+  the app just doesn't list them yet).
+- [ ] Capture richer per-recording metadata the server currently drops: device
+  model, mic/input route, session id, and pre-conversion sample rate/channels.
+  Needed for dataset condition reports and the mistake-correction loop.
+- [ ] Emit distinct `false_positive` / `false_negative` labels from evaluation
+  mistakes into correction batches (labels are already accepted end to end).
 - [ ] Add optional runtime scorer service or test harness under `runtime/`.
 - [ ] Add a post-sync cleanup policy for app-private clips after server import
   is acknowledged.
