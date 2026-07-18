@@ -1,0 +1,32 @@
+model_name: "all_set"
+target_phrases:
+  - "all set"
+
+custom_negative_phrases:
+  - "oil set"
+  - "all let"
+  - "all get"
+  - "all met"
+  - "all net"
+  - "all bet"
+  - "all yet"
+  - "all seat"
+  - "all sent"
+  - "wall set"
+  - "hall set"
+  - "paul set"
+  - "off set"
+  - "all not set"
+
+data_dir: "./data"
+output_dir: "./output"
+real_samples_dir: "./data/train"
+
+model:
+  model_type: "conv_attention"
+  model_size: "medium"
+
+n_samples: 20000
+n_samples_val: 4000
+steps: 50000
+target_fp_per_hour: 0.2
