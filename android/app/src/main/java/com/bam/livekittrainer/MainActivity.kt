@@ -42,7 +42,6 @@ class MainActivity : Activity() {
     private lateinit var workspaceScroll: ScrollView
     private lateinit var workspace: LinearLayout
     private lateinit var serverUrlInput: EditText
-    private lateinit var whisperServerUrlInput: EditText
     private lateinit var bulkWakePlacementsInput: EditText
     private var currentPage: AppPage = AppPage.Record
     private var lastRenderedPage: AppPage? = null
@@ -351,15 +350,6 @@ class MainActivity : Activity() {
             setText(syncPrefs.getString(KEY_SYNC_SERVER_URL, DEFAULT_SYNC_SERVER_URL))
             styleInput()
         }
-        whisperServerUrlInput = EditText(this).apply {
-            hint = "Whisper server URL"
-            isSaveEnabled = false
-            setSingleLine()
-            imeOptions = EditorInfo.IME_ACTION_DONE
-            textSize = 14f
-            setText(syncPrefs.getString(KEY_WHISPER_SERVER_URL, DEFAULT_WHISPER_SERVER_URL))
-            styleInput()
-        }
         bulkWakePlacementsInput = EditText(this).apply {
             hint = "Wake placements per bulk script"
             isSaveEnabled = false
@@ -375,14 +365,11 @@ class MainActivity : Activity() {
             addView(text("Settings", 20f, textColor(), Typeface.BOLD))
             addView(text("Sync server", 15f, mutedColor()).withTop(dp(8)))
             addView(serverUrlInput.withTop(dp(6)))
-            addView(text("Whisper server", 15f, mutedColor()).withTop(dp(14)))
-            addView(whisperServerUrlInput.withTop(dp(6)))
             addView(text("Bulk wake placements", 15f, mutedColor()).withTop(dp(14)))
             addView(bulkWakePlacementsInput.withTop(dp(6)))
             addView(actionButton("Save settings", ButtonStyle.Primary) {
                 saveSettings(
                     serverUrlInput.text.toString().trim(),
-                    whisperServerUrlInput.text.toString().trim(),
                     bulkWakePlacementsInput.text.toString().trim(),
                 )
             }.withTop(dp(10)))
@@ -626,7 +613,7 @@ class MainActivity : Activity() {
         if (serverUrl.isNotBlank()) {
             Thread {
                 try {
-                    BundleSyncClient(serverUrl, savedWhisperServerUrl())
+                    BundleSyncClient(serverUrl)
                         .deleteRecording(recording.projectSlug, recording.id)
                 } catch (_: Exception) {
                     // Local delete already happened; a stale server copy is harmless.
@@ -655,7 +642,7 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val client = BundleSyncClient(serverUrl, savedWhisperServerUrl())
+                val client = BundleSyncClient(serverUrl)
                 val zip = exporter.exportProjectZip(project, emptyList(), bulkRecordings)
                 val response = client.upload(zip)
                 val clips = client.loadBulkReview(project.slug)
@@ -713,7 +700,7 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val client = BundleSyncClient(serverUrl, savedWhisperServerUrl())
+                val client = BundleSyncClient(serverUrl)
                 val message = call(client)
                 val clips = client.loadBulkReview(project.slug)
                 runOnUiThread {
@@ -749,13 +736,13 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val clips = BundleSyncClient(serverUrl, savedWhisperServerUrl()).loadBulkReview(project.slug)
+                val clips = BundleSyncClient(serverUrl).loadBulkReview(project.slug)
                 runOnUiThread {
                     bulkReviewProjectSlug = project.slug
                     bulkReviewClips = clips
                     loadingBulkReview = false
                     statusMessage = if (clips.isEmpty()) {
-                        "No clips yet. Tap Sync & process, and check the Whisper server URL."
+                        "No clips yet. Tap Sync & process to transcribe and slice."
                     } else {
                         "Loaded ${clips.size} clips"
                     }
@@ -834,7 +821,7 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val alignment = BundleSyncClient(serverUrl, savedWhisperServerUrl())
+                val alignment = BundleSyncClient(serverUrl)
                     .loadBulkAlignment(project.slug, sourceRecording)
                 runOnUiThread {
                     bulkAlignmentProjectSlug = project.slug
@@ -955,7 +942,7 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val response = BundleSyncClient(serverUrl, savedWhisperServerUrl()).deleteBulkReviewClip(project.slug, clip)
+                val response = BundleSyncClient(serverUrl).deleteBulkReviewClip(project.slug, clip)
                 runOnUiThread {
                     bulkReviewClips = bulkReviewClips.filterNot {
                         it.category == clip.category && it.fileName == clip.fileName
@@ -972,7 +959,7 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun saveSettings(serverUrl: String, whisperServerUrl: String, bulkWakePlacementsText: String) {
+    private fun saveSettings(serverUrl: String, bulkWakePlacementsText: String) {
         if (serverUrl.isBlank()) {
             serverUrlInput.error = "Server URL required"
             return
@@ -985,7 +972,6 @@ class MainActivity : Activity() {
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_SYNC_SERVER_URL, serverUrl)
-            .putString(KEY_WHISPER_SERVER_URL, whisperServerUrl)
             .putInt(KEY_BULK_WAKE_PLACEMENTS, bulkWakePlacements)
             .apply()
         statusMessage = "Saving settings to server"
@@ -993,7 +979,7 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val response = BundleSyncClient(serverUrl, whisperServerUrl).saveSettings()
+                val response = BundleSyncClient(serverUrl).saveSettings()
                 runOnUiThread {
                     statusMessage = "Saved settings: $response"
                     render()
@@ -1017,7 +1003,7 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val projects = BundleSyncClient(serverUrl, savedWhisperServerUrl()).loadProjects()
+                val projects = BundleSyncClient(serverUrl).loadProjects()
                 projects.forEach { project -> store.addProject(project.normalizedForLocalImport()) }
                 runOnUiThread {
                     if (selectedProjectId == null) {
@@ -1050,12 +1036,6 @@ class MainActivity : Activity() {
             ?: DEFAULT_SYNC_SERVER_URL
     }
 
-    private fun savedWhisperServerUrl(): String {
-        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_WHISPER_SERVER_URL, DEFAULT_WHISPER_SERVER_URL)
-            .orEmpty()
-            .ifBlank { DEFAULT_WHISPER_SERVER_URL }
-    }
 
     private fun savedBulkWakePlacements(): Int {
         return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
@@ -1488,11 +1468,9 @@ class MainActivity : Activity() {
         const val REQUEST_RECORD_AUDIO = 100
         const val SYNC_PREFS = "sync"
         const val KEY_SYNC_SERVER_URL = "server_url"
-        const val KEY_WHISPER_SERVER_URL = "whisper_server_url"
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
         const val KEY_DARK_MODE = "dark_mode"
         const val DEFAULT_SYNC_SERVER_URL = "http://100.64.0.2:8765"
-        const val DEFAULT_WHISPER_SERVER_URL = "http://pickle.bam.net:8572"
         val ACCENT: Int = Color.rgb(37, 110, 112)
     }
 

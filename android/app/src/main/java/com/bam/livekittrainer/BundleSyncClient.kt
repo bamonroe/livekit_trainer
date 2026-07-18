@@ -9,14 +9,12 @@ import org.json.JSONObject
 
 class BundleSyncClient(
     private val serverUrl: String,
-    private val whisperServerUrl: String = "",
 ) {
     fun saveSettings(): String {
         val endpoint = URL(serverUrl.trimEnd('/') + "/settings")
         val body = """
             {
-              "sync_server_url": ${jsonString(serverUrl)},
-              "whisper_server_url": ${jsonString(whisperServerUrl)}
+              "sync_server_url": ${jsonString(serverUrl)}
             }
         """.trimIndent().toByteArray(Charsets.UTF_8)
         val connection = endpoint.openConnection() as HttpURLConnection
@@ -48,9 +46,6 @@ class BundleSyncClient(
         connection.doOutput = true
         connection.setRequestProperty("Content-Type", "application/zip")
         connection.setRequestProperty("X-Bundle-Name", bundleZip.name)
-        if (whisperServerUrl.isNotBlank()) {
-            connection.setRequestProperty("X-Whisper-Server-Url", whisperServerUrl)
-        }
         connection.setFixedLengthStreamingMode(bundleZip.length())
 
         try {
@@ -199,9 +194,6 @@ class BundleSyncClient(
         connection.requestMethod = "POST"
         connection.connectTimeout = 10_000
         connection.readTimeout = 120_000
-        if (whisperServerUrl.isNotBlank()) {
-            connection.setRequestProperty("X-Whisper-Server-Url", whisperServerUrl)
-        }
         // Some servers require a content length for POST; send an empty body.
         connection.doOutput = true
         connection.setFixedLengthStreamingMode(0)

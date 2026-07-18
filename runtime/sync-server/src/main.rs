@@ -46,6 +46,10 @@ struct AppState {
     incoming_root: Arc<PathBuf>,
     settings_path: Arc<PathBuf>,
     settings: Arc<Mutex<ServerSettings>>,
+    // Whisper server URL from the WHISPER_SERVER_URL environment variable. This
+    // is the source of truth for where audio is transcribed; the app no longer
+    // configures it.
+    whisper_url: Arc<Option<String>>,
     db: Arc<Mutex<Connection>>,
 }
 
@@ -56,13 +60,11 @@ fn now_ms() -> i64 {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct ServerSettings {
     sync_server_url: Option<String>,
-    whisper_server_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SettingsRequest {
     sync_server_url: Option<String>,
-    whisper_server_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,11 +274,21 @@ async fn main() {
     let db = db::open(&PathBuf::from(&db_path)).expect("open database");
     println!("database at {db_path}");
 
+    let whisper_url = env::var("WHISPER_SERVER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match &whisper_url {
+        Some(url) => println!("whisper server at {url}"),
+        None => println!("WHISPER_SERVER_URL not set; transcription will fail until configured"),
+    }
+
     let state = AppState {
         data_root: Arc::new(PathBuf::from(data_root)),
         incoming_root: Arc::new(PathBuf::from(incoming_root)),
         settings: Arc::new(Mutex::new(load_settings(&settings_path))),
         settings_path: Arc::new(settings_path),
+        whisper_url: Arc::new(whisper_url),
         db: Arc::new(Mutex::new(db)),
     };
 
@@ -338,7 +350,6 @@ async fn update_settings(
 ) -> Result<Json<SettingsResponse>, AppError> {
     let settings = ServerSettings {
         sync_server_url: clean_optional_url(request.sync_server_url),
-        whisper_server_url: clean_optional_url(request.whisper_server_url),
     };
     save_settings(&state.settings_path, &settings)?;
     *state.settings.lock().expect("settings lock poisoned") = settings.clone();
@@ -377,20 +388,7 @@ async fn sync(
     if body.is_empty() {
         return Err(AppError::bad_request("empty upload"));
     }
-    let whisper_server_url = headers
-        .get("x-whisper-server-url")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            state
-                .settings
-                .lock()
-                .expect("settings lock poisoned")
-                .whisper_server_url
-                .clone()
-        });
+    let whisper_server_url = resolve_whisper_url(&state, &headers);
 
     fs::create_dir_all(&*state.incoming_root)?;
     let archive = state
@@ -448,7 +446,8 @@ async fn sync(
 }
 
 /// Resolve the Whisper server URL from the request header, falling back to the
-/// saved server setting. Shared by the upload and reprocess paths.
+/// WHISPER_SERVER_URL environment variable captured at startup. Shared by the
+/// upload and reprocess paths.
 fn resolve_whisper_url(state: &AppState, headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-whisper-server-url")
@@ -456,14 +455,7 @@ fn resolve_whisper_url(state: &AppState, headers: &HeaderMap) -> Option<String> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| {
-            state
-                .settings
-                .lock()
-                .expect("settings lock poisoned")
-                .whisper_server_url
-                .clone()
-        })
+        .or_else(|| state.whisper_url.as_ref().clone())
 }
 
 async fn reprocess_project(

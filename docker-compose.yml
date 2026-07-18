@@ -32,6 +32,9 @@ services:
       BIND_ADDR: "0.0.0.0:8765"
       DATA_ROOT: "/data/real"
       INCOMING_ROOT: "/incoming/bundles"
+      # Where recorded audio is transcribed. This is the source of truth for the
+      # Whisper server; the Android app no longer configures it.
+      WHISPER_SERVER_URL: "${WHISPER_SERVER_URL:-http://pickle.bam.net:8572}"
 
 volumes:
   livekit-trainer-python-cache:
