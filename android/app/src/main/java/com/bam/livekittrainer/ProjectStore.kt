@@ -468,9 +468,22 @@ class ProjectStore(context: Context) {
         }
 
         private fun addCaptureColumns(db: SQLiteDatabase, table: String) {
+            val existing = existingColumns(db, table)
             for ((name, type) in CAPTURE_COLUMNS) {
+                if (name in existing) continue
                 db.execSQL("ALTER TABLE $table ADD COLUMN $name $type")
             }
+        }
+
+        private fun existingColumns(db: SQLiteDatabase, table: String): Set<String> {
+            val columns = mutableSetOf<String>()
+            db.rawQuery("PRAGMA table_info($table)", null).use { cursor ->
+                val nameIndex = cursor.getColumnIndex("name")
+                while (cursor.moveToNext()) {
+                    columns.add(cursor.getString(nameIndex))
+                }
+            }
+            return columns
         }
     }
 
