@@ -125,6 +125,51 @@ class BundleSyncClient(
         }
     }
 
+    fun loadServerRecordings(wakeWordSlug: String): List<ServerRecording> {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/bulk/${urlPart(wakeWordSlug)}/recordings/detail")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val response = readResponse(connection, "Load server recordings failed")
+        val recordings = JSONObject(response).getJSONArray("recordings")
+        return buildList {
+            for (index in 0 until recordings.length()) {
+                val item = recordings.getJSONObject(index)
+                add(
+                    ServerRecording(
+                        id = item.getString("id"),
+                        isBackground = item.optBoolean("is_background", false),
+                        recordedAtMillis = parseIsoMillis(item.optString("recorded_at")),
+                        durationMs = item.optLong("duration_ms", 0L),
+                        positiveCount = item.optInt("positive_count", 0),
+                        negativeCount = item.optInt("negative_count", 0),
+                        backgroundCount = item.optInt("background_count", 0),
+                        deviceManufacturer = item.optStringOrNull("device_manufacturer"),
+                        deviceModel = item.optStringOrNull("device_model"),
+                        appVersion = item.optStringOrNull("app_version"),
+                        inputRoute = item.optStringOrNull("input_route"),
+                        sessionId = item.optStringOrNull("session_id"),
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun JSONObject.optStringOrNull(key: String): String? =
+        if (isNull(key)) null else optString(key).ifBlank { null }
+
+    private fun parseIsoMillis(value: String): Long =
+        if (value.isBlank()) {
+            0L
+        } else {
+            try {
+                java.time.Instant.parse(value).toEpochMilli()
+            } catch (_: Exception) {
+                0L
+            }
+        }
+
     fun loadBulkReview(wakeWordSlug: String): List<BulkReviewClip> {
         val endpoint = URL(serverUrl.trimEnd('/') + "/review/${urlPart(wakeWordSlug)}/bulk")
         val connection = endpoint.openConnection() as HttpURLConnection

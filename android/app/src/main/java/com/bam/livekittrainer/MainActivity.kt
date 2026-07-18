@@ -64,6 +64,11 @@ class MainActivity : Activity() {
     private var backgroundRecordingActive: Boolean = false
     private var bulkReviewProjectSlug: String? = null
     private var bulkReviewClips: List<BulkReviewClip> = emptyList()
+    // The server's authoritative recording list for the active wake word,
+    // including takes captured on other devices. Null slug means not loaded yet.
+    private var serverRecordingsSlug: String? = null
+    private var serverRecordings: List<ServerRecording> = emptyList()
+    private var loadingServerRecordings: Boolean = false
     private var projectCounts: Map<String, ProjectCounts> = emptyMap()
     private var bulkAlignmentProjectSlug: String? = null
     private var bulkAlignment: BulkAlignment? = null
@@ -326,12 +331,21 @@ class MainActivity : Activity() {
             maybeStatus()
             return
         }
+        ensureServerRecordings(project)
         val bulkRecordings = store.loadBulkRecordings(project.id)
         val backgroundRecordings = store.loadBackgroundRecordings(project.id)
+        val serverForSlug =
+            if (serverRecordingsSlug == project.slug) serverRecordings else emptyList()
         workspace.addView(syncCard(project, bulkRecordings))
-        workspace.addView(recordingsCard(project, bulkRecordings).withTop(dp(12)))
-        if (backgroundRecordings.isNotEmpty()) {
-            workspace.addView(backgroundRecordingsCard(backgroundRecordings).withTop(dp(12)))
+        workspace.addView(
+            recordingsCard(project, bulkRecordings, serverForSlug.filter { !it.isBackground })
+                .withTop(dp(12)),
+        )
+        val serverBackground = serverForSlug.filter { it.isBackground }
+        if (backgroundRecordings.isNotEmpty() || serverBackground.isNotEmpty()) {
+            workspace.addView(
+                backgroundRecordingsCard(backgroundRecordings, serverBackground).withTop(dp(12)),
+            )
         }
         maybeStatus()
     }
@@ -346,6 +360,9 @@ class MainActivity : Activity() {
         }
         val recording = store.loadBulkRecordings(project.id)
             .firstOrNull { it.id == selectedBulkRecordingId }
+            ?: serverRecordings
+                .firstOrNull { it.id == selectedBulkRecordingId && it.isBackground.not() }
+                ?.let { serverRecordingAsBulk(project, it) }
         if (recording == null) {
             workspace.addView(emptyCard("Bulk recording not found."))
             maybeStatus()
@@ -532,16 +549,90 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun recordingsCard(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
+    private fun recordingsCard(
+        project: WakeWordProject,
+        localBulk: List<BulkRecording>,
+        serverBulk: List<ServerRecording>,
+    ): View {
+        // The server is the master list. Local takes not yet on the server are
+        // shown as pending so nothing captured here is invisible either.
+        val serverIds = serverBulk.map { it.id }.toSet()
+        val pending = localBulk.filter { it.id !in serverIds }
+        val total = serverBulk.size + pending.size
         return card().apply {
-            addView(text("Bulk recordings  ${bulkRecordings.size}", 18f, textColor(), Typeface.BOLD))
-            if (bulkRecordings.isEmpty()) {
-                addView(text("No bulk recordings yet. Record one on the Record tab.", 14f, mutedColor()).withTop(dp(8)))
+            addView(text("Bulk recordings  $total", 18f, textColor(), Typeface.BOLD))
+            if (total == 0) {
+                val message = if (loadingServerRecordings) {
+                    "Loading recordings from the server…"
+                } else {
+                    "No bulk recordings yet. Record one on the Record tab."
+                }
+                addView(text(message, 14f, mutedColor()).withTop(dp(8)))
             } else {
-                bulkRecordings.forEach { recording ->
+                serverBulk.forEach { recording ->
+                    val localMatch = localBulk.firstOrNull { it.id == recording.id }
+                    addView(serverRecordingRow(project, recording, localMatch).withTop(dp(8)))
+                }
+                pending.forEach { recording ->
                     addView(bulkRecordingRow(recording).withTop(dp(8)))
                 }
             }
+        }
+    }
+
+    /**
+     * A recording as the server sees it, so it renders the same whether it was
+     * captured on this device or another one. Shows the capturing device, slice
+     * tallies, and a Delete that removes it from the server (and the local copy
+     * if this device happens to have one).
+     */
+    private fun serverRecordingRow(
+        project: WakeWordProject,
+        recording: ServerRecording,
+        localMatch: BulkRecording?,
+    ): View {
+        val open = {
+            selectedBulkRecordingId = recording.id
+            statusMessage = ""
+            currentPage = AppPage.Detail
+            render()
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(promptColor(), dp(14), 0)
+            setOnClickListener { open() }
+            addView(text("Take  ${recording.durationMs / 1000}s", 15f, textColor(), Typeface.BOLD))
+            addView(text(formatRecordedAt(recording.recordedAtMillis), 12f, mutedColor()).withTop(dp(2)))
+            addView(text(deviceAttribution(recording), 12f, mutedColor()).withTop(dp(2)))
+            addView(
+                text(
+                    "${recording.positiveCount} positive · ${recording.negativeCount} negative",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(2)),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(actionButton("Open", ButtonStyle.Secondary) { open() }.weight1())
+                    addView(
+                        actionButton("Delete", ButtonStyle.Ghost) {
+                            confirmDeleteServerRecording(project, recording, localMatch)
+                        }.weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(8)),
+            )
+        }
+    }
+
+    /** "This phone" for takes from this device, else the capturing device name. */
+    private fun deviceAttribution(recording: ServerRecording): String {
+        val label = recording.deviceLabel ?: return "Unknown device"
+        return if (recording.deviceModel.equals(android.os.Build.MODEL, ignoreCase = true)) {
+            "This device · $label"
+        } else {
+            "From $label"
         }
     }
 
@@ -820,6 +911,73 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun confirmDeleteServerRecording(
+        project: WakeWordProject,
+        recording: ServerRecording,
+        localMatch: BulkRecording?,
+    ) {
+        val kind = if (recording.isBackground) "background take" else "recording"
+        AlertDialog.Builder(this)
+            .setTitle("Delete this $kind?")
+            .setMessage("Removes it and its slices from the server for every device. This cannot be undone.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ ->
+                deleteServerRecording(project, recording, localMatch)
+            }
+            .show()
+    }
+
+    private fun deleteServerRecording(
+        project: WakeWordProject,
+        recording: ServerRecording,
+        localMatch: BulkRecording?,
+    ) {
+        player?.release()
+        player = null
+        activePlaybackKey = null
+        // Remove any local copy this device holds so the two stay in step.
+        localMatch?.let {
+            File(it.filePath).delete()
+            store.deleteBulkRecording(it)
+        }
+        serverRecordings = serverRecordings.filterNot { it.id == recording.id }
+        bulkReviewClips = bulkReviewClips.filterNot { it.sourceRecording == recording.id }
+        val serverUrl = savedServerUrl()
+        currentPage = AppPage.Review
+        statusMessage = "Deleting…"
+        render()
+
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            render()
+            return
+        }
+        Thread {
+            try {
+                val client = BundleSyncClient(serverUrl)
+                client.deleteRecording(project.slug, recording.id)
+                val recordings = client.loadServerRecordings(project.slug)
+                val counts = try {
+                    client.loadProjectCounts()
+                } catch (_: Exception) {
+                    projectCounts
+                }
+                runOnUiThread {
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
+                    projectCounts = counts
+                    statusMessage = "Deleted"
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    statusMessage = error.message ?: "Delete failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
     private fun syncAndProcess(project: WakeWordProject, bulkRecordings: List<BulkRecording>) {
         val serverUrl = savedServerUrl()
         if (serverUrl.isBlank()) {
@@ -852,6 +1010,11 @@ class MainActivity : Activity() {
                 )
                 val response = client.upload(zip)
                 val clips = client.loadBulkReview(project.slug)
+                val recordings = try {
+                    client.loadServerRecordings(project.slug)
+                } catch (_: Exception) {
+                    serverRecordings
+                }
                 val counts = try {
                     client.loadProjectCounts()
                 } catch (_: Exception) {
@@ -860,6 +1023,8 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     bulkReviewProjectSlug = project.slug
                     bulkReviewClips = clips
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
                     projectCounts = counts
                     bulkAlignmentProjectSlug = null
                     bulkAlignment = null
@@ -915,9 +1080,16 @@ class MainActivity : Activity() {
                 val client = BundleSyncClient(serverUrl)
                 val message = call(client)
                 val clips = client.loadBulkReview(project.slug)
+                val recordings = try {
+                    client.loadServerRecordings(project.slug)
+                } catch (_: Exception) {
+                    serverRecordings
+                }
                 runOnUiThread {
                     bulkReviewProjectSlug = project.slug
                     bulkReviewClips = clips
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
                     bulkAlignmentProjectSlug = null
                     bulkAlignment = null
                     reprocessing = false
@@ -946,10 +1118,16 @@ class MainActivity : Activity() {
         statusMessage = "Loading generated slices for ${project.slug}"
         render()
 
+        loadingServerRecordings = true
         Thread {
             try {
                 val client = BundleSyncClient(serverUrl)
                 val clips = client.loadBulkReview(project.slug)
+                val recordings = try {
+                    client.loadServerRecordings(project.slug)
+                } catch (_: Exception) {
+                    serverRecordings
+                }
                 val counts = try {
                     client.loadProjectCounts()
                 } catch (_: Exception) {
@@ -958,8 +1136,11 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     bulkReviewProjectSlug = project.slug
                     bulkReviewClips = clips
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
                     projectCounts = counts
                     loadingBulkReview = false
+                    loadingServerRecordings = false
                     statusMessage = if (clips.isEmpty()) {
                         "No clips yet. Tap Sync & process to transcribe and slice."
                     } else {
@@ -970,7 +1151,36 @@ class MainActivity : Activity() {
             } catch (error: Exception) {
                 runOnUiThread {
                     loadingBulkReview = false
+                    loadingServerRecordings = false
                     statusMessage = error.message ?: "Load review failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Fetch the server's recording list once when the Review page opens for a
+     * wake word, so takes captured on other devices show up without the user
+     * having to tap Refresh. Silent: failures leave the last known list.
+     */
+    private fun ensureServerRecordings(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        if (loadingServerRecordings || serverRecordingsSlug == project.slug) return
+        loadingServerRecordings = true
+        Thread {
+            try {
+                val recordings = BundleSyncClient(serverUrl).loadServerRecordings(project.slug)
+                runOnUiThread {
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
+                    loadingServerRecordings = false
+                    render()
+                }
+            } catch (_: Exception) {
+                runOnUiThread {
+                    loadingServerRecordings = false
                     render()
                 }
             }
@@ -1397,6 +1607,25 @@ class MainActivity : Activity() {
         background = rounded(inputColor(), dp(12), strokeColor())
     }
 
+    /**
+     * Adapt a server recording into the local model so the detail page can open
+     * takes captured on another device. There is no local WAV, so whole-take
+     * playback is unavailable, but slices and alignment come from the server.
+     */
+    private fun serverRecordingAsBulk(project: WakeWordProject, recording: ServerRecording): BulkRecording =
+        BulkRecording(
+            id = recording.id,
+            projectId = project.id,
+            projectSlug = project.slug,
+            filePath = "",
+            script = "",
+            recordedAtMillis = recording.recordedAtMillis,
+            durationMs = recording.durationMs,
+            sampleRateHz = 16_000,
+            channels = 1,
+            encoding = "pcm_16bit",
+        )
+
     private fun formatRecordedAt(millis: Long): String =
         SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault()).format(Date(millis))
 
@@ -1440,17 +1669,17 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun backgroundRecordingsCard(backgroundRecordings: List<BackgroundRecording>): View {
-        val totalSeconds = backgroundRecordings.sumOf { it.durationMs } / 1000
+    private fun backgroundRecordingsCard(
+        localBackground: List<BackgroundRecording>,
+        serverBackground: List<ServerRecording>,
+    ): View {
+        val serverIds = serverBackground.map { it.id }.toSet()
+        val pending = localBackground.filter { it.id !in serverIds }
+        val total = serverBackground.size + pending.size
+        val totalSeconds =
+            (serverBackground.sumOf { it.durationMs } + pending.sumOf { it.durationMs }) / 1000
         return card().apply {
-            addView(
-                text(
-                    "Background takes  ${backgroundRecordings.size}",
-                    18f,
-                    textColor(),
-                    Typeface.BOLD,
-                ),
-            )
+            addView(text("Background takes  $total", 18f, textColor(), Typeface.BOLD))
             addView(
                 text(
                     "${totalSeconds}s of ambient audio. The server chops each take into short background clips pooled across every wake word.",
@@ -1458,9 +1687,36 @@ class MainActivity : Activity() {
                     mutedColor(),
                 ).withTop(dp(4)),
             )
-            backgroundRecordings.forEach { recording ->
+            serverBackground.forEach { recording ->
+                val localMatch = localBackground.firstOrNull { it.id == recording.id }
+                if (localMatch != null) {
+                    addView(backgroundRecordingRow(localMatch).withTop(dp(8)))
+                } else {
+                    addView(serverBackgroundRow(recording).withTop(dp(8)))
+                }
+            }
+            pending.forEach { recording ->
                 addView(backgroundRecordingRow(recording).withTop(dp(8)))
             }
+        }
+    }
+
+    /** A background take held on the server but not on this device. */
+    private fun serverBackgroundRow(recording: ServerRecording): View {
+        val project = activeProjectOrNull()
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(promptColor(), dp(14), 0)
+            addView(text("Take  ${recording.durationMs / 1000}s", 15f, textColor(), Typeface.BOLD))
+            addView(text(formatRecordedAt(recording.recordedAtMillis), 12f, mutedColor()).withTop(dp(2)))
+            addView(text(deviceAttribution(recording), 12f, mutedColor()).withTop(dp(2)))
+            addView(text("${recording.backgroundCount} background clips", 12f, mutedColor()).withTop(dp(2)))
+            addView(
+                actionButton("Delete", ButtonStyle.Ghost) {
+                    if (project != null) confirmDeleteServerRecording(project, recording, null)
+                }.withTop(dp(8)),
+            )
         }
     }
 
