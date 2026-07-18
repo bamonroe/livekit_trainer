@@ -45,6 +45,8 @@ class MainActivity : Activity() {
     private lateinit var whisperServerUrlInput: EditText
     private lateinit var bulkWakePlacementsInput: EditText
     private var currentPage: AppPage = AppPage.Record
+    private var lastRenderedPage: AppPage? = null
+    private var lastRenderedDetailId: String? = null
     private var bulkScriptRevision: Int = 0
     private var reprocessing: Boolean = false
     private var darkMode: Boolean = false
@@ -127,7 +129,13 @@ class MainActivity : Activity() {
         window.navigationBarColor = navColor()
         root.setBackgroundColor(surfaceColor())
         workspaceScroll.setBackgroundColor(surfaceColor())
-        workspaceScroll.scrollTo(0, 0)
+
+        // Keep the scroll position across in-place redraws (e.g. tapping play on a
+        // slice) and only snap to the top when the user actually changes pages.
+        val keepScroll = currentPage == lastRenderedPage &&
+            (currentPage != AppPage.Detail || selectedBulkRecordingId == lastRenderedDetailId)
+        val priorScroll = workspaceScroll.scrollY
+
         val project = projects.firstOrNull { it.id == selectedProjectId }
         when (currentPage) {
             AppPage.Record -> renderRecordPage(project)
@@ -136,6 +144,12 @@ class MainActivity : Activity() {
             AppPage.Settings -> renderSettingsPage()
         }
         renderBottomNav()
+
+        lastRenderedPage = currentPage
+        lastRenderedDetailId = selectedBulkRecordingId
+        workspaceScroll.post {
+            workspaceScroll.scrollTo(0, if (keepScroll) priorScroll else 0)
+        }
     }
 
     private fun renderBottomNav() {
