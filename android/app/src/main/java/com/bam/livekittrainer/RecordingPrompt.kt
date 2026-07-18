@@ -212,18 +212,33 @@ object PromptGenerator {
         val second = words.getOrElse(1) { "counter" }
         val third = words.getOrElse(2) { "folder" }
         val fourth = words.getOrElse(3) { "window" }
-        return when (random.nextInt(10)) {
-            0 -> "The $first is beside the $second."
-            1 -> "Please move the $first near the $second."
-            2 -> "I checked the $first before the $second."
-            3 -> "The $first and the $second are on the table."
-            4 -> "Put the $first behind the $second for now."
-            5 -> "The $first is ready, but the $second is missing."
-            6 -> "I wrote $first and $second on the note."
-            7 -> "The $first, $second, and $third are in the room."
-            8 -> "Before dinner, I moved the $first near the $second."
-            else -> "The $first is between the $second and the $third near the $fourth."
-        }.sentenceCase()
+        val templates = listOf(
+            "The $first is beside the $second.",
+            "Please move the $first near the $second.",
+            "I checked the $first before the $second.",
+            "The $first and the $second are on the table.",
+            "Put the $first behind the $second for now.",
+            "The $first is ready, but the $second is missing.",
+            "I wrote $first and $second on the note.",
+            "The $first, $second, and $third are in the room.",
+            "Before dinner, I moved the $first near the $second.",
+            "The $first is between the $second and the $third near the $fourth.",
+            "Where did you leave the $first yesterday?",
+            "My $first fell behind the $second again.",
+            "She carried the $first across the $second.",
+            "Nobody remembered to close the $first.",
+            "That $first has been sitting by the $second all week.",
+            "Can you hand me the $first from the $second?",
+            "Every morning I move the $first past the $second.",
+            "He traded his old $first for a newer $second.",
+            "Two $first and one $second went missing overnight.",
+            "Somewhere under the $first, I found the $second.",
+            "It rained so hard the $first soaked the $second.",
+            "I can't believe the $first outlasted the $second.",
+            "We stacked the $first on top of the $second.",
+            "The $first rolled off the $second and stopped.",
+        )
+        return templates[random.nextInt(templates.size)].sentenceCase()
     }
 
     private fun bulkWakeSentence(
@@ -235,16 +250,28 @@ object PromptGenerator {
         val words = lexicon.randomContentWords(random, phrase, 3)
         val first = words.getOrElse(0) { "item" }
         val second = words.getOrElse(1) { "list" }
-        return when ((index + random.nextInt(8)) % 8) {
-            0 -> "After the $first is ready, say $phrase."
-            1 -> "When the $second is finished, the next words are $phrase."
-            2 -> "I will pause for a moment, then say $phrase."
-            3 -> "The reminder is complete, so now I say $phrase."
-            4 -> "Once the room is quiet, the wake phrase is $phrase."
-            5 -> "After checking the $first, I can say $phrase."
-            6 -> "The task is done, and the correct phrase is $phrase."
-            else -> "When everything is ready, I say $phrase without rushing."
-        }.sentenceCase()
+        val third = words.getOrElse(2) { "shelf" }
+        val templates = listOf(
+            "After the $first is ready, say $phrase.",
+            "When the $second is finished, the next words are $phrase.",
+            "I will pause for a moment, then say $phrase.",
+            "The reminder is complete, so now I say $phrase.",
+            "Once the room is quiet, the wake phrase is $phrase.",
+            "After checking the $first, I can say $phrase.",
+            "The task is done, and the correct phrase is $phrase.",
+            "When everything is ready, I say $phrase without rushing.",
+            "$phrase, I said, right after the $first settled.",
+            "I leaned toward the $first and said $phrase.",
+            "Sometimes I just say $phrase for no clear reason.",
+            "$phrase is what comes out when the $second is near.",
+            "Halfway through sorting the $first, I said $phrase.",
+            "My favorite thing to try is $phrase, honestly.",
+            "Right before lunch, the phrase I need is $phrase.",
+            "I whispered $phrase while holding the $first.",
+            "$phrase came out clearly once the $second stopped.",
+            "Between the $first and the $third, I said $phrase.",
+        )
+        return templates[(index + random.nextInt(templates.size)) % templates.size].sentenceCase()
     }
 
     private fun bulkHardNegativeSentence(
@@ -254,12 +281,17 @@ object PromptGenerator {
         phrase: String,
     ): String {
         val word = lexicon.randomContentWords(random, phrase, 1).firstOrNull() ?: "note"
-        return when (random.nextInt(4)) {
-            0 -> "This is not the wake phrase, but I will say $nearMiss."
-            1 -> "The near match for this $word is $nearMiss."
-            2 -> "Ignore the similar phrase $nearMiss and keep reading."
-            else -> "For a hard negative example, say $nearMiss."
-        }.sentenceCase()
+        val templates = listOf(
+            "This is not the wake phrase, but I will say $nearMiss.",
+            "The near match for this $word is $nearMiss.",
+            "Ignore the similar phrase $nearMiss and keep reading.",
+            "For a hard negative example, say $nearMiss.",
+            "It almost sounds right, but I am only saying $nearMiss.",
+            "Careful, $nearMiss is close but not the one.",
+            "The tricky look-alike here is $nearMiss.",
+            "Don't be fooled, this is just $nearMiss.",
+        )
+        return templates[random.nextInt(templates.size)].sentenceCase()
     }
 
     private fun hardNegativeCandidates(
@@ -295,15 +327,27 @@ object PromptGenerator {
 
             variants.add(words.drop(1).joinToString(" ").ifBlank { words.first() })
             variants.add(words.dropLast(1).joinToString(" ").ifBlank { words.first() })
-            variants.add("$phrase now")
-            variants.add("not $phrase")
-            variants.add("$phrase please")
         }
 
         return variants
             .map { it.trim().replace(Regex("\\s+"), " ") }
             .filter { it.isNotBlank() && it != phrase.lowercase() }
+            .filterNot { candidate -> containsPhraseRun(candidate, words) }
             .distinct()
+    }
+
+    private fun containsPhraseRun(candidate: String, phraseWords: List<String>): Boolean {
+        if (phraseWords.isEmpty()) return false
+        val candidateWords = candidate.trim().lowercase()
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+        if (candidateWords.size < phraseWords.size) return false
+        for (start in 0..candidateWords.size - phraseWords.size) {
+            if (candidateWords.subList(start, start + phraseWords.size) == phraseWords) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun List<String>.replaceAt(index: Int, value: String): List<String> {
