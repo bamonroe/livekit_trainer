@@ -13,6 +13,11 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Cross-wake-word negative reuse: `scripts/assemble_training_data.py` builds
+  a pooled `data/train/<slug>` tree where negatives include every other wake
+  word's negatives and (as hard negatives) their positives; background is pooled
+  too, positives stay own-only. `generate_config.py` now emits `real_samples_dir`
+  (defaults to `./data/train`). Tests in `tests/test_assemble_training_data.py`.
 - [x] Hard-cap slices at 1.5s (word span + padding clamped; transcript trimmed
   to audible words). Verified on `all_set`: all clips <= 1.5s, none dropped.
 - [x] Add server reprocess endpoints (`POST /reprocess/:slug`,

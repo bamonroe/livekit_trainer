@@ -25,6 +25,16 @@ def main() -> int:
         help="Custom negative phrase; may be repeated",
     )
     parser.add_argument("--out", type=Path, help="Output YAML path")
+    parser.add_argument(
+        "--real-samples-dir",
+        default="./data/train",
+        help=(
+            "Root of the real recorded clips the trainer injects, laid out as "
+            "<dir>/<slug>/{positive,negative,background}. Defaults to ./data/train, "
+            "the pooled tree built by assemble_training_data.py. Use ./data/real "
+            "for this project's own clips only, or empty to disable injection."
+        ),
+    )
     parser.add_argument("--n-samples", type=int, default=20_000)
     parser.add_argument("--n-samples-val", type=int, default=4_000)
     parser.add_argument("--steps", type=int, default=50_000)
@@ -66,6 +76,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "custom_negative_phrases": negatives,
         "data_dir": "./data",
         "output_dir": "./output",
+        "real_samples_dir": (args.real_samples_dir or "").strip() or None,
         "model": {
             "model_type": "conv_attention",
             "model_size": args.model_size,
@@ -94,6 +105,12 @@ def render_yaml(config: dict[str, Any]) -> str:
             "",
             f"data_dir: {yaml_string(config['data_dir'])}",
             f"output_dir: {yaml_string(config['output_dir'])}",
+        ],
+    )
+    if config.get("real_samples_dir"):
+        lines.append(f"real_samples_dir: {yaml_string(config['real_samples_dir'])}")
+    lines.extend(
+        [
             "",
             "model:",
             f"  model_type: {yaml_string(config['model']['model_type'])}",
