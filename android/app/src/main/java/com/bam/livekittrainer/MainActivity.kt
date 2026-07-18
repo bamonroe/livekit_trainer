@@ -29,6 +29,9 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import org.json.JSONObject
 
@@ -462,6 +465,7 @@ class MainActivity : Activity() {
         val busy = processingBulkSplit || reprocessing
         return card().apply {
             addView(text("Bulk recording  ${recording.durationMs / 1000}s", 20f, textColor(), Typeface.BOLD))
+            addView(text(formatRecordedAt(recording.recordedAtMillis), 13f, textColor()).withTop(dp(2)))
             addView(text(File(recording.filePath).name, 12f, mutedColor()).withTop(dp(2)))
             addView(text("Original script", 15f, mutedColor()).withTop(dp(12)))
             addView(text(recording.script, 15f, textColor()).withTop(dp(4)))
@@ -1130,6 +1134,9 @@ class MainActivity : Activity() {
         background = rounded(inputColor(), dp(12), strokeColor())
     }
 
+    private fun formatRecordedAt(millis: Long): String =
+        SimpleDateFormat("MMM d, yyyy · h:mm a", Locale.getDefault()).format(Date(millis))
+
     private fun bulkRecordingRow(recording: BulkRecording): View {
         val counts = if (bulkReviewProjectSlug == activeProjectOrNull()?.slug) {
             bulkReviewClips.filter { it.sourceRecording == recording.id }.groupingBy { it.label }.eachCount()
@@ -1148,6 +1155,7 @@ class MainActivity : Activity() {
             background = rounded(promptColor(), dp(14), 0)
             setOnClickListener { open() }
             addView(text("Take  ${recording.durationMs / 1000}s", 15f, textColor(), Typeface.BOLD))
+            addView(text(formatRecordedAt(recording.recordedAtMillis), 12f, mutedColor()).withTop(dp(2)))
             addView(
                 text(
                     if (counts.isEmpty()) {
