@@ -100,6 +100,11 @@ struct ProjectSummary {
     phrase: String,
     created_at_millis: i64,
     bulk_slice_count: usize,
+    positive_count: usize,
+    negative_count: usize,
+    background_count: usize,
+    /// Negatives available from every *other* project, reusable for this one.
+    pooled_negative_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -364,14 +369,26 @@ async fn projects(State(state): State<AppState>) -> Result<Json<ProjectsResponse
         let conn = state.db.lock().expect("db lock poisoned");
         db::project_summaries(&conn).map_err(db_error)?
     };
+    // Cross-wake-word reuse: every other project's negatives, plus their
+    // positives (reused as hard negatives), are available to this project.
+    let total_negatives: i64 = rows.iter().map(|r| r.negative_count).sum();
+    let total_positives: i64 = rows.iter().map(|r| r.positive_count).sum();
     let projects = rows
         .into_iter()
-        .map(|row| ProjectSummary {
-            id: row.external_id,
-            slug: row.slug,
-            phrase: row.phrase,
-            created_at_millis: row.created_at_ms,
-            bulk_slice_count: row.bulk_slice_count as usize,
+        .map(|row| {
+            let pooled = (total_negatives - row.negative_count)
+                + (total_positives - row.positive_count);
+            ProjectSummary {
+                id: row.external_id,
+                slug: row.slug,
+                phrase: row.phrase,
+                created_at_millis: row.created_at_ms,
+                bulk_slice_count: row.bulk_slice_count as usize,
+                positive_count: row.positive_count as usize,
+                negative_count: row.negative_count as usize,
+                background_count: row.background_count as usize,
+                pooled_negative_count: pooled.max(0) as usize,
+            }
         })
         .collect();
     Ok(Json(ProjectsResponse {

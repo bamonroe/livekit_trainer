@@ -86,6 +86,30 @@ class BundleSyncClient(
         }
     }
 
+    fun loadProjectCounts(): Map<String, ProjectCounts> {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/projects")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val response = readResponse(connection, "Load project counts failed")
+        val projects = JSONObject(response).getJSONArray("projects")
+        return buildMap {
+            for (index in 0 until projects.length()) {
+                val item = projects.getJSONObject(index)
+                put(
+                    item.getString("slug"),
+                    ProjectCounts(
+                        positive = item.optInt("positive_count", 0),
+                        negative = item.optInt("negative_count", 0),
+                        background = item.optInt("background_count", 0),
+                        pooledNegative = item.optInt("pooled_negative_count", 0),
+                    ),
+                )
+            }
+        }
+    }
+
     fun syncedBulkRecordingIds(wakeWordSlug: String): Set<String> {
         val endpoint = URL(serverUrl.trimEnd('/') + "/bulk/${urlPart(wakeWordSlug)}/recordings")
         val connection = endpoint.openConnection() as HttpURLConnection

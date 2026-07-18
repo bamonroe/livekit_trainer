@@ -104,6 +104,9 @@ pub struct ProjectRow {
     pub external_id: String,
     pub created_at_ms: i64,
     pub bulk_slice_count: i64,
+    pub positive_count: i64,
+    pub negative_count: i64,
+    pub background_count: i64,
 }
 
 /// Everything a reprocess pass needs about a stored recording to re-run
@@ -576,7 +579,10 @@ pub fn recording_cuts(
 pub fn project_summaries(conn: &Connection) -> Result<Vec<ProjectRow>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT p.slug, p.phrase, COALESCE(p.external_id, p.slug), p.created_at_ms,
-                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active')
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active'),
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'positive'),
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'negative'),
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'background')
          FROM projects p
          ORDER BY p.slug ASC",
     )?;
@@ -587,6 +593,9 @@ pub fn project_summaries(conn: &Connection) -> Result<Vec<ProjectRow>, rusqlite:
             external_id: row.get(2)?,
             created_at_ms: row.get(3)?,
             bulk_slice_count: row.get(4)?,
+            positive_count: row.get(5)?,
+            negative_count: row.get(6)?,
+            background_count: row.get(7)?,
         })
     })?;
     rows.collect()

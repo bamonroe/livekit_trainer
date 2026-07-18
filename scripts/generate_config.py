@@ -35,6 +35,20 @@ def main() -> int:
             "for this project's own clips only, or empty to disable injection."
         ),
     )
+    parser.add_argument(
+        "--positive-per-batch",
+        type=int,
+        default=None,
+        help=(
+            "Overweight positives by raising the per-batch positive slot count "
+            "(trainer default 50). Since negatives are pooled across wake words and "
+            "grow far faster than positives, bumping this keeps positive gradient "
+            "signal strong. Setting it emits an explicit batch_n_per_class block."
+        ),
+    )
+    parser.add_argument("--adversarial-negative-per-batch", type=int, default=50)
+    parser.add_argument("--acav-per-batch", type=int, default=1024)
+    parser.add_argument("--background-noise-per-batch", type=int, default=50)
     parser.add_argument("--n-samples", type=int, default=20_000)
     parser.add_argument("--n-samples-val", type=int, default=4_000)
     parser.add_argument("--steps", type=int, default=50_000)
@@ -70,6 +84,15 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     negatives.extend(args.negative)
     negatives = dedupe([item.strip() for item in negatives if item.strip()])
 
+    batch_n_per_class = None
+    if args.positive_per_batch is not None:
+        batch_n_per_class = {
+            "positive": args.positive_per_batch,
+            "adversarial_negative": args.adversarial_negative_per_batch,
+            "ACAV100M_sample": args.acav_per_batch,
+            "background_noise": args.background_noise_per_batch,
+        }
+
     return {
         "model_name": slug,
         "target_phrases": dedupe(target_phrases),
@@ -77,6 +100,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "data_dir": "./data",
         "output_dir": "./output",
         "real_samples_dir": (args.real_samples_dir or "").strip() or None,
+        "batch_n_per_class": batch_n_per_class,
         "model": {
             "model_type": "conv_attention",
             "model_size": args.model_size,
@@ -109,6 +133,11 @@ def render_yaml(config: dict[str, Any]) -> str:
     )
     if config.get("real_samples_dir"):
         lines.append(f"real_samples_dir: {yaml_string(config['real_samples_dir'])}")
+    if config.get("batch_n_per_class"):
+        lines.append("")
+        lines.append("batch_n_per_class:")
+        for key, value in config["batch_n_per_class"].items():
+            lines.append(f"  {key}: {value}")
     lines.extend(
         [
             "",

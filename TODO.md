@@ -13,6 +13,13 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Recently done
 
+- [x] Surface pooled clip counts in the app: `/projects` now returns per-slug
+  positive/negative/background counts plus `pooled_negative_count` (other words'
+  negatives + their positives reused as negatives); the Review "Sync & process"
+  card shows a Training pool block and warns when positives are heavily
+  outnumbered. `generate_config.py --positive-per-batch` emits `batch_n_per_class`
+  to overweight positives (the correct lever — disk duplication is a no-op given
+  the trainer's modulo-wraparound batching).
 - [x] Cross-wake-word negative reuse: `scripts/assemble_training_data.py` builds
   a pooled `data/train/<slug>` tree where negatives include every other wake
   word's negatives and (as hard negatives) their positives; background is pooled

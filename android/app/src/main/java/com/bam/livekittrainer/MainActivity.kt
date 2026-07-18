@@ -57,6 +57,7 @@ class MainActivity : Activity() {
     private var activeProject: WakeWordProject? = null
     private var bulkReviewProjectSlug: String? = null
     private var bulkReviewClips: List<BulkReviewClip> = emptyList()
+    private var projectCounts: Map<String, ProjectCounts> = emptyMap()
     private var bulkAlignmentProjectSlug: String? = null
     private var bulkAlignment: BulkAlignment? = null
     private var loadingBulkReview: Boolean = false
@@ -438,6 +439,56 @@ class MainActivity : Activity() {
                     mutedColor(),
                 ).withTop(dp(10)),
             )
+            projectCounts[project.slug]?.let { counts ->
+                addView(trainingPoolCard(counts).withTop(dp(12)))
+            }
+        }
+    }
+
+    /**
+     * Shows this wake word's own clip tallies alongside the negatives pooled in
+     * from every other project. Negatives are shared and pile up fast, so this
+     * surfaces how many real positives still need collecting for a balanced set.
+     */
+    private fun trainingPoolCard(counts: ProjectCounts): View {
+        val ownNegativeTotal = counts.negative + counts.pooledNegative
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = rounded(promptColor(), dp(14), 0)
+            addView(text("Training pool", 15f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "${counts.positive} positive · ${counts.negative} negative · ${counts.background} background (this word)",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                text(
+                    "+${counts.pooledNegative} negatives reused from other words → $ownNegativeTotal total negatives for training",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(2)),
+            )
+            if (counts.positive > 0 && ownNegativeTotal >= counts.positive * 5) {
+                val ratio = ownNegativeTotal / counts.positive
+                addView(
+                    text(
+                        "Positives are heavily outnumbered (~1:$ratio). Record more wake takes; training can also overweight positives via batch_n_per_class.",
+                        13f,
+                        Color.parseColor("#C2410C"),
+                    ).withTop(dp(6)),
+                )
+            } else if (counts.positive == 0) {
+                addView(
+                    text(
+                        "No positives yet for this word. Record a bulk take with the wake phrase.",
+                        13f,
+                        Color.parseColor("#C2410C"),
+                    ).withTop(dp(6)),
+                )
+            }
         }
     }
 
@@ -650,9 +701,15 @@ class MainActivity : Activity() {
                 val zip = exporter.exportProjectZip(project, emptyList(), bulkRecordings)
                 val response = client.upload(zip)
                 val clips = client.loadBulkReview(project.slug)
+                val counts = try {
+                    client.loadProjectCounts()
+                } catch (_: Exception) {
+                    projectCounts
+                }
                 runOnUiThread {
                     bulkReviewProjectSlug = project.slug
                     bulkReviewClips = clips
+                    projectCounts = counts
                     bulkAlignmentProjectSlug = null
                     bulkAlignment = null
                     processingBulkSplit = false
@@ -740,10 +797,17 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                val clips = BundleSyncClient(serverUrl).loadBulkReview(project.slug)
+                val client = BundleSyncClient(serverUrl)
+                val clips = client.loadBulkReview(project.slug)
+                val counts = try {
+                    client.loadProjectCounts()
+                } catch (_: Exception) {
+                    projectCounts
+                }
                 runOnUiThread {
                     bulkReviewProjectSlug = project.slug
                     bulkReviewClips = clips
+                    projectCounts = counts
                     loadingBulkReview = false
                     statusMessage = if (clips.isEmpty()) {
                         "No clips yet. Tap Sync & process to transcribe and slice."
