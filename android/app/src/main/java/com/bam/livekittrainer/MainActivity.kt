@@ -100,6 +100,13 @@ class MainActivity : Activity() {
     private var scoreMode: String = "full"
     private var scoreCurveView: ScoreCurveView? = null
     private var scoreCountsText: TextView? = null
+    // Test-page take-list collapse state. Test takes are the ones you usually
+    // score, so they start open; the larger training pool starts collapsed. The
+    // list is also paged so a big library doesn't bury the score card.
+    private var testTakesExpanded: Boolean = true
+    private var trainingTakesExpanded: Boolean = false
+    private var testTakesShown: Int = TAKE_PAGE_SIZE
+    private var trainingTakesShown: Int = TAKE_PAGE_SIZE
     private var scorePlaybackTicker: Runnable? = null
     private var player: MediaPlayer? = null
     private var activePlaybackKey: String? = null
@@ -415,11 +422,14 @@ class MainActivity : Activity() {
         }
         ensureServerRecordings(project)
         workspace.addView(testRecorderCard(project))
-        workspace.addView(testPickerCard(project).withTop(dp(12)))
+        // The score card sits directly under the recorder, above the take list,
+        // so tapping Score on a take doesn't leave the result buried far below a
+        // long list. The list is collapsible/paged beneath it.
         val result = scoreResult?.takeIf { scoreProjectSlug == project.slug }
         if (result != null || loadingScore) {
             workspace.addView(scoreResultCard(project, result).withTop(dp(12)))
         }
+        workspace.addView(testPickerCard(project).withTop(dp(12)))
         maybeStatus()
     }
 
@@ -619,6 +629,8 @@ class MainActivity : Activity() {
         } else {
             emptyList()
         }
+        val testTakes = recordings.filter { it.isTest }
+        val trainingTakes = recordings.filter { !it.isTest }
         return card().apply {
             addView(text("Model test", 20f, textColor(), Typeface.BOLD))
             addView(
@@ -634,10 +646,72 @@ class MainActivity : Activity() {
                     addView(text("Loading recordings…", 14f, mutedColor()).withTop(dp(12)))
                 recordings.isEmpty() ->
                     addView(text("No recordings on the server yet for this wake word.", 14f, mutedColor()).withTop(dp(12)))
-                else -> recordings.forEach { recording ->
-                    addView(testRecordingRow(project, recording).withTop(dp(8)))
+                else -> {
+                    addTakeGroup(
+                        project,
+                        title = "Test takes",
+                        takes = testTakes,
+                        expanded = testTakesExpanded,
+                        shown = testTakesShown,
+                        onToggle = { testTakesExpanded = !testTakesExpanded; render() },
+                        onShowMore = { testTakesShown += TAKE_PAGE_SIZE; render() },
+                    )
+                    addTakeGroup(
+                        project,
+                        title = "Training takes",
+                        takes = trainingTakes,
+                        expanded = trainingTakesExpanded,
+                        shown = trainingTakesShown,
+                        onToggle = { trainingTakesExpanded = !trainingTakesExpanded; render() },
+                        onShowMore = { trainingTakesShown += TAKE_PAGE_SIZE; render() },
+                    )
                 }
             }
+        }
+    }
+
+    /**
+     * A collapsible, paged group of takes. The header shows the count and a
+     * chevron; tapping it toggles the body. When open, only the first [shown]
+     * rows render, with a "Show more" footer so a big library never buries the
+     * score card above it.
+     */
+    private fun LinearLayout.addTakeGroup(
+        project: WakeWordProject,
+        title: String,
+        takes: List<ServerRecording>,
+        expanded: Boolean,
+        shown: Int,
+        onToggle: () -> Unit,
+        onShowMore: () -> Unit,
+    ) {
+        if (takes.isEmpty()) return
+        addView(
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(10), dp(4), dp(4))
+                setOnClickListener { onToggle() }
+                addView(
+                    text(if (expanded) "▾" else "▸", 15f, mutedColor(), Typeface.BOLD),
+                )
+                addView(
+                    text("  $title", 15f, textColor(), Typeface.BOLD).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    },
+                )
+                addView(text("${takes.size}", 14f, mutedColor(), Typeface.BOLD))
+            }.withTop(dp(8)),
+        )
+        if (!expanded) return
+        takes.take(shown).forEach { recording ->
+            addView(testRecordingRow(project, recording).withTop(dp(8)))
+        }
+        if (takes.size > shown) {
+            addView(
+                actionButton("Show ${takes.size - shown} more", ButtonStyle.Secondary) { onShowMore() }
+                    .withTop(dp(8)),
+            )
         }
     }
 
@@ -2816,6 +2890,7 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQUEST_RECORD_AUDIO = 100
+        const val TAKE_PAGE_SIZE = 5
         const val SYNC_PREFS = "sync"
         const val KEY_SYNC_SERVER_URL = "server_url"
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
