@@ -35,6 +35,11 @@ services:
       # Where recorded audio is transcribed. This is the source of truth for the
       # Whisper server; the Android app no longer configures it.
       WHISPER_SERVER_URL: "${WHISPER_SERVER_URL:-http://pickle.bam.net:8572}"
+      # Where the model-test scoring endpoint sends audio. Points at the scorer
+      # service below; unset disables /score only.
+      SCORER_SERVER_URL: "${SCORER_SERVER_URL:-http://scorer:8770}"
+    depends_on:
+      - scorer
 
   # Rolling-window wake-word scorer. Loads trained models from ./output and
   # turns an uploaded 16 kHz mono WAV into a detection-score curve. Bases on the

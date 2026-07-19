@@ -18,10 +18,20 @@ discovered. Prefer small, actionable items with clear status.
     `reset` = silence-pad each step). Validated exact vs `predict()` (~3e-8);
     `full` 10 ms is ~sub-second, `reset` near real-time at ~40 ms. Compose
     service `scorer` on :8770, reads `./output`.
-  - [ ] Wire the sync-server to call the scorer for test takes and overlay
-    Whisper word timings into per-word TP/FP/FN.
+  - [x] Wire the sync-server to call the scorer and overlay Whisper word
+    timings into per-target TP/FN/FP. `GET /score/:slug/:recording_id` replays a
+    stored bulk recording through the scorer (`SCORER_SERVER_URL`, header
+    override `x-scorer-server-url`), locates each trigger-phrase utterance in the
+    current transcript, and tags it with the model's peak score in the window
+    aligned to the phrase tail. Params `mode` (full|reset), `step_ms`, `keep_ms`,
+    `threshold`; returns the full curve so a client re-thresholds counts for
+    free. Validated on a real `all_set` take: `full` → 4/4 FN (~0.01 peaks,
+    streaming gap); `reset` → 4/4 TP (~0.98). Compose wires `sync-server` →
+    `scorer`.
   - [ ] Separate "test" recording category/storage so test takes never enter
-    the training pool.
+    the training pool. (Interim: `/score` runs against existing bulk recordings,
+    which is enough for the honest diagnostic; a dedicated test channel is only
+    needed once the app records test-only takes.)
   - [ ] App: "record test" prompt flow + score-curve/threshold/pad UI.
   - [ ] Host-runnable unit test for the scorer (currently validated only via
     the container smoke test).

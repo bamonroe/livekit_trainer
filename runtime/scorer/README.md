@@ -44,6 +44,25 @@ POST /score    multipart form:
 true/false positives and false negatives as the threshold and padding sliders
 move.
 
+## Fronted by the sync-server
+
+The Rust sync-server calls this service so callers never talk to it directly for
+stored takes. `GET /score/:slug/:recording_id` on the sync-server replays a
+stored bulk recording through here and overlays the recording's current Whisper
+transcript:
+
+- It resolves the scorer from `SCORER_SERVER_URL` (or the `x-scorer-server-url`
+  request header), reads the take's `bulk_source` WAV, and POSTs it here.
+- It locates every trigger-phrase utterance in the transcript and tags each with
+  the model's peak score in the window aligned to the phrase tail.
+- Response adds `targets[]` (per-utterance peak + `detected`) and
+  `true_positives`/`false_negatives`/`false_positives` at `threshold`, alongside
+  the full `times_ms`/`scores` curve so a client can re-threshold for free.
+
+Query params mirror this service: `mode` (full|reset), `step_ms`, `keep_ms`,
+`threshold`. This is the honest streaming diagnostic — `full` shows the real
+mid-sentence recall, `reset` shows the training-time (silence-padded) view.
+
 ## Run
 
 ```bash

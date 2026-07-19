@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, RawQuery, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -60,6 +60,9 @@ struct AppState {
     // is the source of truth for where audio is transcribed; the app no longer
     // configures it.
     whisper_url: Arc<Option<String>>,
+    // Wake-word scorer service URL from SCORER_SERVER_URL. Optional: only the
+    // model-test scoring endpoint needs it; the rest of the server works without.
+    scorer_url: Arc<Option<String>>,
     db: Arc<Mutex<Connection>>,
 }
 
@@ -217,6 +220,56 @@ struct ReprocessResponse {
     whisper_server_url: Option<String>,
 }
 
+/// Rolling wake-word detection over a stored bulk recording, with each true
+/// target-phrase utterance (located from the current Whisper transcript) tagged
+/// with the model's peak score in its window. The full curve is returned so a
+/// client can re-threshold the detection/false-positive counts for free.
+#[derive(Debug, Serialize)]
+struct ScoreResponse {
+    status: &'static str,
+    wake_word_slug: String,
+    source_recording: String,
+    phrase: String,
+    mode: String,
+    window_ms: u64,
+    step_ms: u64,
+    keep_ms: u64,
+    duration_ms: f64,
+    threshold: f64,
+    times_ms: Vec<f64>,
+    scores: Vec<f64>,
+    targets: Vec<ScoreTarget>,
+    /// Counts at `threshold`: targets that peaked at/above it, targets that did
+    /// not, and above-threshold detections landing outside any target window.
+    true_positives: usize,
+    false_negatives: usize,
+    false_positives: usize,
+}
+
+/// One occurrence of the trigger phrase in the transcript, with the model's
+/// best score anywhere in the detection window aligned to the phrase tail.
+#[derive(Debug, Serialize)]
+struct ScoreTarget {
+    text: String,
+    start_ms: i64,
+    end_ms: i64,
+    peak_score: f64,
+    peak_time_ms: f64,
+    detected: bool,
+}
+
+/// The scorer service's `/score` reply: parallel time/score arrays. The scorer
+/// emits fractional milliseconds, so times are floats.
+#[derive(Debug, Deserialize)]
+struct ScorerCurve {
+    #[serde(default)]
+    duration_ms: f64,
+    #[serde(default)]
+    times_ms: Vec<f64>,
+    #[serde(default)]
+    scores: Vec<f64>,
+}
+
 #[derive(Debug, Serialize)]
 struct DeleteRecordingResponse {
     status: &'static str,
@@ -364,12 +417,22 @@ async fn main() {
         None => println!("WHISPER_SERVER_URL not set; transcription will fail until configured"),
     }
 
+    let scorer_url = env::var("SCORER_SERVER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match &scorer_url {
+        Some(url) => println!("scorer server at {url}"),
+        None => println!("SCORER_SERVER_URL not set; model-test scoring disabled"),
+    }
+
     let state = AppState {
         data_root: Arc::new(PathBuf::from(data_root)),
         incoming_root: Arc::new(PathBuf::from(incoming_root)),
         settings: Arc::new(Mutex::new(load_settings(&settings_path))),
         settings_path: Arc::new(settings_path),
         whisper_url: Arc::new(whisper_url),
+        scorer_url: Arc::new(scorer_url),
         db: Arc::new(Mutex::new(db)),
     };
 
@@ -395,6 +458,7 @@ async fn main() {
             "/review/:slug/bulk/:recording_id/audio",
             get(bulk_source_audio),
         )
+        .route("/score/:slug/:recording_id", get(score_recording))
         .route(
             "/review/:slug/:category/:file_name",
             get(review_audio).delete(delete_review_clip),
@@ -868,6 +932,249 @@ async fn bulk_source_audio(
         .join(format!("{}.wav", safe_filename(&recording_id)));
     let bytes = fs::read(path)?;
     Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
+}
+
+/// Resolve the scorer service URL from the request header, falling back to the
+/// SCORER_SERVER_URL environment variable captured at startup.
+fn resolve_scorer_url(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-scorer-server-url")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| state.scorer_url.as_ref().clone())
+}
+
+/// Score a stored bulk recording against a trained model and overlay the
+/// current Whisper transcript so each true target utterance is scored honestly.
+/// This is the model-test diagnostic: synthetic eval recall hides the streaming
+/// gap, so we replay real takes and check whether the phrase actually fires
+/// mid-sentence. Query params: `mode` (full|reset), `step_ms`, `keep_ms`,
+/// `threshold`.
+async fn score_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((slug, recording_id)): AxumPath<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ScoreResponse>, AppError> {
+    if !is_safe_slug(&slug) || !is_safe_recording_id(&recording_id) {
+        return Err(AppError::bad_request("unsafe score path"));
+    }
+    let params = parse_query(query.as_deref());
+    let mode = match params.get("mode").map(String::as_str) {
+        Some("full") | None => "full",
+        Some("reset") => "reset",
+        Some(other) => return Err(AppError::bad_request(format!("unknown mode: {other}"))),
+    };
+    let step_ms = params
+        .get("step_ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(if mode == "reset" { 40 } else { 10 });
+    let keep_ms = params
+        .get("keep_ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(700);
+    let threshold = params
+        .get("threshold")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.5);
+
+    let scorer_url = resolve_scorer_url(&state, &headers).ok_or_else(|| {
+        AppError::bad_request("scorer not configured; set SCORER_SERVER_URL or x-scorer-server-url")
+    })?;
+
+    let (phrase, words) = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        let phrase = db::project_phrase(&conn, &slug)
+            .map_err(db_error)?
+            .map(|(phrase, _external_id)| phrase)
+            .unwrap_or_else(|| slug.replace('_', " "));
+        let words = db::current_transcript_words(&conn, &recording_id).map_err(db_error)?;
+        (phrase, words)
+    };
+
+    let wav_path = state
+        .data_root
+        .join(&slug)
+        .join("bulk_source")
+        .join(format!("{}.wav", safe_filename(&recording_id)));
+    let wav = fs::read(&wav_path)
+        .map_err(|_| AppError::bad_request(format!("no source audio for {recording_id}")))?;
+
+    let curve = run_scorer(&scorer_url, wav, &slug, mode, step_ms, keep_ms).await?;
+
+    let targets = locate_targets(&phrase, &words, &curve, threshold);
+    let true_positives = targets.iter().filter(|t| t.detected).count();
+    let false_negatives = targets.len() - true_positives;
+    let false_positives = count_false_positives(&curve, &targets, threshold);
+
+    Ok(Json(ScoreResponse {
+        status: "ok",
+        wake_word_slug: slug,
+        source_recording: recording_id,
+        phrase,
+        mode: mode.to_string(),
+        window_ms: 2000,
+        step_ms,
+        keep_ms,
+        duration_ms: curve.duration_ms,
+        threshold,
+        times_ms: curve.times_ms,
+        scores: curve.scores,
+        targets,
+        true_positives,
+        false_negatives,
+        false_positives,
+    }))
+}
+
+/// Minimal `a=b&c=d` query parser; avoids pulling in axum's `query` feature.
+fn parse_query(raw: Option<&str>) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(raw) = raw else { return map };
+    for pair in raw.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        map.insert(key.to_string(), value.to_string());
+    }
+    map
+}
+
+/// POST the WAV to the scorer service and parse its rolling-score curve.
+async fn run_scorer(
+    scorer_url: &str,
+    wav: Vec<u8>,
+    slug: &str,
+    mode: &str,
+    step_ms: u64,
+    keep_ms: u64,
+) -> Result<ScorerCurve, AppError> {
+    let part = reqwest::multipart::Part::bytes(wav)
+        .file_name(format!("{slug}.wav"))
+        .mime_str("audio/wav")
+        .map_err(|error| AppError::internal(format!("prepare scorer upload: {error}")))?;
+    let form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("slug", slug.to_string())
+        .text("mode", mode.to_string())
+        .text("step_ms", step_ms.to_string())
+        .text("keep_ms", keep_ms.to_string());
+    let endpoint = format!("{}/score", scorer_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| AppError::internal(format!("scorer request failed: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AppError::internal(format!("scorer response read failed: {error}")))?;
+    if !status.is_success() {
+        return Err(AppError::internal(format!(
+            "scorer returned {status}: {}",
+            body.trim()
+        )));
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| AppError::internal(format!("scorer response JSON failed: {error}")))
+}
+
+/// Normalize a spoken token for phrase matching: lowercase, keep only letters
+/// and digits. Whisper emits leading spaces and stray punctuation on words.
+fn normalize_token(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Find every run of transcript words matching the trigger phrase and attach the
+/// model's peak score in the detection window aligned to the phrase tail. The
+/// model fires when the phrase ends the 2s window, so the peak sits near the
+/// last word's end; we search a small band around it.
+fn locate_targets(
+    phrase: &str,
+    words: &[db::WordRow],
+    curve: &ScorerCurve,
+    threshold: f64,
+) -> Vec<ScoreTarget> {
+    let tokens: Vec<String> = phrase
+        .split_whitespace()
+        .map(normalize_token)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() || words.is_empty() {
+        return Vec::new();
+    }
+    let normalized: Vec<String> = words.iter().map(|w| normalize_token(&w.word)).collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    while i + tokens.len() <= normalized.len() {
+        if normalized[i..i + tokens.len()] == tokens[..] {
+            let start_ms = words[i].start_ms;
+            let end_ms = words[i + tokens.len() - 1].end_ms;
+            // Whisper word timings drift from the audio, so scan a band trailing
+            // the phrase end for the model's response rather than a single point.
+            let (peak_time_ms, peak_score) =
+                peak_in_window(curve, end_ms as f64 - 100.0, end_ms as f64 + 400.0);
+            targets.push(ScoreTarget {
+                text: words[i..i + tokens.len()]
+                    .iter()
+                    .map(|w| w.word.trim())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                start_ms,
+                end_ms,
+                peak_score,
+                peak_time_ms,
+                detected: peak_score >= threshold,
+            });
+            i += tokens.len();
+        } else {
+            i += 1;
+        }
+    }
+    targets
+}
+
+/// Highest score (and its time) among curve points within [lo_ms, hi_ms].
+fn peak_in_window(curve: &ScorerCurve, lo_ms: f64, hi_ms: f64) -> (f64, f64) {
+    let mut best = (lo_ms.max(0.0), 0.0_f64);
+    for (t, s) in curve.times_ms.iter().zip(curve.scores.iter()) {
+        if *t >= lo_ms && *t <= hi_ms && *s >= best.1 {
+            best = (*t, *s);
+        }
+    }
+    best
+}
+
+/// Count above-threshold detections that do not overlap any target window. A
+/// contiguous run above threshold counts once. A detection whose time falls in
+/// any target's search band is a true positive, not a false one.
+fn count_false_positives(curve: &ScorerCurve, targets: &[ScoreTarget], threshold: f64) -> usize {
+    let bands: Vec<(f64, f64)> = targets
+        .iter()
+        .map(|t| (t.end_ms as f64 - 100.0, t.end_ms as f64 + 400.0))
+        .collect();
+    let mut count = 0;
+    let mut in_run = false;
+    for (t, s) in curve.times_ms.iter().zip(curve.scores.iter()) {
+        let hot = *s >= threshold;
+        let near_target = bands.iter().any(|(lo, hi)| *t >= *lo && *t <= *hi);
+        if hot && !near_target {
+            if !in_run {
+                count += 1;
+                in_run = true;
+            }
+        } else {
+            in_run = false;
+        }
+    }
+    count
 }
 
 async fn review_audio(
