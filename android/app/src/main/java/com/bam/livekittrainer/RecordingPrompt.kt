@@ -37,7 +37,7 @@ object PromptGenerator {
         batchNumber: Int = 0,
         revision: Int = 0,
         wakePlacements: Int = DEFAULT_BULK_WAKE_PLACEMENTS,
-        positiveDense: Boolean = false,
+        style: String = STYLE_PROSE,
     ): BulkScriptContent {
         val phrase = project.phrase
         val placementCount = wakePlacements.coerceIn(1, 48)
@@ -47,8 +47,9 @@ object PromptGenerator {
             lexicon,
             stableRandom("${project.slug}:bulk:$batchNumber:$revision:hard-negatives"),
         ).shuffled(random).toMutableList()
-        if (positiveDense) {
-            return denseBulkScript(phrase, lexicon, random, placementCount, hardNegatives)
+        when (style) {
+            STYLE_STREAM -> return wordStreamScript(phrase, lexicon, random, placementCount, hardNegatives)
+            STYLE_DENSE -> return denseBulkScript(phrase, lexicon, random, placementCount, hardNegatives)
         }
         val usedHardNegatives = mutableListOf<String>()
         val script = buildList {
@@ -156,6 +157,69 @@ object PromptGenerator {
     }
 
     const val DEFAULT_BULK_WAKE_PLACEMENTS = 8
+
+    const val STYLE_PROSE = "prose"
+    const val STYLE_DENSE = "dense"
+    const val STYLE_STREAM = "stream"
+
+    /**
+     * A word-stream script: the speaker reads a long, ever-changing run of
+     * ordinary words drawn frequency-weighted from the whole lexicon, with the
+     * wake phrase (and the occasional near miss) dropped in at intervals. Because
+     * every word is sampled fresh from thousands of candidates, no filler word
+     * gets over-represented across takes the way the fixed carrier templates
+     * did. Each wake utterance is surrounded by continuous real speech, which is
+     * good context for the streaming-recall fix. Words are grouped into short
+     * breath lines; the wake phrase and near misses stand alone so the aligner
+     * can slice them cleanly.
+     */
+    private fun wordStreamScript(
+        phrase: String,
+        lexicon: PromptLexicon,
+        random: kotlin.random.Random,
+        placementCount: Int,
+        hardNegativeSeed: List<String>,
+    ): BulkScriptContent {
+        val usedHardNegatives = mutableListOf<String>()
+        val hardNegatives = hardNegativeSeed.toMutableList()
+        fun nextHardNegative(): String? {
+            if (hardNegatives.isEmpty()) {
+                if (hardNegativeSeed.isEmpty()) return null
+                hardNegatives.addAll(hardNegativeSeed.shuffled(random))
+            }
+            return hardNegatives.removeAt(0)
+        }
+
+        val lines = mutableListOf<String>()
+        fun emitWordRun(wordCount: Int) {
+            val words = lexicon.frequencyWeightedStream(phrase, random, wordCount)
+            if (words.isEmpty()) return
+            // Break the run into short breath groups so it reads at a natural
+            // pace instead of one long unpunctuated mumble.
+            var i = 0
+            while (i < words.size) {
+                val groupSize = 4 + random.nextInt(3)
+                val group = words.subList(i, minOf(i + groupSize, words.size))
+                lines.add(group.joinToString(" ").sentenceCase())
+                i += groupSize
+            }
+        }
+
+        // Lead-in speech so the mic settles and the first wake has real context.
+        emitWordRun(10 + random.nextInt(8))
+        repeat(placementCount) { index ->
+            lines.add(phrase.trim().sentenceCase())
+            emitWordRun(10 + random.nextInt(10))
+            if (index % 2 == 1) {
+                nextHardNegative()?.let { nearMiss ->
+                    usedHardNegatives.add(nearMiss)
+                    lines.add(nearMiss.trim().sentenceCase())
+                    emitWordRun(6 + random.nextInt(6))
+                }
+            }
+        }
+        return BulkScriptContent(lines.joinToString(" "), usedHardNegatives.distinct())
+    }
 
     fun initialBatch(
         project: WakeWordProject,

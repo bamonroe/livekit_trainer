@@ -448,7 +448,7 @@ class MainActivity : Activity() {
             // script even at the same shuffle revision.
             testScriptRevision + 7919,
             wakePlacements,
-            positiveDense = savedPositiveDense(),
+            style = savedScriptStyle(),
         )
         val script = scriptContent.text
         val recordingThisProject =
@@ -1181,14 +1181,17 @@ class MainActivity : Activity() {
             addView(actionButton("Load server projects", ButtonStyle.Secondary) {
                 loadServerProjects(serverUrlInput.text.toString().trim())
             }.withTop(dp(8)))
-            val dense = savedPositiveDense()
+            val style = savedScriptStyle()
             addView(text("Bulk script style", 15f, mutedColor()).withTop(dp(14)))
             addView(
                 text(
-                    if (dense) {
-                        "Dense: short, varied ways to say the wake phrase back to back, with frequent near misses. Many positives per minute."
-                    } else {
-                        "Prose: wake phrase woven into full sentences. More natural negatives, but slower to gather positives."
+                    when (style) {
+                        PromptGenerator.STYLE_STREAM ->
+                            "Stream: read a long run of ever-changing words drawn frequency-weighted from the whole lexicon, with the wake phrase dropped in at intervals. Maximum variety, so no filler word repeats across takes."
+                        PromptGenerator.STYLE_DENSE ->
+                            "Dense: short, varied ways to say the wake phrase back to back, with frequent near misses. Many positives per minute."
+                        else ->
+                            "Prose: wake phrase woven into full sentences. More natural negatives, but slower to gather positives."
                     },
                     12f,
                     mutedColor(),
@@ -1197,8 +1200,13 @@ class MainActivity : Activity() {
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    addView(actionButton("Prose", if (!dense) ButtonStyle.Primary else ButtonStyle.Secondary) { setPositiveDense(false) }.weight1())
-                    addView(actionButton("Dense", if (dense) ButtonStyle.Primary else ButtonStyle.Secondary) { setPositiveDense(true) }.weight1().withLeft(dp(8)))
+                    fun styleButton(label: String, value: String, leftPad: Boolean) =
+                        actionButton(label, if (style == value) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            setScriptStyle(value)
+                        }.weight1().let { if (leftPad) it.withLeft(dp(8)) else it }
+                    addView(styleButton("Prose", PromptGenerator.STYLE_PROSE, false))
+                    addView(styleButton("Dense", PromptGenerator.STYLE_DENSE, true))
+                    addView(styleButton("Stream", PromptGenerator.STYLE_STREAM, true))
                 }.withTop(dp(8)),
             )
             addView(text("Appearance", 15f, mutedColor()).withTop(dp(14)))
@@ -1467,7 +1475,7 @@ class MainActivity : Activity() {
             store.promptBatch(project.id),
             bulkScriptRevision,
             wakePlacements,
-            positiveDense = savedPositiveDense(),
+            style = savedScriptStyle(),
         )
         val script = scriptContent.text
         val recordingThisProject =
@@ -2333,19 +2341,29 @@ class MainActivity : Activity() {
             .coerceIn(1, 48)
     }
 
-    private fun savedPositiveDense(): Boolean {
-        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_BULK_POSITIVE_DENSE, false)
+    private fun savedScriptStyle(): String {
+        val prefs = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+        prefs.getString(KEY_BULK_SCRIPT_STYLE, null)?.let { return it }
+        // Migrate the old two-way dense boolean into the new style key.
+        return if (prefs.getBoolean(KEY_BULK_POSITIVE_DENSE, false)) {
+            PromptGenerator.STYLE_DENSE
+        } else {
+            PromptGenerator.STYLE_PROSE
+        }
     }
 
-    private fun setPositiveDense(enabled: Boolean) {
+    private fun setScriptStyle(style: String) {
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(KEY_BULK_POSITIVE_DENSE, enabled)
+            .putString(KEY_BULK_SCRIPT_STYLE, style)
             .apply()
         // Re-roll so the visible script switches style immediately.
         bulkScriptRevision += 1
-        statusMessage = if (enabled) "Dense positive script" else "Prose script"
+        statusMessage = when (style) {
+            PromptGenerator.STYLE_STREAM -> "Word-stream script"
+            PromptGenerator.STYLE_DENSE -> "Dense positive script"
+            else -> "Prose script"
+        }
         render()
     }
 
@@ -2991,6 +3009,7 @@ class MainActivity : Activity() {
         const val KEY_SYNC_SERVER_URL = "server_url"
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
         const val KEY_BULK_POSITIVE_DENSE = "bulk_positive_dense"
+        const val KEY_BULK_SCRIPT_STYLE = "bulk_script_style"
         const val KEY_DARK_MODE = "dark_mode"
         const val KEY_APPEARANCE = "appearance_mode"
         const val APPEARANCE_SYSTEM = "system"

@@ -50,6 +50,38 @@ class PromptLexicon private constructor(
         return randomWords(random, phraseWords(phrase), count)
     }
 
+    /**
+     * A stream of words sampled frequency-weighted from the whole ranked lexicon
+     * (most common words first). Sampling by `rank = n * u^2` biases toward
+     * common, easily-spoken words without letting the handful of top function
+     * words dominate, while still reaching deep into the list for variety. A
+     * recent-word window suppresses near-term repeats so no single word gets
+     * over-represented within a take.
+     */
+    fun frequencyWeightedStream(phrase: String, random: kotlin.random.Random, count: Int): List<String> {
+        if (words.isEmpty() || count <= 0) return emptyList()
+        val excluded = phraseWords(phrase)
+        val n = words.size
+        val recent = ArrayDeque<String>()
+        val recentWindow = min(48, n / 2)
+        val out = ArrayList<String>(count)
+        var guard = 0
+        val guardLimit = count * 40 + 64
+        while (out.size < count && guard < guardLimit) {
+            guard++
+            val u = random.nextDouble()
+            val index = (n * u * u).toInt().coerceIn(0, n - 1)
+            val word = words[index]
+            if (word.length < 2) continue
+            if (word in excluded) continue
+            if (word in recent) continue
+            out.add(word)
+            recent.addLast(word)
+            if (recent.size > recentWindow) recent.removeFirst()
+        }
+        return out
+    }
+
     fun phoneticHardNegatives(phrase: String, random: kotlin.random.Random, limit: Int): List<String> {
         val words = phrase.trim().lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (words.isEmpty()) return emptyList()
