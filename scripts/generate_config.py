@@ -24,6 +24,18 @@ def main() -> int:
         default=[],
         help="Custom negative phrase; may be repeated",
     )
+    parser.add_argument(
+        "--negatives-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a durable list of hard-negative phrases, one per line "
+            "(blank lines and lines starting with # are ignored). These are the "
+            "curated near-misses that must never trigger; keeping them in a "
+            "sidecar file means regenerating the config from the app can't drop "
+            "them. Merged with any --negative flags and manifest negatives."
+        ),
+    )
     parser.add_argument("--out", type=Path, help="Output YAML path")
     parser.add_argument(
         "--real-samples-dir",
@@ -93,6 +105,12 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
     if not SAFE_SLUG.fullmatch(slug):
         raise SystemExit(f"unsafe slug: {slug!r}")
+
+    if args.negatives_file and args.negatives_file.exists():
+        for line in args.negatives_file.read_text(encoding="utf-8").splitlines():
+            phrase = line.strip()
+            if phrase and not phrase.startswith("#"):
+                negatives.append(phrase)
 
     negatives.extend(args.negative)
     negatives = dedupe([item.strip() for item in negatives if item.strip()])

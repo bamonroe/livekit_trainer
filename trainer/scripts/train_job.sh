@@ -70,6 +70,11 @@ CONFIG="trainer/configs/$SLUG.yaml"
 gen_args=(--slug "$SLUG" --phrase "$PHRASE" --out "$CONFIG"
   --steps "$STEPS" --model-size "$MODEL_SIZE" --target-fp-per-hour "$TARGET_FP_PER_HOUR"
   --real-samples-dir "$REAL_SAMPLES_DIR")
+# Durable hard negatives: the app regenerates this config on every run, so the
+# curated near-miss list lives in a sidecar file and is always fed back in
+# rather than being silently overwritten to empty.
+NEGATIVES_FILE="trainer/configs/$SLUG.negatives.txt"
+[ -f "$NEGATIVES_FILE" ] && gen_args+=(--negatives-file "$NEGATIVES_FILE")
 [ "$PERSONAL" = "1" ] && gen_args+=(--personal)
 [ -n "$N_SAMPLES" ] && gen_args+=(--n-samples "$N_SAMPLES")
 [ -n "$N_SAMPLES_VAL" ] && gen_args+=(--n-samples-val "$N_SAMPLES_VAL")

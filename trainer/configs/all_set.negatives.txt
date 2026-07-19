@@ -1,0 +1,18 @@
+# Hard negatives for the "all set" wake word: near-miss phrases that must
+# never trigger. Durable source of truth — the app's train tab regenerates
+# the YAML on every run, and train_job.sh feeds this file back in so these
+# are never dropped. One phrase per line; # comments and blank lines ignored.
+oil set
+all let
+all get
+all met
+all net
+all bet
+all yet
+all seat
+all sent
+wall set
+hall set
+paul set
+off set
+all not set
