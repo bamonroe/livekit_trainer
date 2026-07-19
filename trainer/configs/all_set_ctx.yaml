@@ -1,0 +1,60 @@
+# all_set retrain with the leading-context augmentation fix.
+#
+# The stock trainer places every positive at the end of a 2s window and
+# zero-fills the ~1s in front (livekit.wakeword.data.augment.align_clip_to_end).
+# Pure digital silence before the phrase is a cue that never occurs on a live
+# mic, so the previous all_set model scored 99.8% on silence-padded eval clips
+# but ~1% on the same phrase spoken mid-sentence (see streaming-recall-gap).
+#
+# trainer/patches/augment_ctxfix.py re-mixes background across the full window
+# AFTER placement, so the leading region carries real sound. background_paths
+# below point at our own ordinary-speech negatives (leading *speech* context)
+# and ambient background, so positives learn to fire when preceded by sound.
+# Mount the patch over the installed module when running this config; use
+# trainer/scripts/train_ctxfix.sh.
+model_name: "all_set"
+target_phrases:
+  - "all set"
+
+custom_negative_phrases:
+  - "oil set"
+  - "all let"
+  - "all get"
+  - "all met"
+  - "all net"
+  - "all bet"
+  - "all yet"
+  - "all seat"
+  - "all sent"
+  - "wall set"
+  - "hall set"
+  - "paul set"
+  - "off set"
+  - "all not set"
+
+data_dir: "./data"
+output_dir: "./output"
+real_samples_dir: "./data/train"
+
+model:
+  model_type: "conv_attention"
+  model_size: "medium"
+
+augmentation:
+  # Fill the leading context of positives with real sound instead of zeros: the
+  # trainer's own 774 ambient-noise files (general noise robustness), our own
+  # ordinary-speech negatives (leading *speech* context — the case the old model
+  # missed), and our ambient background takes. mix_with_background picks one at
+  # random per clip, so positives see a healthy mix of noise- and speech-preceded
+  # windows.
+  background_paths:
+    - "./data/backgrounds"
+    - "./data/train/all_set/negative"
+    - "./data/real/all_set/background"
+
+# Larger synthetic pool for diversity now that the front is no longer a trivial
+# constant; more steps to converge on the harder (realistic) positives.
+n_samples: 50000
+n_samples_val: 8000
+steps: 120000
+target_fp_per_hour: 0.2

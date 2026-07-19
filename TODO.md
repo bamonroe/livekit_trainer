@@ -39,6 +39,20 @@ discovered. Prefer small, actionable items with clear status.
   [streaming-recall-gap]: 99.8% synthetic recall but ~1% in continuous real
   speech; fires ~0.99 only under `reset`.
 
+- [~] Fix the streaming-recall gap at its root (retrain in progress). Root cause:
+  `livekit.wakeword.data.augment.align_clip_to_end` **zero-fills** the ~1s in
+  front of every positive, so the model learns "dead-silent front → wake word",
+  a cue that never occurs on a live mic. Fix = `trainer/patches/augment_ctxfix.py`
+  re-mixes background across the full 2s window after placement, with
+  `background_paths` pointing at ambient noise + our ordinary-speech negatives so
+  positives learn to fire when preceded by speech. Run with
+  `trainer/scripts/train_ctxfix.sh trainer/configs/all_set_ctx.yaml` (mounts the
+  patch; no image rebuild). Old silence-pad model backed up at
+  `output/all_set_prev_silencepad/`. Validated mechanically (augmented `_r0`
+  leads non-zero); **must verify streaming recall with the `/score` full-mode
+  harness on real bulk recordings, not the synthetic eval.** See
+  [context-fix-augmentation].
+
 - [ ] Test bulk scripted collection with real phone recordings and tune slice
   padding, negative sampling, and review output. See
   `docs/BULK_SCRIPTED_COLLECTION.md`.

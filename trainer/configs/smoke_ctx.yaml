@@ -1,0 +1,28 @@
+# Tiny end-to-end validation of the leading-context augmentation fix.
+# Exercises real_samples_dir + speech/ambient background_paths + the mounted
+# augment_ctxfix.py patch, then trains a few steps to confirm nothing breaks.
+model_name: smoke_ctx
+target_phrases:
+  - "all set"
+
+custom_negative_phrases:
+  - "all bet"
+  - "ordinary sentence"
+
+data_dir: ./data
+output_dir: ./output
+real_samples_dir: ./data/train
+
+model:
+  model_type: conv_attention
+  model_size: tiny
+
+augmentation:
+  background_paths:
+    - "./data/train/all_set/negative"
+    - "./data/real/all_set/background"
+
+n_samples: 60
+n_samples_val: 12
+steps: 20
+target_fp_per_hour: 1.0
