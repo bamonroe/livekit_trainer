@@ -32,9 +32,8 @@ class ScoreCurveView(context: Context) : View(context) {
     // Shaded band where the LiveKit engine would actually fire at the current
     // threshold + width, colored by whether Whisper agrees, and the marker for
     // where Whisper located the phrase.
-    private var fireColor = Color.argb(64, 245, 158, 66) // agreement (Whisper too)
-    private var modelOnlyColor = Color.argb(95, 150, 70, 205) // model caught, Whisper missed
-    private var falseAlarmColor = Color.argb(45, 140, 140, 140) // low-confidence noise
+    private var fireColor = Color.argb(64, 245, 158, 66) // LiveKit fire band
+    private var fireMarkColor = Color.rgb(230, 130, 20) // solid orange, where a fire starts
     private var whisperColor = Color.rgb(90, 100, 210)
 
     private val density = resources.displayMetrics.density
@@ -140,16 +139,11 @@ class ScoreCurveView(context: Context) : View(context) {
         // Shaded band wherever the LiveKit engine would actually fire at the
         // current threshold + width — the events that drive the counts. Drawn
         // behind the curve so the trace still reads on top. This is where a real
-        // trigger would land, lag and all.
+        // trigger would land, lag and all. Bands merge so they never overlap: one
+        // firing decision per window.
         val events = ScoreEvents.events(timesMs, scores, threshold, windowMs)
-        val windows = ScoreEvents.windows(targets)
         for (event in events) {
-            val inWhisper = windows.any { event.startMs <= it.second && event.endMs >= it.first }
-            firePaint.color = when {
-                inWhisper -> fireColor
-                event.peak >= ScoreEvents.MODEL_ONLY_CONFIDENCE -> modelOnlyColor
-                else -> falseAlarmColor
-            }
+            firePaint.color = fireColor
             val xl = xForMs(event.startMs)
             val xr = xForMs(event.endMs)
             canvas.drawRect(xl, padT, maxOf(xr, xl + dp(1.5f)), padT + plotH, firePaint)
@@ -188,6 +182,22 @@ class ScoreCurveView(context: Context) : View(context) {
             trianglePath.close()
             canvas.drawPath(trianglePath, whisperFill)
             canvas.drawLine(x, padT, x, padT + plotH, whisperPaint)
+        }
+
+        // LiveKit fire markers: a solid orange upward triangle at the bottom edge
+        // where each firing decision begins. The band under the thick trace is
+        // easy to lose, so this pins the exact start of every fire. One per
+        // merged event, so it never doubles up inside a window.
+        firePaint.color = fireMarkColor
+        val fireBase = padT + plotH
+        for (event in events) {
+            val x = xForMs(event.startMs)
+            trianglePath.reset()
+            trianglePath.moveTo(x - tri, fireBase)
+            trianglePath.lineTo(x + tri, fireBase)
+            trianglePath.lineTo(x, fireBase - tri * 1.4f)
+            trianglePath.close()
+            canvas.drawPath(trianglePath, firePaint)
         }
 
         // Per-utterance model markers: peak dot, colored by whether a

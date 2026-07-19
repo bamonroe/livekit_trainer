@@ -917,9 +917,8 @@ class MainActivity : Activity() {
 
             addView(
                 text(
-                    "Bands = where LiveKit fires; ▾ blue = where Whisper heard the phrase.  " +
-                        "Orange = both agree.  Purple = model caught it, Whisper missed (model-only win).  " +
-                        "Grey = low-confidence false alarm.",
+                    "▴ orange (bottom) = where LiveKit starts firing; the orange band spans that fire.  " +
+                        "▾ blue (top) = where Whisper heard the phrase.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(6)),
