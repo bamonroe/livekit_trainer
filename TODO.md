@@ -7,6 +7,28 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [ ] In-app model-test flow (server-scored, decided). A dedicated "record
+  test" prompt flow in the app, kept **separate** from training data: gives
+  words to say, records one take, Whisper-slices it, and the server scores each
+  cut word so the app can visualize per-word scores. Sliders for detection
+  threshold and silence-pad amount; live true-positive / false-negative /
+  false-positive counts vs Whisper ground truth. Remaining:
+  - [x] Server scoring engine: `runtime/scorer/` HTTP service (mode `full` =
+    continuous rolling window via a dense embedding bank computed once; mode
+    `reset` = silence-pad each step). Validated exact vs `predict()` (~3e-8);
+    `full` 10 ms is ~sub-second, `reset` near real-time at ~40 ms. Compose
+    service `scorer` on :8770, reads `./output`.
+  - [ ] Wire the sync-server to call the scorer for test takes and overlay
+    Whisper word timings into per-word TP/FP/FN.
+  - [ ] Separate "test" recording category/storage so test takes never enter
+    the training pool.
+  - [ ] App: "record test" prompt flow + score-curve/threshold/pad UI.
+  - [ ] Host-runnable unit test for the scorer (currently validated only via
+    the container smoke test).
+  First model under test: `output/all_set/all_set.onnx` — see
+  [streaming-recall-gap]: 99.8% synthetic recall but ~1% in continuous real
+  speech; fires ~0.99 only under `reset`.
+
 - [ ] Test bulk scripted collection with real phone recordings and tune slice
   padding, negative sampling, and review output. See
   `docs/BULK_SCRIPTED_COLLECTION.md`.
