@@ -96,6 +96,16 @@ discovered. Prefer small, actionable items with clear status.
     Verified on the db6f2a54 take: "Detected 1/3 · missed 2 · false alarms 0 ·
     model-only 1" with a purple band. Caveat: a confident trigger on a near-miss
     ("hall set") would also land here; play it back to be sure.
+  - [x] Width slider redefined as a sliding-window firing decision. The old width
+    was a min-plateau filter that *deleted* narrow events and never visibly moved
+    the bands. Now "Detection window" (0–1000 ms, default 150) is a max-pool
+    decision: slide a window that wide, and wherever the model's peak inside it
+    clears the threshold, the whole window fires — so every above-threshold sample
+    lights a band `window` wide and adjacent fires merge. Widening pools context
+    and grows/merges bands; narrowing tightens to raw crossings. `ScoreEvents`
+    rewritten to dilation-by-window/2; threshold + window together are the firing
+    rule a runtime would use. Verified: on 775540ae, 150 ms → 15/16, 719 ms →
+    16/16 with 0 false alarms, bands visibly widening as the slider moves.
   - [x] Cache score curves so re-scoring a take is instant. The expensive step
     is replaying the WAV through the model; the result curve depends only on the
     audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client

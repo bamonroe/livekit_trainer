@@ -20,7 +20,7 @@ class ScoreCurveView(context: Context) : View(context) {
     private var targets: List<ScoreTarget> = emptyList()
     private var domainMs: Double = 1.0
     private var threshold: Double = 0.5
-    private var minWidthMs: Double = 0.0
+    private var windowMs: Double = 0.0
     private var playheadMs: Double = -1.0
 
     private var curveColor = Color.rgb(37, 110, 112)
@@ -99,9 +99,9 @@ class ScoreCurveView(context: Context) : View(context) {
         invalidate()
     }
 
-    /** Minimum plateau width (ms) a run must span to mark a target detected. */
-    fun setMinWidth(value: Double) {
-        minWidthMs = value
+    /** Sliding max-pool window width (ms) for the firing decision. */
+    fun setWindow(value: Double) {
+        windowMs = value
         invalidate()
     }
 
@@ -141,7 +141,7 @@ class ScoreCurveView(context: Context) : View(context) {
         // current threshold + width — the events that drive the counts. Drawn
         // behind the curve so the trace still reads on top. This is where a real
         // trigger would land, lag and all.
-        val events = ScoreEvents.events(timesMs, scores, threshold, minWidthMs)
+        val events = ScoreEvents.events(timesMs, scores, threshold, windowMs)
         val windows = ScoreEvents.windows(targets)
         for (event in events) {
             val inWhisper = windows.any { event.startMs <= it.second && event.endMs >= it.first }

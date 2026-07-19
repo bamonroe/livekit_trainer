@@ -99,7 +99,7 @@ class MainActivity : Activity() {
     // detection. A real wake word paints a wide plateau; a spurious blip is a
     // tick or two. Filters those spikes without touching the curve. See
     // [ScoreEvents].
-    private var scoreMinWidthMs: Double = 80.0
+    private var scoreWindowMs: Double = 150.0
     // Scoring mode: "full" = continuous rolling window (honest streaming test),
     // "reset" = silence-padded per step (matches isolated-clip training).
     private var scoreMode: String = "full"
@@ -905,7 +905,7 @@ class MainActivity : Activity() {
                 )
                 setData(result.timesMs, result.scores, result.targets, result.durationMs)
                 setThreshold(scoreThreshold)
-                setMinWidth(scoreMinWidthMs)
+                setWindow(scoreWindowMs)
                 layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             }
             scoreCurveView = curve
@@ -946,19 +946,19 @@ class MainActivity : Activity() {
             )
 
             addView(
-                text("Minimum detection width  ${scoreMinWidthMs.toInt()} ms", 13f, mutedColor())
+                text("Detection window  ${scoreWindowMs.toInt()} ms", 13f, mutedColor())
                     .withTop(dp(10)),
             )
             val widthLabel = getChildAt(childCount - 1) as TextView
             addView(
                 SeekBar(this@MainActivity).apply {
-                    max = 300
-                    progress = scoreMinWidthMs.toInt().coerceIn(0, 300)
+                    max = 1000
+                    progress = scoreWindowMs.toInt().coerceIn(0, 1000)
                     setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                         override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
-                            scoreMinWidthMs = value.toDouble()
-                            widthLabel.text = "Minimum detection width  $value ms"
-                            scoreCurveView?.setMinWidth(scoreMinWidthMs)
+                            scoreWindowMs = value.toDouble()
+                            widthLabel.text = "Detection window  $value ms"
+                            scoreCurveView?.setWindow(scoreWindowMs)
                             scoreCountsText?.text = scoreCountsSummary(result, scoreThreshold)
                         }
 
@@ -993,9 +993,10 @@ class MainActivity : Activity() {
             addView(
                 text(
                     "Slide the threshold to see how many wake words the model keeps and how many false alarms it adds. " +
-                        "Minimum detection width ignores narrow spikes: a run must stay above the line this long to count, " +
-                        "so brief blips stop registering. Re-score fresh bypasses the cached curve so a changed backend " +
-                        "is re-run. Nothing here is added to your training data.",
+                        "Detection window is the decision width: slide a window this wide, and wherever the model's peak " +
+                        "inside it clears the threshold, that whole window counts as a fire (a band). Widen it to pool " +
+                        "context and merge nearby fires; narrow it to tighten to the raw crossings. Re-score fresh bypasses " +
+                        "the cached curve so a changed backend is re-run. Nothing here is added to your training data.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(10)),
@@ -1009,7 +1010,7 @@ class MainActivity : Activity() {
      * re-hitting the server — the curve is fixed, only its reading changes.
      */
     private fun scoreCountsSummary(result: ScoreResult, threshold: Double): String {
-        val events = ScoreEvents.events(result.timesMs, result.scores, threshold, scoreMinWidthMs)
+        val events = ScoreEvents.events(result.timesMs, result.scores, threshold, scoreWindowMs)
         val t = ScoreEvents.tally(result.targets, events)
         val base = "Detected ${t.detected}/${result.targets.size} · missed ${t.missed} · false alarms ${t.falseAlarms}"
         // Only mention the model-only wins when there are any, so the common case
@@ -1047,7 +1048,7 @@ class MainActivity : Activity() {
                     scoreProjectSlug = project.slug
                     scoreResult = result
                     loadingScore = false
-                    val events = ScoreEvents.events(result.timesMs, result.scores, scoreThreshold, scoreMinWidthMs)
+                    val events = ScoreEvents.events(result.timesMs, result.scores, scoreThreshold, scoreWindowMs)
                     val detected = ScoreEvents.detectedFlags(result.targets, events).count { it }
                     statusMessage =
                         "Detected $detected/${result.targets.size} wake words in $modeLabel mode"

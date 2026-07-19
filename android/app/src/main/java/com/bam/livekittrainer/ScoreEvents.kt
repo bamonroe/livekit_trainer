@@ -1,13 +1,15 @@
 package com.bam.livekittrainer
 
 /**
- * Turns the raw rolling score curve into discrete detection *events*.
+ * Turns the raw rolling score curve into discrete detection *events* — the
+ * firing decision a real runtime would make.
  *
- * The scanner scores every ~10 ms, so a single spoken wake word paints a whole
- * run of consecutive above-threshold ticks (a plateau), while spurious blips are
- * only a tick or two wide. An "event" is one contiguous above-threshold run; the
- * [minWidthMs] gate drops runs narrower than that, so a real plateau survives but
- * a one-tick spike is ignored. This is the width filter the Test tab exposes.
+ * The scanner scores every ~10 ms. To decide "the model fired here" we slide a
+ * window of width [windowMs] over the curve: wherever the *maximum* score inside
+ * that window clears the threshold, the whole window is considered firing.
+ * Adjacent firing windows merge into one event, whose span is the fired band and
+ * whose peak is the highest score inside. Widening the window pools more context
+ * and grows/merges the bands; narrowing it tightens them to the raw crossings.
  */
 object ScoreEvents {
     data class Event(
@@ -38,40 +40,45 @@ object ScoreEvents {
         }
 
     /**
-     * Contiguous runs of `score >= threshold` whose time span is at least
-     * [minWidthMs]. Times/scores are parallel arrays from the score curve.
+     * Sliding-window max-pool firing decision. Every sample that clears the
+     * threshold lights a band of width [windowMs] centered on it (±windowMs/2);
+     * overlapping bands merge, so a run of crossings becomes one wide event and
+     * an isolated crossing becomes a band exactly [windowMs] wide. The event's
+     * peak is the highest score among the crossings inside it. Times/scores are
+     * parallel arrays from the score curve.
      */
     fun events(
         timesMs: List<Double>,
         scores: List<Double>,
         threshold: Double,
-        minWidthMs: Double,
+        windowMs: Double,
     ): List<Event> {
+        val half = windowMs / 2.0
         val out = ArrayList<Event>()
         val n = minOf(timesMs.size, scores.size)
-        var i = 0
-        while (i < n) {
-            if (scores[i] < threshold) {
-                i++
-                continue
-            }
-            var j = i
-            var peak = scores[i]
-            var peakMs = timesMs[i]
-            while (j < n && scores[j] >= threshold) {
-                if (scores[j] > peak) {
-                    peak = scores[j]
-                    peakMs = timesMs[j]
+        var start = Double.NaN
+        var end = Double.NaN
+        var peak = 0.0
+        var peakMs = 0.0
+        for (i in 0 until n) {
+            if (scores[i] < threshold) continue
+            val lo = timesMs[i] - half
+            val hi = timesMs[i] + half
+            when {
+                start.isNaN() -> {
+                    start = lo; end = hi; peak = scores[i]; peakMs = timesMs[i]
                 }
-                j++
+                lo <= end -> {
+                    end = maxOf(end, hi)
+                    if (scores[i] > peak) { peak = scores[i]; peakMs = timesMs[i] }
+                }
+                else -> {
+                    out.add(Event(maxOf(start, 0.0), end, peakMs, peak))
+                    start = lo; end = hi; peak = scores[i]; peakMs = timesMs[i]
+                }
             }
-            val startMs = timesMs[i]
-            val endMs = timesMs[j - 1]
-            if (endMs - startMs >= minWidthMs) {
-                out.add(Event(startMs, endMs, peakMs, peak))
-            }
-            i = j
         }
+        if (!start.isNaN()) out.add(Event(maxOf(start, 0.0), end, peakMs, peak))
         return out
     }
 
