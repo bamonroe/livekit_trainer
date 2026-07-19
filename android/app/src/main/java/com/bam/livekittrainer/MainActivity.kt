@@ -1453,8 +1453,12 @@ class MainActivity : Activity() {
         val basedOn = status.optInt("based_on_runs", 0)
         return buildString {
             append("State: $label")
-            if (state == "running" && step.isNotBlank()) append("  ·  step: $step")
             val progress = status.optJSONObject("progress")
+            val activeStep = progress?.optInt("active_step", 0) ?: 0
+            // The coarse `step` (assemble/setup/train…) is only useful before the
+            // six-stage pipeline starts; once a pipeline stage is active the
+            // granular view below replaces it, so don't show both.
+            if (state == "running" && step.isNotBlank() && activeStep == 0) append("  ·  step: $step")
             if (progress != null && (state == "running" || state == "starting" || state == "succeeded")) {
                 val overall = progress.optInt("overall_percent", 0)
                 append("  ·  ${overall}% overall")
