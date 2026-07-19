@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Per-take capture provenance forwarded by the app: which device and input
 /// route recorded it, the mic's native format before the app's 16 kHz mono
@@ -258,6 +258,31 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             state         TEXT NOT NULL,
             UNIQUE(slug, started_at)
         );
+
+        -- One row per trained model artifact, versioned by run_id so retraining a
+        -- wake word never overwrites prior models. Linked to the wake word by a
+        -- real foreign key; the current live model (the one behind
+        -- output/<slug>/<slug>.onnx) is flagged with is_current = 1.
+        CREATE TABLE IF NOT EXISTS models (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug          TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
+            run_id        TEXT NOT NULL,
+            onnx_path     TEXT NOT NULL,
+            onnx_sha256   TEXT,
+            pt_sha256     TEXT,
+            steps         INTEGER,
+            model_size    TEXT,
+            personal      INTEGER NOT NULL DEFAULT 0,
+            git_commit    TEXT,
+            metrics       TEXT,
+            started_at    TEXT,
+            finished_at   TEXT,
+            created_at_ms INTEGER NOT NULL,
+            is_current    INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(slug, run_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_models_slug ON models(slug, created_at_ms DESC);
 
         CREATE INDEX IF NOT EXISTS idx_slices_project ON slices(project_slug, status);
         CREATE INDEX IF NOT EXISTS idx_slices_recording ON slices(recording_id, status);
@@ -710,6 +735,68 @@ pub fn record_training_run(
     Ok(changed > 0)
 }
 
+/// A trained model artifact to record, gathered from a run's manifest and the
+/// terminal training status. Every optional field tolerates an older run whose
+/// manifest predates that field.
+#[derive(Debug, Clone, Default)]
+pub struct ModelRecord {
+    pub slug: String,
+    pub phrase: String,
+    pub run_id: String,
+    pub onnx_path: String,
+    pub onnx_sha256: Option<String>,
+    pub pt_sha256: Option<String>,
+    pub steps: Option<i64>,
+    pub model_size: Option<String>,
+    pub personal: bool,
+    pub git_commit: Option<String>,
+    pub metrics: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// Record a versioned trained model. Ensures the wake word exists, inserts the
+/// model row (idempotent on `(slug, run_id)` so it is safe to call on every
+/// status poll), and when `make_current` is set flips this run to the sole
+/// current model for the wake word. Returns true if a new model row was added.
+pub fn record_model(
+    conn: &Connection,
+    model: &ModelRecord,
+    now_ms: i64,
+    make_current: bool,
+) -> Result<bool, rusqlite::Error> {
+    upsert_project(conn, &model.slug, &model.phrase, None, now_ms)?;
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO models
+            (slug, run_id, onnx_path, onnx_sha256, pt_sha256, steps, model_size,
+             personal, git_commit, metrics, started_at, finished_at, created_at_ms, is_current)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+        params![
+            model.slug,
+            model.run_id,
+            model.onnx_path,
+            model.onnx_sha256,
+            model.pt_sha256,
+            model.steps,
+            model.model_size,
+            model.personal as i64,
+            model.git_commit,
+            model.metrics,
+            model.started_at,
+            model.finished_at,
+            now_ms,
+        ],
+    )?;
+    if make_current {
+        conn.execute(
+            "UPDATE models SET is_current = CASE WHEN run_id = ?2 THEN 1 ELSE 0 END
+             WHERE slug = ?1",
+            params![model.slug, model.run_id],
+        )?;
+    }
+    Ok(changed > 0)
+}
+
 /// Average milliseconds per training step from past *successful* runs, preferring
 /// the same model size and falling back to all sizes when that size has no
 /// history. Returns (avg_ms_per_step, run_count), or None when there is no data.
@@ -1005,6 +1092,47 @@ mod tests {
         assert_eq!(background.id, "background_200_b");
         assert_eq!(background.background_count, 1);
         assert_eq!(background.device_model.as_deref(), Some("SM-P620"));
+    }
+
+    #[test]
+    fn record_model_versions_and_tracks_current() {
+        let conn = test_conn();
+        let mut m = ModelRecord {
+            slug: "all_set".to_string(),
+            phrase: "all set".to_string(),
+            run_id: "20260719T120000Z".to_string(),
+            onnx_path: "runs/20260719T120000Z/all_set.onnx".to_string(),
+            onnx_sha256: Some("aaa".to_string()),
+            steps: Some(50_000),
+            model_size: Some("medium".to_string()),
+            ..Default::default()
+        };
+        assert!(record_model(&conn, &m, 0, true).expect("first model"));
+        // Idempotent on (slug, run_id): a repeat poll adds nothing.
+        assert!(!record_model(&conn, &m, 1, true).expect("repeat"));
+
+        // A second run becomes current and demotes the first.
+        m.run_id = "20260719T130000Z".to_string();
+        m.onnx_sha256 = Some("bbb".to_string());
+        assert!(record_model(&conn, &m, 2, true).expect("second model"));
+
+        let current: String = conn
+            .query_row(
+                "SELECT run_id FROM models WHERE slug = 'all_set' AND is_current = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("one current");
+        assert_eq!(current, "20260719T130000Z");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM models WHERE slug = 'all_set'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(total, 2);
+        // The project row was created by the model insert's foreign-key upsert.
+        let phrase = project_phrase(&conn, "all_set").expect("q").expect("row");
+        assert_eq!(phrase.0, "all set");
     }
 
     #[test]

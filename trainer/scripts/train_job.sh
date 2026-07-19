@@ -34,6 +34,10 @@ STATUS="$OUT_DIR/train_status.json"
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 STARTED="$(now)"
+# Compact, filesystem-safe run id derived from the start instant, e.g.
+# 20260719T153000Z. Each run archives its artifacts under output/<slug>/runs/<RUNID>/
+# so retraining never overwrites a prior model.
+RUNID="$(printf '%s' "$STARTED" | tr -d ':-')"
 
 # Escape a value for embedding inside a JSON string (backslash and quote only;
 # the fields here never carry control characters).
@@ -45,7 +49,7 @@ write_status() {
   esc_msg="$(json_escape "$4")"
   esc_phrase="$(json_escape "$PHRASE")"
   cat > "$STATUS" <<EOF
-{"slug":"$SLUG","phrase":"$esc_phrase","state":"$1","step":"$2","exit_code":$3,"message":"$esc_msg","steps":$STEPS,"model_size":"$MODEL_SIZE","personal":$([ "$PERSONAL" = "1" ] && echo true || echo false),"started_at":"$STARTED","updated_at":"$(now)"}
+{"slug":"$SLUG","phrase":"$esc_phrase","state":"$1","step":"$2","exit_code":$3,"message":"$esc_msg","steps":$STEPS,"model_size":"$MODEL_SIZE","personal":$([ "$PERSONAL" = "1" ] && echo true || echo false),"run_id":"$RUNID","started_at":"$STARTED","updated_at":"$(now)"}
 EOF
 }
 
@@ -90,5 +94,35 @@ livekit-wakeword setup -c "$CONFIG" >>"$LOG" 2>&1 || fail setup $? "setup failed
 write_status "running" "train" 0 "training ($STEPS steps)"
 livekit-wakeword run "$CONFIG" >>"$LOG" 2>&1 || fail train $? "training failed"
 
-write_status "succeeded" "done" 0 "model written to $OUT_DIR"
+# 5. Archive this run: snapshot the model artifacts into a timestamped folder
+# with checksums and a manifest, so the series of models for this wake word is
+# retained and comparable. The live path (output/<slug>/<slug>.onnx) is left in
+# place so the scorer, app, and status endpoints keep reading it unchanged; a
+# CURRENT marker records which run it corresponds to.
+write_status "running" "archive" 0 "archiving run $RUNID"
+RUN_DIR="$OUT_DIR/runs/$RUNID"
+mkdir -p "$RUN_DIR"
+
+sha256() { [ -f "$1" ] && sha256sum "$1" | awk '{print $1}' || true; }
+
+for f in "$SLUG.onnx" "$SLUG.pt" "${SLUG}_metrics.json" "${SLUG}_eval.json" "${SLUG}_det.png"; do
+  [ -f "$OUT_DIR/$f" ] && cp -p "$OUT_DIR/$f" "$RUN_DIR/"
+done
+[ -f "$CONFIG" ] && cp -p "$CONFIG" "$RUN_DIR/config.yaml"
+[ -f "$NEGATIVES_FILE" ] && cp -p "$NEGATIVES_FILE" "$RUN_DIR/negatives.txt"
+
+ONNX_SHA="$(sha256 "$OUT_DIR/$SLUG.onnx")"
+PT_SHA="$(sha256 "$OUT_DIR/$SLUG.pt")"
+GIT_COMMIT="$(git -C /work rev-parse HEAD 2>/dev/null || echo unknown)"
+FINISHED="$(now)"
+esc_phrase_m="$(json_escape "$PHRASE")"
+
+cat > "$RUN_DIR/manifest.json" <<EOF
+{"slug":"$SLUG","phrase":"$esc_phrase_m","run_id":"$RUNID","onnx_path":"runs/$RUNID/$SLUG.onnx","onnx_sha256":"$ONNX_SHA","pt_sha256":"$PT_SHA","steps":$STEPS,"model_size":"$MODEL_SIZE","personal":$([ "$PERSONAL" = "1" ] && echo true || echo false),"positive_boost":$POSITIVE_BOOST,"target_fp_per_hour":$TARGET_FP_PER_HOUR,"git_commit":"$GIT_COMMIT","started_at":"$STARTED","finished_at":"$FINISHED"}
+EOF
+
+printf '%s\n' "$RUNID" > "$OUT_DIR/CURRENT"
+echo "== archived run $RUNID (onnx sha256 ${ONNX_SHA:-none}) ==" | tee -a "$LOG"
+
+write_status "succeeded" "done" 0 "model written to $OUT_DIR (run $RUNID)"
 echo "== done: model in $OUT_DIR ==" | tee -a "$LOG"

@@ -1162,6 +1162,47 @@ fn model_fingerprint(models_root: &Path, slug: &str) -> String {
     format!("{}-{}", meta.len(), mtime)
 }
 
+/// A run id is a compact UTC timestamp like `20260719T153000Z`; restrict it to
+/// ASCII alphanumerics so it can never escape the run directory.
+fn is_safe_run_id(run_id: &str) -> bool {
+    !run_id.is_empty() && run_id.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+/// Read a finished run's manifest (and its metrics sidecar) into a `ModelRecord`,
+/// merging in the fields already parsed from the training status body. Returns
+/// None if the run id is unsafe or the manifest is missing/unreadable.
+fn read_model_manifest(
+    models_root: &Path,
+    slug: &str,
+    run_id: &str,
+    status: &Value,
+) -> Option<db::ModelRecord> {
+    if !is_safe_slug(slug) || !is_safe_run_id(run_id) {
+        return None;
+    }
+    let run_dir = models_root.join(slug).join("runs").join(run_id);
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).ok()?).ok()?;
+    let metrics = fs::read_to_string(run_dir.join(format!("{slug}_metrics.json"))).ok();
+    let mstr = |k: &str| manifest.get(k).and_then(Value::as_str).map(str::to_string);
+    let sstr = |k: &str| status.get(k).and_then(Value::as_str).map(str::to_string);
+    Some(db::ModelRecord {
+        slug: slug.to_string(),
+        phrase: sstr("phrase").unwrap_or_default(),
+        run_id: run_id.to_string(),
+        onnx_path: mstr("onnx_path").unwrap_or_else(|| format!("runs/{run_id}/{slug}.onnx")),
+        onnx_sha256: mstr("onnx_sha256"),
+        pt_sha256: mstr("pt_sha256"),
+        steps: status.get("steps").and_then(Value::as_i64),
+        model_size: sstr("model_size"),
+        personal: status.get("personal").and_then(Value::as_bool).unwrap_or(false),
+        git_commit: mstr("git_commit"),
+        metrics,
+        started_at: sstr("started_at"),
+        finished_at: mstr("finished_at").or_else(|| sstr("updated_at")),
+    })
+}
+
 /// POST the WAV to the scorer service and parse its rolling-score curve.
 async fn run_scorer(
     scorer_url: &str,
@@ -3543,6 +3584,21 @@ async fn training_status(
                     duration_ms,
                     &run_state,
                 );
+            }
+        }
+
+        // A succeeded run leaves a versioned, checksummed artifact folder and a
+        // manifest under output/<slug>/runs/<run_id>/. Fold that into the models
+        // table so every trained model is retained and queryable, and flag this
+        // freshly finished run as the current live model. Idempotent on the poll.
+        if run_state == "succeeded" {
+            if let Some(run_id) = body.get("run_id").and_then(Value::as_str) {
+                if let Some(model) =
+                    read_model_manifest(&state.models_root, &slug, run_id, &body)
+                {
+                    let conn = state.db.lock().expect("db lock poisoned");
+                    let _ = db::record_model(&conn, &model, now_ms(), true);
+                }
             }
         }
     }
