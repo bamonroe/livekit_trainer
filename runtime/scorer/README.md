@@ -66,9 +66,9 @@ mid-sentence recall, `reset` shows the training-time (silence-padded) view.
 ## Run
 
 ```bash
-docker compose up -d --build scorer      # serves on :8770, reads ./output
-curl -s localhost:8770/health
-curl -s -F file=@take.wav -F slug=all_set -F mode=reset localhost:8770/score
+docker compose up -d --build scorer      # host :8780 -> container :8770, reads ./output
+curl -s localhost:8780/health
+curl -s -F file=@take.wav -F slug=all_set -F mode=reset localhost:8780/score
 ```
 
 Notes: `full` mode needs ≥2 s of audio to produce any points (it can't form a
