@@ -3281,6 +3281,14 @@ const TRAIN_STEPS: [&str; 6] = [
 /// rather than step count. Training dominates. Sums to 100.
 const TRAIN_STEP_WEIGHTS: [u32; 6] = [10, 12, 10, 53, 5, 10];
 
+/// Where each stage does its heavy compute, surfaced so the app can tag each
+/// step "C" (CPU) or "G" (GPU). Verified against the installed trainer source:
+/// synthesis (VITS/VoxCPM via get_device()->cuda), training, and evaluation run
+/// on the GPU. Feature extraction runs on CPU — the mel/embedding ONNX sessions
+/// are pinned to CPUExecutionProvider. Clip augmentation (parallelized sox
+/// effects) and ONNX export are CPU.
+const TRAIN_STEP_DEVICES: [&str; 6] = ["gpu", "cpu", "cpu", "gpu", "cpu", "gpu"];
+
 /// Read only the last `max_bytes` of a file — the trainer log grows to many MB,
 /// and the recent tail is all we need to locate the current stage.
 fn read_tail_bytes(path: &std::path::Path, max_bytes: u64) -> Option<String> {
@@ -3405,7 +3413,7 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
             } else {
                 ("pending", 0u8)
             };
-            json!({ "name": name, "state": st, "percent": percent })
+            json!({ "name": name, "state": st, "percent": percent, "device": TRAIN_STEP_DEVICES[i] })
         })
         .collect();
 

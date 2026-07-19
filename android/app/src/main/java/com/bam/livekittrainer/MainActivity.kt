@@ -1469,7 +1469,12 @@ class MainActivity : Activity() {
                             "active" -> "▶"
                             else -> "·"
                         }
-                        append("\n  $glyph $name")
+                        val device = when (s.optString("device", "")) {
+                            "gpu" -> "[G]"
+                            "cpu" -> "[C]"
+                            else -> "   "
+                        }
+                        append("\n  $glyph $device $name")
                         if (s.optString("state") == "active") append("  ${stepPct}%")
                     }
                     val activeLabel = progress.optString("active_label", "")
