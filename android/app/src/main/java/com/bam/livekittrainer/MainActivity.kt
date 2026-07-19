@@ -1603,7 +1603,7 @@ class MainActivity : Activity() {
                         PromptGenerator.STYLE_STREAM ->
                             "Stream: read a long run of ever-changing words drawn frequency-weighted from the whole lexicon, with the wake phrase dropped in at intervals. Maximum variety, so no filler word repeats across takes."
                         PromptGenerator.STYLE_DENSE ->
-                            "Dense: short, varied ways to say the wake phrase back to back, with frequent near misses. Many positives per minute."
+                            "Dense: short, varied ways to say the wake phrase with a few genuinely random words between each one and frequent near misses. Many positives per minute, without a long march of filler."
                         else ->
                             "Prose: wake phrase woven into full sentences. More natural negatives, but slower to gather positives."
                     },

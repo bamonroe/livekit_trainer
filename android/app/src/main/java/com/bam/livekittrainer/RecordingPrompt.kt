@@ -74,11 +74,13 @@ object PromptGenerator {
 
     /**
      * A positive-dense script: mostly short, prosodically varied ways to say the
-     * wake phrase itself, with near-miss hard negatives folded in frequently and
-     * only a light sprinkle of neutral filler. This packs many true positives and
-     * hard negatives into far less speaking time than the prose script, while the
-     * rotating carrier styles keep the speaker off a fixed cadence. The trainer
-     * already floods itself with generic negatives, so ordinary filler is minimal.
+     * wake phrase itself, with near-miss hard negatives folded in frequently and,
+     * between each one, a *short* run of genuinely random words drawn from the
+     * whole lexicon. Unlike the full word stream, the filler here is only a few
+     * words per gap, so the take stays dense with positives and hard negatives
+     * instead of turning into a long march of random words. The random filler
+     * still gives each wake utterance real surrounding speech (good context for
+     * the streaming-recall fix) without any fixed carrier sentence repeating.
      */
     private fun denseBulkScript(
         phrase: String,
@@ -98,25 +100,31 @@ object PromptGenerator {
             }
             return hardNegatives.removeAt(0)
         }
-        val script = buildList {
-            // One short warmup line so mic level settles before the first positive.
-            add(bulkNeutralSentence(lexicon, random, phrase))
-            repeat(placementCount) { index ->
-                add(compactWakeLine(phrase, random, index))
-                // A near-miss after roughly every other positive.
-                if (index % 2 == 1) {
-                    nextHardNegative()?.let { nearMiss ->
-                        usedHardNegatives.add(nearMiss)
-                        add(compactHardNegativeLine(nearMiss, random))
-                    }
-                }
-                // A little ordinary speech every fifth positive for variety.
-                if (index % 5 == 4) {
-                    add(bulkNeutralSentence(lexicon, random, phrase))
+
+        val lines = mutableListOf<String>()
+        // A few genuinely random words between wake words — enough to surround the
+        // wake with real speech, but nowhere near the long word-stream style.
+        fun emitShortRun(wordCount: Int) {
+            val words = lexicon.frequencyWeightedStream(phrase, random, wordCount)
+            if (words.isNotEmpty()) lines.add(words.joinToString(" ").sentenceCase())
+        }
+
+        // One short warmup run so mic level settles before the first positive.
+        emitShortRun(3 + random.nextInt(3))
+        repeat(placementCount) { index ->
+            lines.add(compactWakeLine(phrase, random, index))
+            emitShortRun(3 + random.nextInt(4))
+            // A near-miss after roughly every other positive, with its own short
+            // random tail so it doesn't butt straight into the next wake.
+            if (index % 2 == 1) {
+                nextHardNegative()?.let { nearMiss ->
+                    usedHardNegatives.add(nearMiss)
+                    lines.add(compactHardNegativeLine(nearMiss, random))
+                    emitShortRun(2 + random.nextInt(3))
                 }
             }
-        }.joinToString(" ")
-        return BulkScriptContent(script, usedHardNegatives.distinct())
+        }
+        return BulkScriptContent(lines.joinToString(" "), usedHardNegatives.distinct())
     }
 
     private fun compactWakeLine(
