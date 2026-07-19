@@ -17,9 +17,25 @@ object ScoreEvents {
         val peak: Double,
     )
 
-    /** Search band a target's detection may fall in, trailing the phrase end. */
-    fun band(target: ScoreTarget): Pair<Double, Double> =
-        (target.endMs - 100.0) to (target.endMs + 400.0)
+    /** Model firing can land up to ~1s from Whisper's reported word time. */
+    private const val MAX_DRIFT_MS = 1200.0
+
+    /**
+     * One detection search window per target, in time order — matches the
+     * server's `target_windows`. Whisper word timings drift up to ~1s from where
+     * the tail-aligned model fires, so each window spans `end ± MAX_DRIFT_MS`,
+     * clamped to the midpoints between adjacent phrase ends so a dense script's
+     * repeats can't claim each other's firing.
+     */
+    fun windows(targets: List<ScoreTarget>): List<Pair<Double, Double>> =
+        targets.indices.map { k ->
+            val e = targets[k].endMs
+            var lo = e - MAX_DRIFT_MS
+            var hi = e + MAX_DRIFT_MS
+            if (k > 0) lo = maxOf(lo, (targets[k - 1].endMs + e) / 2.0)
+            if (k + 1 < targets.size) hi = minOf(hi, (e + targets[k + 1].endMs) / 2.0)
+            maxOf(lo, 0.0) to hi
+        }
 
     /**
      * Contiguous runs of `score >= threshold` whose time span is at least
@@ -62,21 +78,21 @@ object ScoreEvents {
     private fun overlaps(event: Event, band: Pair<Double, Double>): Boolean =
         event.startMs <= band.second && event.endMs >= band.first
 
-    /** Which targets have a qualifying event inside their search band. */
+    /** Which targets have a qualifying event inside their drift window. */
     fun detectedFlags(
         targets: List<ScoreTarget>,
         events: List<Event>,
-    ): List<Boolean> = targets.map { target ->
-        val b = band(target)
-        events.any { overlaps(it, b) }
+    ): List<Boolean> {
+        val windows = windows(targets)
+        return windows.map { window -> events.any { overlaps(it, window) } }
     }
 
-    /** Events that fall outside every target's band — the false alarms. */
+    /** Events that fall outside every target's window — the false alarms. */
     fun falseAlarms(
         targets: List<ScoreTarget>,
         events: List<Event>,
     ): Int {
-        val bands = targets.map { band(it) }
-        return events.count { event -> bands.none { overlaps(event, it) } }
+        val windows = windows(targets)
+        return events.count { event -> windows.none { overlaps(event, it) } }
     }
 }

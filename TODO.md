@@ -57,6 +57,18 @@ discovered. Prefer small, actionable items with clear status.
     both sliders stay instant. Verified: raising width 80→240 ms cut false alarms
     6→2 (and, over-filtered, real detections 11→8 — the visible tradeoff).
     Deferred siblings: two-threshold hysteresis and a refractory cooldown.
+  - [x] Drift-tolerant target alignment. Whisper word timings drift up to ~1s
+    from where the tail-aligned model actually fires, so the old ±(100..400)ms
+    match window scored real detections as misses (and, worse, counted those
+    same firings as false alarms). `target_windows` now scans `end ± 1200ms`,
+    clamped to the midpoints between adjacent phrase ends so a dense script's
+    back-to-back "all set" can't claim each other's firing; `locate_targets` and
+    `count_false_positives` (server) and `ScoreEvents` (app) all share it. On the
+    775540ae take this moved 13/16→14/16 TP and 6→0 false alarms with no model
+    change — the earlier "misses" were mostly a measurement artifact. Remaining
+    gaps: one borderline 0.49 peak, one genuinely ambiguous pair of wake words
+    ~1.2s apart. Honest recall is high; real remaining work is deployment-noise
+    robustness, not clean-room recall.
   - [x] Cache score curves so re-scoring a take is instant. The expensive step
     is replaying the WAV through the model; the result curve depends only on the
     audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client

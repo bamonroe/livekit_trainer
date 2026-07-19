@@ -1190,34 +1190,67 @@ fn locate_targets(
         return Vec::new();
     }
     let normalized: Vec<String> = words.iter().map(|w| normalize_token(&w.word)).collect();
-    let mut targets = Vec::new();
+    // First pass: locate every phrase occurrence and its Whisper start/end.
+    let mut occ: Vec<(i64, i64, String)> = Vec::new();
     let mut i = 0;
     while i + tokens.len() <= normalized.len() {
         if normalized[i..i + tokens.len()] == tokens[..] {
             let start_ms = words[i].start_ms;
             let end_ms = words[i + tokens.len() - 1].end_ms;
-            // Whisper word timings drift from the audio, so scan a band trailing
-            // the phrase end for the model's response rather than a single point.
-            let (peak_time_ms, peak_score) =
-                peak_in_window(curve, end_ms as f64 - 100.0, end_ms as f64 + 400.0);
-            targets.push(ScoreTarget {
-                text: words[i..i + tokens.len()]
-                    .iter()
-                    .map(|w| w.word.trim())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                start_ms,
-                end_ms,
-                peak_score,
-                peak_time_ms,
-                detected: peak_score >= threshold,
-            });
+            let text = words[i..i + tokens.len()]
+                .iter()
+                .map(|w| w.word.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            occ.push((start_ms, end_ms, text));
             i += tokens.len();
         } else {
             i += 1;
         }
     }
-    targets
+    // Second pass: score each occurrence at the model's peak within its drift
+    // window (neighbor-clamped so dense repeats can't claim each other's firing).
+    let ends: Vec<f64> = occ.iter().map(|(_, end, _)| *end as f64).collect();
+    let windows = target_windows(&ends);
+    occ.into_iter()
+        .zip(windows)
+        .map(|((start_ms, end_ms, text), (lo, hi))| {
+            let (peak_time_ms, peak_score) = peak_in_window(curve, lo, hi);
+            ScoreTarget {
+                text,
+                start_ms,
+                end_ms,
+                peak_score,
+                peak_time_ms,
+                detected: peak_score >= threshold,
+            }
+        })
+        .collect()
+}
+
+/// Model firing can land up to ~1s from Whisper's reported word time.
+const MAX_DRIFT_MS: f64 = 1200.0;
+
+/// One detection search window per located phrase, in time order. Whisper word
+/// timings drift up to ~1s from where the tail-aligned model actually fires, so
+/// each window spans `end ± MAX_DRIFT_MS`. To stop a dense script (many "all
+/// set" a couple seconds apart) from letting neighbors claim the same firing,
+/// each window is clamped to the midpoints between adjacent phrase ends.
+fn target_windows(ends: &[f64]) -> Vec<(f64, f64)> {
+    ends.iter()
+        .enumerate()
+        .map(|(k, &e)| {
+            let mut lo = e - MAX_DRIFT_MS;
+            let mut hi = e + MAX_DRIFT_MS;
+            if k > 0 {
+                lo = lo.max((ends[k - 1] + e) / 2.0);
+            }
+            if k + 1 < ends.len() {
+                hi = hi.min((e + ends[k + 1]) / 2.0);
+            }
+            (lo.max(0.0), hi)
+        })
+        .collect()
 }
 
 /// Highest score (and its time) among curve points within [lo_ms, hi_ms].
@@ -1235,10 +1268,8 @@ fn peak_in_window(curve: &ScorerCurve, lo_ms: f64, hi_ms: f64) -> (f64, f64) {
 /// contiguous run above threshold counts once. A detection whose time falls in
 /// any target's search band is a true positive, not a false one.
 fn count_false_positives(curve: &ScorerCurve, targets: &[ScoreTarget], threshold: f64) -> usize {
-    let bands: Vec<(f64, f64)> = targets
-        .iter()
-        .map(|t| (t.end_ms as f64 - 100.0, t.end_ms as f64 + 400.0))
-        .collect();
+    let ends: Vec<f64> = targets.iter().map(|t| t.end_ms as f64).collect();
+    let bands = target_windows(&ends);
     let mut count = 0;
     let mut in_run = false;
     for (t, s) in curve.times_ms.iter().zip(curve.scores.iter()) {
