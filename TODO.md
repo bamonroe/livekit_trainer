@@ -49,6 +49,14 @@ discovered. Prefer small, actionable items with clear status.
     and source playback with a moving playhead. Nothing on this page touches
     training data. (Note: `reset` "Padded" is a fixed silence-pad, not yet a
     variable pad-amount slider; a variable pad would need a scorer param.)
+  - [x] Minimum-detection-width gate. The scanner scores every ~10 ms, so a real
+    wake word paints a wide plateau while spurious blips are a tick or two.
+    `ScoreEvents` groups the curve into contiguous above-threshold runs and drops
+    any narrower than a live "Minimum detection width" slider (default 80 ms);
+    counts and green/red markers use the surviving events. Client-side only, so
+    both sliders stay instant. Verified: raising width 80→240 ms cut false alarms
+    6→2 (and, over-filtered, real detections 11→8 — the visible tradeoff).
+    Deferred siblings: two-threshold hysteresis and a refractory cooldown.
   - [x] Cache score curves so re-scoring a take is instant. The expensive step
     is replaying the WAV through the model; the result curve depends only on the
     audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client

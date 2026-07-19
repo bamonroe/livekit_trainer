@@ -20,6 +20,7 @@ class ScoreCurveView(context: Context) : View(context) {
     private var targets: List<ScoreTarget> = emptyList()
     private var domainMs: Double = 1.0
     private var threshold: Double = 0.5
+    private var minWidthMs: Double = 0.0
     private var playheadMs: Double = -1.0
 
     private var curveColor = Color.rgb(37, 110, 112)
@@ -84,6 +85,12 @@ class ScoreCurveView(context: Context) : View(context) {
         invalidate()
     }
 
+    /** Minimum plateau width (ms) a run must span to mark a target detected. */
+    fun setMinWidth(value: Double) {
+        minWidthMs = value
+        invalidate()
+    }
+
     fun setPlayhead(ms: Double) {
         playheadMs = ms
         invalidate()
@@ -133,10 +140,13 @@ class ScoreCurveView(context: Context) : View(context) {
         val thrY = yForScore(threshold)
         canvas.drawLine(padL, thrY, padL + plotW, thrY, thresholdPaint)
 
-        // Per-utterance markers: vertical tick + peak dot, colored by whether the
-        // peak clears the current threshold (green = detected, red = missed).
-        for (target in targets) {
-            val detected = target.peakScore >= threshold
+        // Per-utterance markers: vertical tick + peak dot, colored by whether a
+        // qualifying-width plateau clears the threshold in the target's band
+        // (green = detected, red = missed) — same rule as the counts.
+        val events = ScoreEvents.events(timesMs, scores, threshold, minWidthMs)
+        val detectedFlags = ScoreEvents.detectedFlags(targets, events)
+        for ((index, target) in targets.withIndex()) {
+            val detected = detectedFlags.getOrElse(index) { false }
             val color = if (detected) hitColor else missColor
             val x = xForMs(target.peakTimeMs)
             markerPaint.color = color

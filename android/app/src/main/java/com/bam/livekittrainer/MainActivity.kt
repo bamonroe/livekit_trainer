@@ -95,6 +95,11 @@ class MainActivity : Activity() {
     private var scoreResult: ScoreResult? = null
     private var loadingScore: Boolean = false
     private var scoreThreshold: Double = 0.5
+    // Minimum plateau width (ms) an above-threshold run must span to count as a
+    // detection. A real wake word paints a wide plateau; a spurious blip is a
+    // tick or two. Filters those spikes without touching the curve. See
+    // [ScoreEvents].
+    private var scoreMinWidthMs: Double = 80.0
     // Scoring mode: "full" = continuous rolling window (honest streaming test),
     // "reset" = silence-padded per step (matches isolated-clip training).
     private var scoreMode: String = "full"
@@ -881,6 +886,7 @@ class MainActivity : Activity() {
                 )
                 setData(result.timesMs, result.scores, result.targets, result.durationMs)
                 setThreshold(scoreThreshold)
+                setMinWidth(scoreMinWidthMs)
                 layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
             }
             scoreCurveView = curve
@@ -910,6 +916,29 @@ class MainActivity : Activity() {
                 }.withTop(dp(4)),
             )
 
+            addView(
+                text("Minimum detection width  ${scoreMinWidthMs.toInt()} ms", 13f, mutedColor())
+                    .withTop(dp(10)),
+            )
+            val widthLabel = getChildAt(childCount - 1) as TextView
+            addView(
+                SeekBar(this@MainActivity).apply {
+                    max = 300
+                    progress = scoreMinWidthMs.toInt().coerceIn(0, 300)
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                            scoreMinWidthMs = value.toDouble()
+                            widthLabel.text = "Minimum detection width  $value ms"
+                            scoreCurveView?.setMinWidth(scoreMinWidthMs)
+                            scoreCountsText?.text = scoreCountsSummary(result, scoreThreshold)
+                        }
+
+                        override fun onStartTrackingTouch(bar: SeekBar) {}
+                        override fun onStopTrackingTouch(bar: SeekBar) {}
+                    })
+                }.withTop(dp(4)),
+            )
+
             val playbackKey = "score:${result.sourceRecording}"
             val playing = activePlaybackKey == playbackKey && player?.isPlaying == true
             addView(
@@ -920,7 +949,8 @@ class MainActivity : Activity() {
             addView(
                 text(
                     "Slide the threshold to see how many wake words the model keeps and how many false alarms it adds. " +
-                        "Nothing here is added to your training data.",
+                        "Minimum detection width ignores narrow spikes: a run must stay above the line this long to count, " +
+                        "so brief blips stop registering. Nothing here is added to your training data.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(10)),
@@ -928,34 +958,17 @@ class MainActivity : Activity() {
         }
     }
 
-    /** True positives / misses / false alarms recomputed live at [threshold]. */
-    private fun scoreCountsSummary(result: ScoreResult, threshold: Double): String {
-        val detected = result.targets.count { it.peakScore >= threshold }
-        val missed = result.targets.size - detected
-        val falseAlarms = countFalseAlarms(result, threshold)
-        return "Detected $detected/${result.targets.size} · missed $missed · false alarms $falseAlarms"
-    }
-
     /**
-     * Count rising crossings above [threshold] that fall outside every located
-     * wake-phrase window — a client-side estimate of false alarms so the slider
-     * stays live without re-hitting the server.
+     * True positives / misses / false alarms recomputed live at [threshold] and
+     * the current plateau-width gate. Both sliders stay live client-side without
+     * re-hitting the server — the curve is fixed, only its reading changes.
      */
-    private fun countFalseAlarms(result: ScoreResult, threshold: Double): Int {
-        if (result.scores.isEmpty()) return 0
-        val windows = result.targets.map { (it.startMs - 150.0) to (it.endMs + 450.0) }
-        var count = 0
-        var prevAbove = false
-        for (index in result.scores.indices) {
-            val above = result.scores[index] >= threshold
-            if (above && !prevAbove) {
-                val timeMs = result.timesMs.getOrElse(index) { 0.0 }
-                val inTarget = windows.any { timeMs >= it.first && timeMs <= it.second }
-                if (!inTarget) count++
-            }
-            prevAbove = above
-        }
-        return count
+    private fun scoreCountsSummary(result: ScoreResult, threshold: Double): String {
+        val events = ScoreEvents.events(result.timesMs, result.scores, threshold, scoreMinWidthMs)
+        val detected = ScoreEvents.detectedFlags(result.targets, events).count { it }
+        val missed = result.targets.size - detected
+        val falseAlarms = ScoreEvents.falseAlarms(result.targets, events)
+        return "Detected $detected/${result.targets.size} · missed $missed · false alarms $falseAlarms"
     }
 
     private fun loadScore(project: WakeWordProject, recordingId: String) {
@@ -984,8 +997,10 @@ class MainActivity : Activity() {
                     scoreProjectSlug = project.slug
                     scoreResult = result
                     loadingScore = false
+                    val events = ScoreEvents.events(result.timesMs, result.scores, scoreThreshold, scoreMinWidthMs)
+                    val detected = ScoreEvents.detectedFlags(result.targets, events).count { it }
                     statusMessage =
-                        "Detected ${result.truePositives}/${result.targets.size} wake words in $modeLabel mode"
+                        "Detected $detected/${result.targets.size} wake words in $modeLabel mode"
                     render()
                 }
             } catch (error: Exception) {
