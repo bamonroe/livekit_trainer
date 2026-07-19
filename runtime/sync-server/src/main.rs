@@ -147,6 +147,7 @@ struct RecordingChecksum {
 struct RecordingDetailItem {
     id: String,
     is_background: bool,
+    is_test: bool,
     recorded_at: String,
     duration_ms: i64,
     positive_count: i64,
@@ -286,6 +287,11 @@ struct Manifest {
     bulk_recordings: Vec<BulkRecording>,
     #[serde(default)]
     background_recordings: Vec<BackgroundRecording>,
+    /// Test-only takes. Transcribed for word timings so the model can be scored
+    /// against them, but never sliced into training data. Recording ids carry the
+    /// `test_` prefix so every downstream path can keep them out of the pool.
+    #[serde(default)]
+    test_recordings: Vec<BulkRecording>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -579,6 +585,15 @@ async fn sync(
             align_background_recordings(&extract_root, &manifest, &state.data_root, &state.db)
                 .await?;
         alignment.absorb(background);
+        let test = align_test_recordings(
+            &extract_root,
+            &manifest,
+            &state.data_root,
+            &state.db,
+            whisper_server_url.as_deref(),
+        )
+        .await?;
+        alignment.absorb(test);
         let archive_name = archive
             .file_name()
             .and_then(|name| name.to_str())
@@ -855,6 +870,7 @@ async fn bulk_recording_details(
         .into_iter()
         .map(|d| RecordingDetailItem {
             is_background: d.id.starts_with("background_"),
+            is_test: d.id.starts_with("test_"),
             id: d.id,
             recorded_at: d.recorded_at,
             duration_ms: d.duration_ms,
@@ -1318,6 +1334,29 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), AppError> {
             )));
         }
     }
+    for (index, recording) in manifest.test_recordings.iter().enumerate() {
+        if recording.id.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "test recording {index} missing id"
+            )));
+        }
+        if !recording.id.starts_with("test_") {
+            return Err(AppError::bad_request(format!(
+                "test recording {index} id {} must start with test_",
+                recording.id
+            )));
+        }
+        if recording.file.is_empty() {
+            return Err(AppError::bad_request(format!(
+                "test recording {index} missing file"
+            )));
+        }
+        if recording.script.trim().is_empty() {
+            return Err(AppError::bad_request(format!(
+                "test recording {index} missing script"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1427,6 +1466,31 @@ fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<String>, AppE
         if spec.sample_rate != 16_000 {
             warnings.push(format!(
                 "{}: expected 16000 Hz background recording, got {}",
+                recording.id, spec.sample_rate
+            ));
+        }
+    }
+    for recording in &manifest.test_recordings {
+        let path = safe_join(bundle, &recording.file)?;
+        let reader = WavReader::open(&path).map_err(|error| {
+            AppError::bad_request(format!("{}: cannot read test WAV: {error}", recording.id))
+        })?;
+        let spec = reader.spec();
+        if spec.channels != 1 {
+            warnings.push(format!(
+                "{}: expected mono test recording, got {} channels",
+                recording.id, spec.channels
+            ));
+        }
+        if spec.bits_per_sample != 16 {
+            warnings.push(format!(
+                "{}: expected 16-bit PCM test recording, got {} bits",
+                recording.id, spec.bits_per_sample
+            ));
+        }
+        if spec.sample_rate != 16_000 {
+            warnings.push(format!(
+                "{}: expected 16000 Hz test recording, got {}",
                 recording.id, spec.sample_rate
             ));
         }
@@ -1645,6 +1709,172 @@ async fn align_background_recordings(
     Ok(summary)
 }
 
+/// Transcribe every test take in the bundle for word timings, but cut no
+/// training slices. Requires Whisper, since scoring needs to locate the wake
+/// phrase inside the take; without it the take is stored source-only.
+async fn align_test_recordings(
+    bundle: &Path,
+    manifest: &Manifest,
+    data_root: &Path,
+    db: &Mutex<Connection>,
+    whisper_url: Option<&str>,
+) -> Result<AlignmentSummary, AppError> {
+    let mut summary = AlignmentSummary::default();
+    if manifest.test_recordings.is_empty() {
+        return Ok(summary);
+    }
+    let Some(whisper_url) = whisper_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        summary
+            .warnings
+            .push("test recordings present but no Whisper server URL configured".to_string());
+        return Ok(summary);
+    };
+
+    let slug = manifest.wake_word.slug.clone();
+    let phrase = manifest.wake_word.phrase();
+    let external_id = manifest
+        .wake_word
+        .extra
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let dest_root = data_root.join(&slug);
+
+    for recording in &manifest.test_recordings {
+        let source = match safe_join(bundle, &recording.file) {
+            Ok(source) => source,
+            Err(error) => {
+                summary.recordings += 1;
+                summary
+                    .warnings
+                    .push(format!("{}: {}", recording.id, error.message));
+                continue;
+            }
+        };
+        // Route through align_one_recording so the shared `test_` branch handles
+        // it identically to a reprocess pass.
+        align_one_recording(
+            &recording.id,
+            &recording.script,
+            &recording.recorded_at,
+            recording.duration_ms,
+            &source,
+            &slug,
+            &phrase,
+            external_id.as_deref(),
+            &dest_root,
+            db,
+            whisper_url,
+            &capture_from_extra(&recording.extra),
+            &mut summary,
+        )
+        .await?;
+    }
+
+    Ok(summary)
+}
+
+/// Store a test take: transcribe it so scoring can locate the wake phrase,
+/// persist the source WAV and transcript, and record ZERO slices. A test take
+/// must never contribute training clips, so this path writes nothing under the
+/// positive/negative/background directories.
+async fn align_test_one(
+    recording_id: &str,
+    script: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    slug: &str,
+    phrase: &str,
+    external_id: Option<&str>,
+    dest_root: &Path,
+    db: &Mutex<Connection>,
+    whisper_url: &str,
+    capture: &db::CaptureMeta,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    let whisper = match transcribe_with_words(whisper_url, source, None).await {
+        Ok(whisper) => whisper,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
+        }
+    };
+    let words = whisper_words(&whisper);
+
+    // Persist the raw source recording, then drop any slice files a prior pass
+    // left behind (e.g. if this id was ever mis-processed as a bulk take).
+    let (source_wav, source_sha256) = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(stored) => stored,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
+        }
+    };
+    let old_paths = {
+        let conn = db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
+    };
+    for old in old_paths {
+        let old = PathBuf::from(old);
+        if old.is_file() {
+            let _ = fs::remove_file(old);
+        }
+    }
+
+    let word_rows = words
+        .iter()
+        .map(|word| db::WordRow {
+            word: word.word.trim().to_string(),
+            start_ms: (word.start * 1000.0).round() as i64,
+            end_ms: (word.end * 1000.0).round() as i64,
+            probability: word.probability,
+        })
+        .collect();
+    let prompts = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    let alignment = db::RecordingAlignment {
+        recording_id: recording_id.to_string(),
+        project_slug: slug.to_string(),
+        phrase: phrase.to_string(),
+        external_id: external_id.map(ToString::to_string),
+        script: script.to_string(),
+        recorded_at: recorded_at.to_string(),
+        duration_ms: duration_ms as i64,
+        source_wav: source_wav.to_string_lossy().to_string(),
+        source_sha256: Some(source_sha256),
+        bundle: None,
+        transcript_text: whisper.text.trim().to_string(),
+        whisper_url: Some(whisper_url.to_string()),
+        words: word_rows,
+        prompts,
+        // Intentionally empty: test takes contribute no training data.
+        slices: Vec::new(),
+        capture: capture.clone(),
+    };
+    {
+        let mut conn = db.lock().expect("db lock poisoned");
+        db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
+    }
+    if words.is_empty() {
+        summary.warnings.push(format!(
+            "{}: test take stored but Whisper returned no words; scoring can still run",
+            recording_id
+        ));
+    }
+    Ok(())
+}
+
 /// Align and slice one already-materialized source WAV. Shared by the upload
 /// path (source from the bundle) and the reprocess path (source is the stored
 /// bulk_source WAV), so both cut slices identically.
@@ -1664,6 +1894,28 @@ async fn align_one_recording(
     summary: &mut AlignmentSummary,
 ) -> Result<(), AppError> {
     summary.recordings += 1;
+    if recording_id.starts_with("test_") {
+        // Test takes exist only to score a trained model. Transcribe them for
+        // word timings but cut zero training slices, so they can never enter the
+        // positive/negative/background pool. This branch also fires on reprocess,
+        // since it keys off the persisted `test_` id prefix.
+        return align_test_one(
+            recording_id,
+            script,
+            recorded_at,
+            duration_ms,
+            source,
+            slug,
+            phrase,
+            external_id,
+            dest_root,
+            db,
+            whisper_url,
+            capture,
+            summary,
+        )
+        .await;
+    }
     if script == BACKGROUND_SCRIPT_MARKER {
         // Background takes carry no speech to align; chop into fixed windows and
         // skip Whisper entirely. This branch also fires on reprocess, since the

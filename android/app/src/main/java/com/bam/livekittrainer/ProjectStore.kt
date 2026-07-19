@@ -102,6 +102,38 @@ class ProjectStore(context: Context) {
         )
     }
 
+    fun loadTestRecordings(projectId: String): List<BulkRecording> {
+        val db = dbHelper.readableDatabase
+        return db.query(
+            TABLE_TEST_RECORDINGS,
+            null,
+            "project_id = ?",
+            arrayOf(projectId),
+            null,
+            null,
+            "recorded_at_millis DESC",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(cursor.toBulkRecording())
+                }
+            }
+        }
+    }
+
+    fun addTestRecording(recording: BulkRecording) {
+        dbHelper.writableDatabase.insertWithOnConflict(
+            TABLE_TEST_RECORDINGS,
+            null,
+            recording.toContentValues(),
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    fun deleteTestRecording(recording: BulkRecording) {
+        dbHelper.writableDatabase.delete(TABLE_TEST_RECORDINGS, "id = ?", arrayOf(recording.id))
+    }
+
     fun loadBackgroundRecordings(projectId: String): List<BackgroundRecording> {
         val db = dbHelper.readableDatabase
         return db.query(
@@ -155,6 +187,7 @@ class ProjectStore(context: Context) {
         File(appContext.filesDir, "clips").deleteRecursively()
         File(appContext.filesDir, "bulk").deleteRecursively()
         File(appContext.filesDir, "background").deleteRecursively()
+        File(appContext.filesDir, "test").deleteRecursively()
         File(appContext.filesDir, "exports").deleteRecursively()
         File(appContext.cacheDir, "sync").deleteRecursively()
 
@@ -162,6 +195,7 @@ class ProjectStore(context: Context) {
         db.beginTransaction()
         try {
             db.delete(TABLE_PROMPT_STATE, null, null)
+            db.delete(TABLE_TEST_RECORDINGS, null, null)
             db.delete(TABLE_BACKGROUND_RECORDINGS, null, null)
             db.delete(TABLE_BULK_RECORDINGS, null, null)
             db.delete(TABLE_CLIPS, null, null)
@@ -396,6 +430,7 @@ class ProjectStore(context: Context) {
             )
             createBulkRecordingsTable(db)
             createBackgroundRecordingsTable(db)
+            createTestRecordingsTable(db)
             db.execSQL("CREATE INDEX clips_project_id_idx ON $TABLE_CLIPS(project_id)")
         }
 
@@ -415,6 +450,9 @@ class ProjectStore(context: Context) {
             if (oldVersion < 6) {
                 addCaptureColumns(db, TABLE_BULK_RECORDINGS)
                 addCaptureColumns(db, TABLE_BACKGROUND_RECORDINGS)
+            }
+            if (oldVersion < 7) {
+                createTestRecordingsTable(db)
             }
         }
 
@@ -467,6 +505,31 @@ class ProjectStore(context: Context) {
             db.execSQL("CREATE INDEX IF NOT EXISTS background_recordings_project_id_idx ON $TABLE_BACKGROUND_RECORDINGS(project_id)")
         }
 
+        // Test takes share the bulk-recording shape (they carry a script) but live
+        // in their own table so they can never be swept into a training upload.
+        private fun createTestRecordingsTable(db: SQLiteDatabase) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS $TABLE_TEST_RECORDINGS (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    project_slug TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    script TEXT NOT NULL,
+                    recorded_at_millis INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    sample_rate_hz INTEGER NOT NULL,
+                    channels INTEGER NOT NULL,
+                    encoding TEXT NOT NULL,
+                    condition_tags TEXT NOT NULL DEFAULT '',
+                    $CAPTURE_COLUMNS_SQL,
+                    FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
+                )
+                """.trimIndent(),
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS test_recordings_project_id_idx ON $TABLE_TEST_RECORDINGS(project_id)")
+        }
+
         private fun addCaptureColumns(db: SQLiteDatabase, table: String) {
             val existing = existingColumns(db, table)
             for ((name, type) in CAPTURE_COLUMNS) {
@@ -489,7 +552,7 @@ class ProjectStore(context: Context) {
 
     private companion object {
         const val DATABASE_NAME = "wake_word_collection.db"
-        const val DATABASE_VERSION = 6
+        const val DATABASE_VERSION = 7
         const val LEGACY_PREFS = "wake_word_projects"
 
         // Per-take provenance columns shared by the bulk and background tables.
@@ -514,6 +577,7 @@ class ProjectStore(context: Context) {
         const val TABLE_PROMPT_STATE = "prompt_state"
         const val TABLE_BULK_RECORDINGS = "bulk_recordings"
         const val TABLE_BACKGROUND_RECORDINGS = "background_recordings"
+        const val TABLE_TEST_RECORDINGS = "test_recordings"
 
         fun legacyClipsKey(projectId: String): String = "clips_$projectId"
 

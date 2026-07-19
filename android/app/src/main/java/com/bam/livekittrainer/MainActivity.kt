@@ -64,6 +64,13 @@ class MainActivity : Activity() {
     // True while the shared recorder is capturing a background-noise take rather
     // than a bulk script, so the two record buttons show independent state.
     private var backgroundRecordingActive: Boolean = false
+    // True while the shared recorder is capturing a test take (Test page) rather
+    // than a training take, so its record button tracks state independently.
+    private var testRecordingActive: Boolean = false
+    // Separate shuffle counter for the test script so reshuffling it never
+    // disturbs the training bulk script shown on the Record page.
+    private var testScriptRevision: Int = 0
+    private var uploadingTestTakes: Boolean = false
     private var bulkReviewProjectSlug: String? = null
     private var bulkReviewClips: List<BulkReviewClip> = emptyList()
     // The server's authoritative recording list for the active wake word,
@@ -88,6 +95,9 @@ class MainActivity : Activity() {
     private var scoreResult: ScoreResult? = null
     private var loadingScore: Boolean = false
     private var scoreThreshold: Double = 0.5
+    // Scoring mode: "full" = continuous rolling window (honest streaming test),
+    // "reset" = silence-padded per step (matches isolated-clip training).
+    private var scoreMode: String = "full"
     private var scoreCurveView: ScoreCurveView? = null
     private var scoreCountsText: TextView? = null
     private var scorePlaybackTicker: Runnable? = null
@@ -353,8 +363,12 @@ class MainActivity : Activity() {
             if (serverRecordingsSlug == project.slug) serverRecordings else emptyList()
         workspace.addView(syncCard(project, bulkRecordings))
         workspace.addView(
-            recordingsCard(project, bulkRecordings, serverForSlug.filter { !it.isBackground })
-                .withTop(dp(12)),
+            recordingsCard(
+                project,
+                bulkRecordings,
+                // Test takes are managed on the Test page, not the training pool.
+                serverForSlug.filter { !it.isBackground && !it.isTest },
+            ).withTop(dp(12)),
         )
         val serverBackground = serverForSlug.filter { it.isBackground }
         if (backgroundRecordings.isNotEmpty() || serverBackground.isNotEmpty()) {
@@ -400,12 +414,203 @@ class MainActivity : Activity() {
             return
         }
         ensureServerRecordings(project)
-        workspace.addView(testPickerCard(project))
+        workspace.addView(testRecorderCard(project))
+        workspace.addView(testPickerCard(project).withTop(dp(12)))
         val result = scoreResult?.takeIf { scoreProjectSlug == project.slug }
         if (result != null || loadingScore) {
             workspace.addView(scoreResultCard(project, result).withTop(dp(12)))
         }
         maybeStatus()
+    }
+
+    private fun testRecorderCard(project: WakeWordProject): View {
+        val wakePlacements = savedBulkWakePlacements()
+        val scriptContent = PromptGenerator.bulkScriptContent(
+            project,
+            lexicon,
+            store.promptBatch(project.id),
+            // Offset the batch seed so the test script differs from the training
+            // script even at the same shuffle revision.
+            testScriptRevision + 7919,
+            wakePlacements,
+            positiveDense = savedPositiveDense(),
+        )
+        val script = scriptContent.text
+        val recordingThisProject =
+            recorder.isRecording && testRecordingActive && activeProject?.id == project.id
+        val localTests = store.loadTestRecordings(project.id)
+        val serverIds = if (serverRecordingsSlug == project.slug) {
+            serverRecordings.map { it.id }.toSet()
+        } else {
+            emptySet()
+        }
+        val pending = localTests.count { it.id !in serverIds }
+        return card().apply {
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        text("Record a test take", 20f, textColor(), Typeface.BOLD).apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        },
+                    )
+                    addView(actionButton("Shuffle", ButtonStyle.Secondary) {
+                        testScriptRevision += 1
+                        statusMessage = "Generated a new test script"
+                        render()
+                    }.apply { isEnabled = !recordingThisProject })
+                },
+            )
+            addView(
+                text(
+                    "Read this in one take, then upload it to score the model. Test takes are transcribed for scoring only — never sliced into training data.",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(bulkScriptText(scriptContent, project.phrase).withTop(dp(12)))
+            addView(
+                actionButton(
+                    if (recordingThisProject) "◼  Stop recording" else "●  Record test take",
+                    if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Primary,
+                ) {
+                    toggleTestRecording(project, script)
+                }.tall().withTop(dp(14)),
+            )
+            if (pending > 0 && !recordingThisProject) {
+                addView(
+                    actionButton(
+                        if (uploadingTestTakes) "Uploading…" else "⇧  Upload $pending test take${if (pending == 1) "" else "s"} & score",
+                        ButtonStyle.Secondary,
+                    ) {
+                        uploadTestTakes(project)
+                    }.withTop(dp(10)).apply { isEnabled = !uploadingTestTakes },
+                )
+            }
+        }
+    }
+
+    private fun toggleTestRecording(project: WakeWordProject, script: String) {
+        if (recorder.isRecording) {
+            // Don't let a Test-page tap stop a training take capturing elsewhere.
+            if (!testRecordingActive) {
+                statusMessage = "Finish the current recording first"
+                render()
+                return
+            }
+            val result = recorder.stop()
+            activeProject = null
+            testRecordingActive = false
+            if (result != null) {
+                store.addTestRecording(
+                    BulkRecording(
+                        id = result.output.nameWithoutExtension,
+                        projectId = project.id,
+                        projectSlug = project.slug,
+                        filePath = result.output.absolutePath,
+                        script = result.prompt.instruction,
+                        recordedAtMillis = result.recordedAtMillis,
+                        durationMs = result.durationMs,
+                        sampleRateHz = result.sampleRateHz,
+                        channels = result.channels,
+                        encoding = result.encoding,
+                        conditions = emptyList(),
+                        capture = captureMetadataFor(result),
+                    ),
+                )
+                testScriptRevision += 1
+                statusMessage = "Saved test take — upload it to score the model"
+            }
+            render()
+            return
+        }
+
+        try {
+            recorder.startTest(project, script)
+            activeProject = project
+            testRecordingActive = true
+            statusMessage = "Recording test take"
+            render()
+        } catch (error: IllegalStateException) {
+            statusMessage = error.message ?: "Could not start test recording"
+            render()
+        }
+    }
+
+    /**
+     * Upload every local test take the server does not yet hold, then score the
+     * newest one. Test takes travel in their own manifest array and never enter
+     * the training pool, so this is safe to run against a live wake word.
+     */
+    private fun uploadTestTakes(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        val localTests = store.loadTestRecordings(project.id)
+        if (localTests.isEmpty()) {
+            statusMessage = "Record a test take first"
+            render()
+            return
+        }
+        uploadingTestTakes = true
+        statusMessage = "Uploading test takes…"
+        render()
+
+        Thread {
+            try {
+                val client = BundleSyncClient(serverUrl)
+                val serverChecksums = try {
+                    client.loadServerChecksums(project.slug)
+                } catch (_: Exception) {
+                    emptyMap()
+                }
+                val toUpload = localTests.filter {
+                    recordingNeedsUpload(it.id, it.filePath, serverChecksums)
+                }
+                if (toUpload.isNotEmpty()) {
+                    val zip = exporter.exportProjectZip(
+                        project,
+                        emptyList(),
+                        emptyList(),
+                        emptyList(),
+                        toUpload,
+                    )
+                    client.upload(zip)
+                }
+                val recordings = try {
+                    client.loadServerRecordings(project.slug)
+                } catch (_: Exception) {
+                    serverRecordings
+                }
+                // Score the newest test take now that it is transcribed server-side.
+                val newest = localTests.maxByOrNull { it.recordedAtMillis }?.id
+                runOnUiThread {
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
+                    uploadingTestTakes = false
+                    statusMessage = if (toUpload.isEmpty()) {
+                        "Test takes already uploaded"
+                    } else {
+                        "Uploaded ${toUpload.size} test take${if (toUpload.size == 1) "" else "s"}"
+                    }
+                    render()
+                    if (newest != null && recordings.any { it.id == newest }) {
+                        loadScore(project, newest)
+                    }
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    uploadingTestTakes = false
+                    statusMessage = error.message ?: "Upload failed"
+                    render()
+                }
+            }
+        }.start()
     }
 
     private fun testPickerCard(project: WakeWordProject): View {
@@ -447,11 +652,26 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = rounded(if (selected) navActiveColor() else promptColor(), dp(12), strokeColor())
+            // Long-press a test take to delete it from the server (and this
+            // device). Training takes are managed on the Review page instead.
+            if (recording.isTest) {
+                setOnLongClickListener {
+                    confirmDeleteTestTake(project, recording)
+                    true
+                }
+            }
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.VERTICAL
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                    addView(text(recording.id.takeLast(8), 15f, textColor(), Typeface.BOLD))
+                    addView(
+                        text(
+                            if (recording.isTest) "${recording.id.takeLast(8)}  · TEST" else recording.id.takeLast(8),
+                            15f,
+                            if (recording.isTest) ACCENT else textColor(),
+                            Typeface.BOLD,
+                        ),
+                    )
                     addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
                 },
             )
@@ -462,6 +682,61 @@ class MainActivity : Activity() {
                 }.apply { isEnabled = !loadingScore },
             )
         }
+    }
+
+    private fun confirmDeleteTestTake(project: WakeWordProject, recording: ServerRecording) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete this test take?")
+            .setMessage("Removes it from the server and this device. This cannot be undone.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ -> deleteTestTake(project, recording) }
+            .show()
+    }
+
+    private fun deleteTestTake(project: WakeWordProject, recording: ServerRecording) {
+        stopScorePlayback()
+        // Drop the local copy this device holds, if any, so the two stay in step.
+        store.loadTestRecordings(project.id)
+            .firstOrNull { it.id == recording.id }
+            ?.let {
+                File(it.filePath).delete()
+                store.deleteTestRecording(it)
+            }
+        serverRecordings = serverRecordings.filterNot { it.id == recording.id }
+        if (scoreRecordingId == recording.id) {
+            scoreResult = null
+            scoreRecordingId = null
+        }
+        val serverUrl = savedServerUrl()
+        statusMessage = "Deleting test take…"
+        render()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            render()
+            return
+        }
+        Thread {
+            try {
+                val client = BundleSyncClient(serverUrl)
+                client.deleteRecording(project.slug, recording.id)
+                val recordings = try {
+                    client.loadServerRecordings(project.slug)
+                } catch (_: Exception) {
+                    serverRecordings
+                }
+                runOnUiThread {
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
+                    statusMessage = "Deleted test take"
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    statusMessage = error.message ?: "Delete failed"
+                    render()
+                }
+            }
+        }.start()
     }
 
     private fun scoreResultCard(project: WakeWordProject, result: ScoreResult?): View {
@@ -479,12 +754,46 @@ class MainActivity : Activity() {
             }
 
             addView(text("Score  ${result.sourceRecording.takeLast(8)}", 20f, textColor(), Typeface.BOLD))
+            val modeName = if (result.mode == "reset") "padded" else "continuous"
             addView(
                 text(
-                    "“${result.phrase}” · continuous mode · ${"%.1f".format(result.durationMs / 1000.0)}s",
+                    "“${result.phrase}” · $modeName mode · ${"%.1f".format(result.durationMs / 1000.0)}s",
                     13f,
                     mutedColor(),
                 ).withTop(dp(2)),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton(
+                            "Continuous",
+                            if (scoreMode == "full") ButtonStyle.Primary else ButtonStyle.Secondary,
+                        ) {
+                            if (scoreMode != "full") {
+                                scoreMode = "full"
+                                scoreRecordingId?.let { loadScore(project, it) }
+                            }
+                        }.apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                            isEnabled = !loadingScore
+                        },
+                    )
+                    addView(
+                        actionButton(
+                            "Padded",
+                            if (scoreMode == "reset") ButtonStyle.Primary else ButtonStyle.Secondary,
+                        ) {
+                            if (scoreMode != "reset") {
+                                scoreMode = "reset"
+                                scoreRecordingId?.let { loadScore(project, it) }
+                            }
+                        }.apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                            isEnabled = !loadingScore
+                        }.withLeft(dp(8)),
+                    )
+                }.withTop(dp(10)),
             )
 
             val curve = ScoreCurveView(this@MainActivity).apply {
@@ -588,19 +897,21 @@ class MainActivity : Activity() {
         scoreProjectSlug = project.slug
         scoreRecordingId = recordingId
         scoreResult = null
-        statusMessage = "Scoring ${recordingId.takeLast(8)} in continuous mode…"
+        val mode = scoreMode
+        val modeLabel = if (mode == "reset") "padded" else "continuous"
+        statusMessage = "Scoring ${recordingId.takeLast(8)} in $modeLabel mode…"
         render()
 
         Thread {
             try {
                 val result = BundleSyncClient(serverUrl)
-                    .loadScore(project.slug, recordingId, "full", scoreThreshold)
+                    .loadScore(project.slug, recordingId, mode, scoreThreshold)
                 runOnUiThread {
                     scoreProjectSlug = project.slug
                     scoreResult = result
                     loadingScore = false
                     statusMessage =
-                        "Detected ${result.truePositives}/${result.targets.size} wake words in continuous mode"
+                        "Detected ${result.truePositives}/${result.targets.size} wake words in $modeLabel mode"
                     render()
                 }
             } catch (error: Exception) {
@@ -1021,7 +1332,8 @@ class MainActivity : Activity() {
         )
         val script = scriptContent.text
         val recordingThisProject =
-            recorder.isRecording && !backgroundRecordingActive && activeProject?.id == project.id
+            recorder.isRecording && !backgroundRecordingActive && !testRecordingActive &&
+                activeProject?.id == project.id
         return card().apply {
             addView(
                 LinearLayout(this@MainActivity).apply {

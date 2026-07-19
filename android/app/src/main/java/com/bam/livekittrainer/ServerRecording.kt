@@ -9,6 +9,7 @@ package com.bam.livekittrainer
 data class ServerRecording(
     val id: String,
     val isBackground: Boolean,
+    val isTest: Boolean = false,
     val recordedAtMillis: Long,
     val durationMs: Long,
     val positiveCount: Int,

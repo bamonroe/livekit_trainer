@@ -38,6 +38,23 @@ class WavRecorder(private val context: Context) {
         return output
     }
 
+    fun startTest(project: WakeWordProject, script: String): File {
+        check(active == null) { "recording already active" }
+        check(
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED,
+        ) { "record audio permission is required" }
+
+        val output = testFile(project)
+        val prompt = RecordingPrompt(
+            label = ClipLabel.NEGATIVE,
+            spokenPhrase = script,
+            instruction = script,
+        )
+        startRecording(output, prompt)
+        return output
+    }
+
     fun startBackground(project: WakeWordProject): File {
         check(active == null) { "recording already active" }
         check(
@@ -187,6 +204,13 @@ class WavRecorder(private val context: Context) {
     private fun backgroundFile(project: WakeWordProject): File {
         val id = "background_${System.currentTimeMillis()}_${UUID.randomUUID()}"
         return File(context.filesDir, "background/${project.slug}/$id.wav")
+    }
+
+    // Test takes carry the `test_` id prefix the sync server routes on: they are
+    // transcribed for scoring but never sliced into training data.
+    private fun testFile(project: WakeWordProject): File {
+        val id = "test_${System.currentTimeMillis()}_${UUID.randomUUID()}"
+        return File(context.filesDir, "test/${project.slug}/$id.wav")
     }
 
     private fun writeRecording(

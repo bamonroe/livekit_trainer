@@ -28,22 +28,27 @@ discovered. Prefer small, actionable items with clear status.
     free. Validated on a real `all_set` take: `full` → 4/4 FN (~0.01 peaks,
     streaming gap); `reset` → 4/4 TP (~0.98). Compose wires `sync-server` →
     `scorer`.
-  - [ ] Separate "test" recording category/storage so test takes never enter
-    the training pool. (Interim: `/score` runs against existing bulk recordings,
-    which is enough for the honest diagnostic; a dedicated test channel is only
-    needed once the app records test-only takes.)
-  - [~] App: score-curve/threshold UI + "record test" prompt flow. Done: a
-    **Test** tab (`AppPage.Test`) that lists the wake word's server recordings,
-    scores any of them in `full` continuous mode via `GET /score`, and draws the
-    detection curve (`ScoreCurveView`) with per-utterance green/red hit/miss
-    markers, a dashed threshold line, a live threshold slider that recomputes
-    detected/missed/false-alarm counts client-side, and source playback with a
-    moving playhead. Nothing on this page touches training data. Verified on the
-    emulator against the retrained `all_set` model (real take → 1/1 detected,
-    peak ~0.97, live re-threshold works). Remaining: a dedicated "record a fresh
-    test take" button + silence-pad slider — blocked on the test-only storage
-    channel below (recording+uploading a take today would pollute the training
-    pool).
+  - [x] Separate "test" recording category/storage so test takes never enter
+    the training pool. Test takes travel in a `test_recordings` manifest array
+    and carry the `test_` id prefix the sync server routes on: they are
+    transcribed for word timings (so `/score` can locate the wake phrase) but cut
+    **zero** slices — nothing is written under positive/negative/background.
+    `recording_details` exposes `is_test`. Verified end-to-end: uploading a test
+    bundle reported "0 positives and 0 negatives", left the training counts
+    untouched (133/223/40), flagged the row `is_test`, and scored 4/4 in `full`
+    mode. The app stores test takes in their own `test_recordings` table and
+    exports them separately, so they can never be swept into a training sync.
+  - [x] App: score-curve/threshold UI + "record test" prompt flow. The **Test**
+    tab (`AppPage.Test`) now: generates a randomized test script, records a test
+    take in one tap (`WavRecorder.startTest`, `test_` id), uploads it on its own
+    channel and auto-scores the newest take, lists server recordings (test takes
+    badged `TEST`, long-press to delete), scores any take in `full` or `reset`
+    mode via a Continuous/Padded toggle, and draws the detection curve
+    (`ScoreCurveView`) with per-utterance green/red markers, a dashed threshold
+    line, a live threshold slider recomputing detected/missed/false-alarm counts,
+    and source playback with a moving playhead. Nothing on this page touches
+    training data. (Note: `reset` "Padded" is a fixed silence-pad, not yet a
+    variable pad-amount slider; a variable pad would need a scorer param.)
   - [ ] Host-runnable unit test for the scorer (currently validated only via
     the container smoke test).
   First model under test: `output/all_set/all_set.onnx` — see
