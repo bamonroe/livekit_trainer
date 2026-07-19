@@ -67,11 +67,28 @@ struct AppState {
     // fingerprint the .onnx so cached score curves invalidate when a model is
     // retrained. May not exist; then the fingerprint is a sentinel.
     models_root: Arc<PathBuf>,
+    // Absolute path of the repo on the *host*. Training launches a sibling
+    // trainer container over the mounted docker socket, and its `-v` bind mount
+    // source must be a host path, not a path inside this container. None until
+    // HOST_REPO_ROOT is set; the training endpoints refuse to run without it.
+    host_repo_root: Arc<Option<String>>,
+    // Trainer image tag launched for a full training run (TRAINER_IMAGE).
+    trainer_image: Arc<String>,
+    // Pass `--gpus all` to the trainer container (TRAINER_USE_GPU != "0").
+    trainer_gpu: Arc<bool>,
     db: Arc<Mutex<Connection>>,
 }
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+/// Parse an RFC 3339 / ISO 8601 timestamp (as written by train_job.sh) to epoch
+/// milliseconds, or None if it does not parse.
+fn rfc3339_ms(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -442,6 +459,23 @@ async fn main() {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "/output".to_string());
 
+    let host_repo_root = env::var("HOST_REPO_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match &host_repo_root {
+        Some(root) => println!("host repo root {root}; training enabled"),
+        None => println!("HOST_REPO_ROOT not set; training endpoints disabled"),
+    }
+    let trainer_image = env::var("TRAINER_IMAGE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "livekit-wakeword-trainer:latest".to_string());
+    let trainer_gpu = env::var("TRAINER_USE_GPU")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true);
+
     let state = AppState {
         data_root: Arc::new(PathBuf::from(data_root)),
         incoming_root: Arc::new(PathBuf::from(incoming_root)),
@@ -450,6 +484,9 @@ async fn main() {
         whisper_url: Arc::new(whisper_url),
         scorer_url: Arc::new(scorer_url),
         models_root: Arc::new(PathBuf::from(models_root)),
+        host_repo_root: Arc::new(host_repo_root),
+        trainer_image: Arc::new(trainer_image),
+        trainer_gpu: Arc::new(trainer_gpu),
         db: Arc::new(Mutex::new(db)),
     };
 
@@ -476,6 +513,10 @@ async fn main() {
             get(bulk_source_audio),
         )
         .route("/score/:slug/:recording_id", get(score_recording))
+        .route("/models", get(list_models))
+        .route("/train/:slug", post(start_training))
+        .route("/train/:slug/status", get(training_status))
+        .route("/train/:slug/log", get(training_log))
         .route(
             "/review/:slug/:category/:file_name",
             get(review_audio).delete(delete_review_clip),
@@ -3035,6 +3076,380 @@ fn validation_summary(warnings: &[String], clip_count: usize) -> String {
         output.push_str(&format!("\nValidated {clip_count} clips"));
         output
     }
+}
+
+/// Hyperparameters for a full training run. All optional; each falls back to the
+/// same default as scripts/generate_config.py when omitted.
+#[derive(Debug, Deserialize)]
+struct TrainRequest {
+    steps: Option<u32>,
+    model_size: Option<String>,
+    target_fp_per_hour: Option<f64>,
+    n_samples: Option<u32>,
+    n_samples_val: Option<u32>,
+    personal: Option<bool>,
+    positive_boost: Option<u32>,
+    positive_per_batch: Option<u32>,
+    real_samples_dir: Option<String>,
+}
+
+fn training_container_name(slug: &str) -> String {
+    format!("lkww-train-{slug}")
+}
+
+/// Append a `-e KEY=VALUE` pair to a docker argv.
+fn push_env(args: &mut Vec<String>, key: &str, value: String) {
+    args.push("-e".into());
+    args.push(format!("{key}={value}"));
+}
+
+/// Run `docker` with the given args off the async executor, returning its output.
+async fn run_docker(args: Vec<String>) -> Result<std::process::Output, AppError> {
+    tokio::task::spawn_blocking(move || std::process::Command::new("docker").args(&args).output())
+        .await
+        .map_err(|e| AppError::internal(format!("docker task join failed: {e}")))?
+        .map_err(|e| AppError::internal(format!("failed to run docker: {e}")))
+}
+
+/// Is a container by this name currently running? Uses `docker inspect`; a
+/// missing container (the `--rm` run already exited) reports false.
+async fn container_running(name: &str) -> bool {
+    let name = name.to_string();
+    let out = run_docker(vec![
+        "inspect".into(),
+        "-f".into(),
+        "{{.State.Running}}".into(),
+        name,
+    ])
+    .await;
+    matches!(out, Ok(o) if o.status.success()
+        && String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
+/// Allowlisted trainer model sizes. generate_config.py writes this straight into
+/// the YAML, so reject anything unexpected up front.
+fn valid_model_size(size: &str) -> bool {
+    matches!(size, "tiny" | "small" | "medium" | "large")
+}
+
+/// A real-samples dir is a plain relative path passed to the assembler/config.
+fn valid_real_samples_dir(dir: &str) -> bool {
+    !dir.is_empty()
+        && dir.len() <= 128
+        && dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-'))
+        && !dir.contains("..")
+}
+
+/// Launch a full training run for a wake word as a sibling trainer container.
+async fn start_training(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    Json(request): Json<TrainRequest>,
+) -> Result<Json<Value>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request("invalid slug"));
+    }
+    let Some(host_repo_root) = (*state.host_repo_root).clone() else {
+        return Err(AppError::internal(
+            "training disabled: HOST_REPO_ROOT not set on the sync-server",
+        ));
+    };
+
+    // The wake word must exist so we can supply its target phrase.
+    let phrase = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::project_phrase(&conn, &slug).map_err(db_error)?
+    };
+    let Some((phrase, _external_id)) = phrase else {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("unknown wake word: {slug}"),
+        });
+    };
+
+    let name = training_container_name(&slug);
+    if container_running(&name).await {
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: format!("training already running for {slug}"),
+        });
+    }
+    // Clear any dead container left behind by a crash so the name is free.
+    let _ = run_docker(vec!["rm".into(), "-f".into(), name.clone()]).await;
+
+    // Validate + default the hyperparameters.
+    let steps = request.steps.unwrap_or(50_000).clamp(100, 500_000);
+    let model_size = request.model_size.unwrap_or_else(|| "medium".to_string());
+    if !valid_model_size(&model_size) {
+        return Err(AppError::bad_request(format!(
+            "invalid model_size: {model_size}"
+        )));
+    }
+    let target_fp = request.target_fp_per_hour.unwrap_or(0.2);
+    if !(target_fp.is_finite() && target_fp >= 0.0 && target_fp <= 100.0) {
+        return Err(AppError::bad_request("invalid target_fp_per_hour"));
+    }
+    let personal = request.personal.unwrap_or(false);
+    let positive_boost = request.positive_boost.unwrap_or(1).clamp(1, 50);
+    let real_samples_dir = request
+        .real_samples_dir
+        .unwrap_or_else(|| "./data/train".to_string());
+    if !valid_real_samples_dir(&real_samples_dir) {
+        return Err(AppError::bad_request("invalid real_samples_dir"));
+    }
+
+    // Assemble the docker argv. Every hyperparameter travels as an -e KEY=VALUE
+    // pair (argv, never shell-interpolated), so nothing here can inject shell.
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-d".into(),
+        "--rm".into(),
+        "--name".into(),
+        name.clone(),
+    ];
+    if *state.trainer_gpu {
+        args.push("--gpus".into());
+        args.push("all".into());
+    }
+    args.push("-v".into());
+    args.push(format!("{host_repo_root}:/work"));
+    push_env(&mut args, "SLUG", slug.clone());
+    push_env(&mut args, "PHRASE", phrase.clone());
+    push_env(&mut args, "STEPS", steps.to_string());
+    push_env(&mut args, "MODEL_SIZE", model_size.clone());
+    push_env(&mut args, "TARGET_FP_PER_HOUR", target_fp.to_string());
+    push_env(
+        &mut args,
+        "PERSONAL",
+        if personal { "1".into() } else { "0".into() },
+    );
+    push_env(&mut args, "POSITIVE_BOOST", positive_boost.to_string());
+    if let Some(n) = request.n_samples {
+        push_env(&mut args, "N_SAMPLES", n.to_string());
+    }
+    if let Some(n) = request.n_samples_val {
+        push_env(&mut args, "N_SAMPLES_VAL", n.to_string());
+    }
+    if let Some(n) = request.positive_per_batch {
+        push_env(&mut args, "POSITIVE_PER_BATCH", n.to_string());
+    }
+    push_env(&mut args, "REAL_SAMPLES_DIR", real_samples_dir.clone());
+    args.push((*state.trainer_image).clone());
+    args.push("bash".into());
+    args.push("-lc".into());
+    args.push("bash /work/trainer/scripts/train_job.sh".into());
+
+    let output = run_docker(args).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::internal(format!(
+            "docker run failed: {}",
+            stderr.trim()
+        )));
+    }
+    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    Ok(Json(json!({
+        "status": "started",
+        "slug": slug,
+        "phrase": phrase,
+        "container_id": container_id,
+        "container_name": name,
+        "steps": steps,
+        "model_size": model_size,
+        "personal": personal,
+    })))
+}
+
+/// Read the training status JSON for a wake word, reconciled with whether the
+/// trainer container is still alive.
+async fn training_status(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request("invalid slug"));
+    }
+    let name = training_container_name(&slug);
+    let running = container_running(&name).await;
+
+    let status_path = state
+        .models_root
+        .join(&slug)
+        .join("train_status.json");
+    let file_status: Option<Value> = fs::read_to_string(&status_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+
+    let mut body = match file_status {
+        Some(mut status) => {
+            // A "running" file with no live container means the run died without
+            // writing a terminal status (crash / OOM / killed).
+            if !running
+                && status.get("state").and_then(Value::as_str) == Some("running")
+            {
+                status["state"] = json!("stopped");
+                status["message"] = json!("trainer container exited before completing");
+            }
+            status
+        }
+        None => {
+            if running {
+                json!({ "slug": slug, "state": "starting", "message": "container launching" })
+            } else {
+                json!({ "slug": slug, "state": "none", "message": "no training run found" })
+            }
+        }
+    };
+    body["container_running"] = json!(running);
+    body["has_model"] = json!(state
+        .models_root
+        .join(&slug)
+        .join(format!("{slug}.onnx"))
+        .exists());
+
+    // Pull the fields we need for benchmarking and ETA out of the status body.
+    let run_state = body
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .to_string();
+    let steps = body.get("steps").and_then(Value::as_i64).unwrap_or(0);
+    let model_size = body
+        .get("model_size")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let personal = body
+        .get("personal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let started_at = body
+        .get("started_at")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let updated_at = body
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let started_ms = started_at.as_deref().and_then(rfc3339_ms);
+
+    // On a terminal state, compute the run duration and persist the benchmark.
+    let terminal = matches!(run_state.as_str(), "succeeded" | "failed" | "stopped");
+    if terminal {
+        let finished_ms = updated_at.as_deref().and_then(rfc3339_ms);
+        let duration_ms = match (started_ms, finished_ms) {
+            (Some(a), Some(b)) if b >= a => Some(b - a),
+            _ => None,
+        };
+        if let Some(d) = duration_ms {
+            body["duration_ms"] = json!(d);
+        }
+        if let Some(started) = started_at.as_deref() {
+            if steps > 0 {
+                let conn = state.db.lock().expect("db lock poisoned");
+                let _ = db::record_training_run(
+                    &conn,
+                    &slug,
+                    steps,
+                    model_size.as_deref(),
+                    personal,
+                    started,
+                    updated_at.as_deref(),
+                    duration_ms,
+                    &run_state,
+                );
+            }
+        }
+    }
+
+    // Estimate total/remaining time from the benchmark history.
+    let avg = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::avg_ms_per_step(&conn, model_size.as_deref()).map_err(db_error)?
+    };
+    if let (Some((avg_ms_per_step, based_on)), true) = (avg, steps > 0) {
+        let estimated_total = (avg_ms_per_step * steps as f64) as i64;
+        body["avg_ms_per_step"] = json!(avg_ms_per_step);
+        body["based_on_runs"] = json!(based_on);
+        body["estimated_total_ms"] = json!(estimated_total);
+        if matches!(run_state.as_str(), "running" | "starting") {
+            if let Some(started) = started_ms {
+                let elapsed = (now_ms() - started).max(0);
+                body["elapsed_ms"] = json!(elapsed);
+                body["remaining_ms"] = json!((estimated_total - elapsed).max(0));
+            }
+        }
+    }
+
+    Ok(Json(body))
+}
+
+/// Tail the training log for a wake word. `?tail=N` bounds the returned lines.
+async fn training_log(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request("invalid slug"));
+    }
+    let params = parse_query(query.as_deref());
+    let tail = params
+        .get("tail")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 5000);
+
+    let log_path = state.models_root.join(&slug).join("train.log");
+    let text = fs::read_to_string(&log_path).unwrap_or_default();
+    let body = if text.is_empty() {
+        "(no log yet)".to_string()
+    } else {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(tail);
+        lines[start..].join("\n")
+    };
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response())
+}
+
+/// List trained models found under the output directory, with any metrics.
+async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let mut models = Vec::new();
+    if let Ok(entries) = fs::read_dir(&*state.models_root) {
+        let mut dirs: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let Some(slug) = dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_safe_slug(slug) {
+                continue;
+            }
+            let onnx = dir.join(format!("{slug}.onnx"));
+            if !onnx.exists() {
+                continue;
+            }
+            let metrics: Option<Value> = fs::read_to_string(dir.join(format!("{slug}_metrics.json")))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok());
+            let modified_ms = fs::metadata(&onnx)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64);
+            models.push(json!({
+                "slug": slug,
+                "modified_ms": modified_ms,
+                "metrics": metrics,
+            }));
+        }
+    }
+    Ok(Json(json!({ "status": "ok", "models": models })))
 }
 
 #[derive(Debug)]

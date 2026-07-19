@@ -384,6 +384,48 @@ class BundleSyncClient(
         return readResponse(connection, "Delete bulk review clip failed")
     }
 
+    /** Kick off a full training run with the given hyperparameter JSON body. */
+    fun startTraining(wakeWordSlug: String, bodyJson: String): JSONObject {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/train/${urlPart(wakeWordSlug)}")
+        val body = bodyJson.toByteArray(Charsets.UTF_8)
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 60_000
+        connection.doOutput = true
+        connection.setRequestProperty("Content-Type", "application/json")
+        connection.setFixedLengthStreamingMode(body.size)
+        try {
+            connection.outputStream.use { it.write(body) }
+        } catch (error: IOException) {
+            connection.disconnect()
+            throw error
+        }
+        return JSONObject(readResponse(connection, "Start training failed"))
+    }
+
+    /** Current training status for a wake word (state, step, message, …). */
+    fun trainingStatus(wakeWordSlug: String): JSONObject {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/train/${urlPart(wakeWordSlug)}/status")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        return JSONObject(readResponse(connection, "Training status failed"))
+    }
+
+    /** Tail of the training log for a wake word. */
+    fun trainingLog(wakeWordSlug: String, tail: Int = 200): String {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') + "/train/${urlPart(wakeWordSlug)}/log?tail=$tail",
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        return readResponse(connection, "Training log failed")
+    }
+
     private fun readResponse(connection: HttpURLConnection, errorPrefix: String): String {
         try {
             val code = connection.responseCode

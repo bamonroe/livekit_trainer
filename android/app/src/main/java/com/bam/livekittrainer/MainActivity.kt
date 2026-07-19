@@ -73,6 +73,15 @@ class MainActivity : Activity() {
     private var uploadingTestTakes: Boolean = false
     private var bulkReviewProjectSlug: String? = null
     private var bulkReviewClips: List<BulkReviewClip> = emptyList()
+    // Live status/log views on the Train page, updated in place by the poller so
+    // a running-status refresh never rebuilds the form and clobbers typed input.
+    private var trainStatusView: TextView? = null
+    private var trainLogView: TextView? = null
+    // Bumped every time we (re)enter the Train page or start a run, so a stale
+    // scheduled poll from an earlier page/run stops itself.
+    private var trainPollToken: Int = 0
+    private var startingTraining: Boolean = false
+    private val trainHandler = Handler(Looper.getMainLooper())
     // The server's authoritative recording list for the active wake word,
     // including takes captured on other devices. Null slug means not loaded yet.
     private var serverRecordingsSlug: String? = null
@@ -198,6 +207,7 @@ class MainActivity : Activity() {
             AppPage.Review -> renderReviewPage(project)
             AppPage.Detail -> renderDetailPage(project)
             AppPage.Test -> renderTestPage(project)
+            AppPage.Train -> renderTrainPage(project)
             AppPage.Settings -> renderSettingsPage()
         }
         renderBottomNav()
@@ -216,6 +226,7 @@ class MainActivity : Activity() {
         bottomNav.addView(navTab("Record", "●", AppPage.Record))
         bottomNav.addView(navTab("Review", "≡", AppPage.Review))
         bottomNav.addView(navTab("Test", "◇", AppPage.Test))
+        bottomNav.addView(navTab("Train", "▲", AppPage.Train))
         bottomNav.addView(navTab("Settings", "⚙", AppPage.Settings))
     }
 
@@ -1135,6 +1146,396 @@ class MainActivity : Activity() {
         player = null
         activePlaybackKey = null
         scoreCurveView?.setPlayhead(-1.0)
+    }
+
+    private fun renderTrainPage(project: WakeWordProject?) {
+        // A fresh render supersedes any in-flight poll loop from an earlier draw.
+        trainPollToken += 1
+        trainStatusView = null
+        trainLogView = null
+        workspace.removeAllViews()
+        workspace.addView(topBar("Train"))
+        if (project == null) {
+            workspace.addView(emptyCard("Create a wake word project and collect some recordings before training."))
+            maybeStatus()
+            return
+        }
+        workspace.addView(trainingFormCard(project))
+        workspace.addView(trainingStatusCard(project).withTop(dp(12)))
+        maybeStatus()
+        // Pull the current status once on entry; it self-schedules while running.
+        refreshTrainingStatus(project, showErrors = false)
+    }
+
+    private fun trainingFormCard(project: WakeWordProject): View {
+        val stepsInput = EditText(this).apply {
+            hint = "Training steps"
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(savedTrainSteps().toString())
+            styleInput()
+        }
+        val targetFpInput = EditText(this).apply {
+            hint = "Target false positives per hour"
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(formatFp(savedTrainTargetFp()))
+            styleInput()
+        }
+        val boostInput = EditText(this).apply {
+            hint = "Positive boost (replicate your voice)"
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(savedTrainPositiveBoost().toString())
+            styleInput()
+        }
+        // Persist the free-text numbers so a re-render (from a toggle below or the
+        // status poller) restores them instead of resetting to the saved value.
+        fun commitNumbers() {
+            saveTrainNumbers(
+                stepsInput.text.toString().trim().toIntOrNull(),
+                targetFpInput.text.toString().trim().toFloatOrNull(),
+                boostInput.text.toString().trim().toIntOrNull(),
+            )
+        }
+
+        val size = savedTrainModelSize()
+        val personal = savedTrainPersonal()
+
+        return card().apply {
+            addView(text("Train ${project.phrase}", 20f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "Runs on the sync server's GPU. Data is assembled from every wake word's clips, with this word's own clips as the positives.",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+
+            addView(text("Training steps", 15f, mutedColor()).withTop(dp(14)))
+            addView(stepsInput.withTop(dp(6)))
+
+            addView(text("Model size", 15f, mutedColor()).withTop(dp(14)))
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    fun sizeButton(value: String, leftPad: Boolean) =
+                        actionButton(
+                            value.replaceFirstChar { it.uppercase() },
+                            if (size == value) ButtonStyle.Primary else ButtonStyle.Secondary,
+                        ) {
+                            commitNumbers()
+                            setTrainModelSize(value)
+                        }.weight1().let { if (leftPad) it.withLeft(dp(8)) else it }
+                    addView(sizeButton("small", false))
+                    addView(sizeButton("medium", true))
+                    addView(sizeButton("large", true))
+                }.withTop(dp(8)),
+            )
+
+            addView(text("Target false positives / hour", 15f, mutedColor()).withTop(dp(14)))
+            addView(targetFpInput.withTop(dp(6)))
+
+            addView(text("Personal preset", 15f, mutedColor()).withTop(dp(14)))
+            addView(
+                text(
+                    if (personal) {
+                        "On: shrink the synthetic positive pool and weight your own recorded positives so a single-voice model favors you. Pair with positive boost."
+                    } else {
+                        "Off: standard mix of synthetic and recorded positives."
+                    },
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton("Off", if (!personal) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            commitNumbers(); setTrainPersonal(false)
+                        }.weight1(),
+                    )
+                    addView(
+                        actionButton("On", if (personal) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            commitNumbers(); setTrainPersonal(true)
+                        }.weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(8)),
+            )
+
+            addView(text("Positive boost", 15f, mutedColor()).withTop(dp(14)))
+            addView(boostInput.withTop(dp(6)))
+
+            addView(
+                actionButton("Start training", ButtonStyle.Primary) {
+                    commitNumbers()
+                    startTraining(project)
+                }.withTop(dp(16)),
+            )
+        }
+    }
+
+    private fun trainingStatusCard(project: WakeWordProject): View {
+        val statusView = text(
+            if (startingTraining) "Starting training…" else "Checking training status…",
+            14f,
+            textColor(),
+        )
+        trainStatusView = statusView
+        val logView = text("", 12f, mutedColor()).apply {
+            typeface = Typeface.MONOSPACE
+            visibility = View.GONE
+        }
+        trainLogView = logView
+        return card().apply {
+            addView(text("Status", 20f, textColor(), Typeface.BOLD))
+            addView(statusView.withTop(dp(8)))
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton("Refresh", ButtonStyle.Secondary) {
+                            refreshTrainingStatus(project, showErrors = true)
+                        }.weight1(),
+                    )
+                    addView(
+                        actionButton("View log", ButtonStyle.Secondary) {
+                            viewTrainingLog(project)
+                        }.weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(12)),
+            )
+            addView(logView.withTop(dp(12)))
+        }
+    }
+
+    private fun startTraining(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        val body = buildTrainRequestBody()
+        startingTraining = true
+        statusMessage = "Starting training…"
+        render()
+        Thread {
+            try {
+                val result = BundleSyncClient(serverUrl).startTraining(project.slug, body)
+                val name = result.optString("container_name", "")
+                runOnUiThread {
+                    startingTraining = false
+                    statusMessage = "Training started${if (name.isNotBlank()) " ($name)" else ""}"
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    startingTraining = false
+                    statusMessage = error.message ?: "Start training failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    private fun refreshTrainingStatus(project: WakeWordProject, showErrors: Boolean) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            trainStatusView?.text = "Set a sync server URL in Settings first"
+            return
+        }
+        val token = trainPollToken
+        Thread {
+            try {
+                val status = BundleSyncClient(serverUrl).trainingStatus(project.slug)
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    trainStatusView?.text = formatTrainingStatus(status)
+                    val state = status.optString("state", "")
+                    if (state == "running" || state == "starting") {
+                        scheduleTrainPoll(project)
+                    }
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    if (showErrors) {
+                        trainStatusView?.text = "Status error: ${error.message}"
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun scheduleTrainPoll(project: WakeWordProject) {
+        val token = trainPollToken
+        trainHandler.postDelayed({
+            if (currentPage == AppPage.Train && token == trainPollToken) {
+                refreshTrainingStatus(project, showErrors = false)
+            }
+        }, 4_000)
+    }
+
+    private fun viewTrainingLog(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        val token = trainPollToken
+        trainLogView?.let {
+            it.visibility = View.VISIBLE
+            it.text = "Loading log…"
+        }
+        Thread {
+            try {
+                val log = BundleSyncClient(serverUrl).trainingLog(project.slug, tail = 200)
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    trainLogView?.apply {
+                        visibility = View.VISIBLE
+                        text = log
+                    }
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    trainLogView?.apply {
+                        visibility = View.VISIBLE
+                        text = "Log error: ${error.message}"
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun formatTrainingStatus(status: org.json.JSONObject): String {
+        val state = status.optString("state", "unknown")
+        val step = status.optString("step", "")
+        val message = status.optString("message", "")
+        val running = status.optBoolean("container_running", false)
+        val hasModel = status.optBoolean("has_model", false)
+        val label = when (state) {
+            "running" -> "Running"
+            "starting" -> "Starting"
+            "succeeded" -> "Succeeded"
+            "failed" -> "Failed"
+            "stopped" -> "Stopped"
+            "none" -> "No run yet"
+            else -> state
+        }
+        val estimatedTotal = status.optLong("estimated_total_ms", -1)
+        val remaining = status.optLong("remaining_ms", -1)
+        val elapsed = status.optLong("elapsed_ms", -1)
+        val duration = status.optLong("duration_ms", -1)
+        val basedOn = status.optInt("based_on_runs", 0)
+        return buildString {
+            append("State: $label")
+            if (state == "running" && step.isNotBlank()) append("  ·  step: $step")
+            if (message.isNotBlank()) append("\n$message")
+            if (state == "running" || state == "starting") {
+                append(if (running) "\nTrainer container is alive." else "\nWaiting on trainer container…")
+                if (remaining >= 0) {
+                    append("\nEstimated remaining: ${formatDuration(remaining)}")
+                    if (elapsed >= 0) append("  ·  elapsed ${formatDuration(elapsed)}")
+                } else if (estimatedTotal >= 0) {
+                    append("\nEstimated total: ~${formatDuration(estimatedTotal)}")
+                }
+                if (estimatedTotal >= 0 && basedOn > 0) {
+                    append("\n(estimate from $basedOn past run${if (basedOn == 1) "" else "s"})")
+                } else if (estimatedTotal < 0) {
+                    append("\nNo time estimate yet — first run will set the benchmark.")
+                }
+            }
+            if (duration >= 0) append("\nTook: ${formatDuration(duration)}")
+            if (hasModel) append("\nA trained model is present for this wake word.")
+        }
+    }
+
+    /** Human-friendly duration from milliseconds, e.g. "1h 12m" or "3m 40s". */
+    private fun formatDuration(ms: Long): String {
+        val totalSeconds = ms / 1000
+        val hours = totalSeconds / 3600
+        val minutes = (totalSeconds % 3600) / 60
+        val seconds = totalSeconds % 60
+        return when {
+            hours > 0 -> "${hours}h ${minutes}m"
+            minutes > 0 -> "${minutes}m ${seconds}s"
+            else -> "${seconds}s"
+        }
+    }
+
+    private fun buildTrainRequestBody(): String {
+        val steps = savedTrainSteps()
+        val size = savedTrainModelSize()
+        val targetFp = savedTrainTargetFp()
+        val personal = savedTrainPersonal()
+        val boost = savedTrainPositiveBoost()
+        return """
+            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost}
+        """.trimIndent()
+    }
+
+    private fun formatFp(value: Float): String {
+        return if (value == value.toLong().toFloat()) value.toLong().toString() else value.toString()
+    }
+
+    private fun savedTrainSteps(): Int {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_TRAIN_STEPS, 50_000)
+            .coerceIn(100, 500_000)
+    }
+
+    private fun savedTrainModelSize(): String {
+        val value = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_TRAIN_MODEL_SIZE, "medium") ?: "medium"
+        return if (value in listOf("small", "medium", "large")) value else "medium"
+    }
+
+    private fun savedTrainTargetFp(): Float {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getFloat(KEY_TRAIN_TARGET_FP, 0.2f)
+            .coerceIn(0f, 100f)
+    }
+
+    private fun savedTrainPersonal(): Boolean {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_TRAIN_PERSONAL, false)
+    }
+
+    private fun savedTrainPositiveBoost(): Int {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_TRAIN_POSITIVE_BOOST, 1)
+            .coerceIn(1, 50)
+    }
+
+    private fun saveTrainNumbers(steps: Int?, targetFp: Float?, boost: Int?) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE).edit().apply {
+            if (steps != null) putInt(KEY_TRAIN_STEPS, steps.coerceIn(100, 500_000))
+            if (targetFp != null) putFloat(KEY_TRAIN_TARGET_FP, targetFp.coerceIn(0f, 100f))
+            if (boost != null) putInt(KEY_TRAIN_POSITIVE_BOOST, boost.coerceIn(1, 50))
+        }.apply()
+    }
+
+    private fun setTrainModelSize(value: String) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit().putString(KEY_TRAIN_MODEL_SIZE, value).apply()
+        render()
+    }
+
+    private fun setTrainPersonal(enabled: Boolean) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_TRAIN_PERSONAL, enabled).apply()
+        render()
     }
 
     private fun renderSettingsPage() {
@@ -3010,6 +3411,11 @@ class MainActivity : Activity() {
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"
         const val KEY_BULK_POSITIVE_DENSE = "bulk_positive_dense"
         const val KEY_BULK_SCRIPT_STYLE = "bulk_script_style"
+        const val KEY_TRAIN_STEPS = "train_steps"
+        const val KEY_TRAIN_MODEL_SIZE = "train_model_size"
+        const val KEY_TRAIN_TARGET_FP = "train_target_fp"
+        const val KEY_TRAIN_PERSONAL = "train_personal"
+        const val KEY_TRAIN_POSITIVE_BOOST = "train_positive_boost"
         const val KEY_DARK_MODE = "dark_mode"
         const val KEY_APPEARANCE = "appearance_mode"
         const val APPEARANCE_SYSTEM = "system"
@@ -3024,6 +3430,7 @@ class MainActivity : Activity() {
         Review,
         Detail,
         Test,
+        Train,
         Settings,
     }
 

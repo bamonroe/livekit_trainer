@@ -246,6 +246,19 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             imported_at_ms INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS training_runs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug          TEXT NOT NULL,
+            steps         INTEGER NOT NULL,
+            model_size    TEXT,
+            personal      INTEGER NOT NULL DEFAULT 0,
+            started_at    TEXT NOT NULL,
+            finished_at   TEXT,
+            duration_ms   INTEGER,
+            state         TEXT NOT NULL,
+            UNIQUE(slug, started_at)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_slices_project ON slices(project_slug, status);
         CREATE INDEX IF NOT EXISTS idx_slices_recording ON slices(recording_id, status);
         CREATE INDEX IF NOT EXISTS idx_slices_file ON slices(project_slug, category, file_name);
@@ -664,6 +677,79 @@ pub fn project_phrase(
         |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .optional()
+}
+
+/// Record a completed (terminal) training run. Idempotent on (slug, started_at),
+/// so it is safe to call on every status poll — repeats are ignored.
+pub fn record_training_run(
+    conn: &Connection,
+    slug: &str,
+    steps: i64,
+    model_size: Option<&str>,
+    personal: bool,
+    started_at: &str,
+    finished_at: Option<&str>,
+    duration_ms: Option<i64>,
+    state: &str,
+) -> Result<bool, rusqlite::Error> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO training_runs
+           (slug, steps, model_size, personal, started_at, finished_at, duration_ms, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            slug,
+            steps,
+            model_size,
+            personal as i64,
+            started_at,
+            finished_at,
+            duration_ms,
+            state
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Average milliseconds per training step from past *successful* runs, preferring
+/// the same model size and falling back to all sizes when that size has no
+/// history. Returns (avg_ms_per_step, run_count), or None when there is no data.
+pub fn avg_ms_per_step(
+    conn: &Connection,
+    model_size: Option<&str>,
+) -> Result<Option<(f64, i64)>, rusqlite::Error> {
+    if let Some(size) = model_size {
+        if let Some(result) = avg_ms_per_step_where(conn, Some(size))? {
+            return Ok(Some(result));
+        }
+    }
+    avg_ms_per_step_where(conn, None)
+}
+
+fn avg_ms_per_step_where(
+    conn: &Connection,
+    model_size: Option<&str>,
+) -> Result<Option<(f64, i64)>, rusqlite::Error> {
+    let row: (Option<f64>, i64) = match model_size {
+        Some(size) => conn.query_row(
+            "SELECT AVG(CAST(duration_ms AS REAL) / steps), COUNT(*)
+               FROM training_runs
+              WHERE state = 'succeeded' AND duration_ms IS NOT NULL AND steps > 0
+                AND model_size = ?1",
+            params![size],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?,
+        None => conn.query_row(
+            "SELECT AVG(CAST(duration_ms AS REAL) / steps), COUNT(*)
+               FROM training_runs
+              WHERE state = 'succeeded' AND duration_ms IS NOT NULL AND steps > 0",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?,
+    };
+    match row {
+        (Some(avg), count) if count > 0 => Ok(Some((avg, count))),
+        _ => Ok(None),
+    }
 }
 
 /// Delete a recording and everything derived from it (transcripts, words,
