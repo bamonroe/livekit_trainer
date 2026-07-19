@@ -26,6 +26,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -246,12 +247,23 @@ class MainActivity : Activity() {
             )
             setOnClickListener {
                 if (currentPage != page) {
+                    hideKeyboard()
                     statusMessage = ""
                     currentPage = page
                     render()
                 }
             }
         }
+    }
+
+    // Drop keyboard focus before switching pages. A focused EditText (e.g. on the
+    // Train form) otherwise keeps the soft keyboard up and the window resized after
+    // its views are gone, which locks scrolling on the next page.
+    private fun hideKeyboard() {
+        val focus = currentFocus
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow((focus ?: root).windowToken, 0)
+        focus?.clearFocus()
     }
 
     private fun topBar(title: String, showBack: Boolean = false): View {
@@ -263,6 +275,7 @@ class MainActivity : Activity() {
                 addView(
                     iconButton("‹").apply {
                         setOnClickListener {
+                            hideKeyboard()
                             currentPage = AppPage.Review
                             render()
                         }
