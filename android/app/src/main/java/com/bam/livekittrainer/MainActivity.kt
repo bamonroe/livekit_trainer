@@ -30,6 +30,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import java.io.File
 import java.security.MessageDigest
@@ -79,6 +80,17 @@ class MainActivity : Activity() {
     private var alignmentPlaybackMs: Int = 0
     private var alignmentPlaybackStartUptimeMs: Long = 0L
     private var lastScheduledAlignmentBoundaryMs: Int = -1
+    // Model-test scoring state for the Test page. The score curve is fixed once
+    // loaded; the threshold slider only re-interprets it, so slider drags update
+    // the curve view and counts label in place rather than re-rendering the page.
+    private var scoreProjectSlug: String? = null
+    private var scoreRecordingId: String? = null
+    private var scoreResult: ScoreResult? = null
+    private var loadingScore: Boolean = false
+    private var scoreThreshold: Double = 0.5
+    private var scoreCurveView: ScoreCurveView? = null
+    private var scoreCountsText: TextView? = null
+    private var scorePlaybackTicker: Runnable? = null
     private var player: MediaPlayer? = null
     private var activePlaybackKey: String? = null
     private val playbackHandler = Handler(Looper.getMainLooper())
@@ -163,6 +175,7 @@ class MainActivity : Activity() {
             AppPage.Record -> renderRecordPage(project)
             AppPage.Review -> renderReviewPage(project)
             AppPage.Detail -> renderDetailPage(project)
+            AppPage.Test -> renderTestPage(project)
             AppPage.Settings -> renderSettingsPage()
         }
         renderBottomNav()
@@ -180,6 +193,7 @@ class MainActivity : Activity() {
         bottomNav.setPadding(dp(6), dp(6), dp(6), dp(6))
         bottomNav.addView(navTab("Record", "●", AppPage.Record))
         bottomNav.addView(navTab("Review", "≡", AppPage.Review))
+        bottomNav.addView(navTab("Test", "◇", AppPage.Test))
         bottomNav.addView(navTab("Settings", "⚙", AppPage.Settings))
     }
 
@@ -371,6 +385,306 @@ class MainActivity : Activity() {
         }
         workspace.addView(bulkRecordingDetailCard(project, recording))
         maybeStatus()
+    }
+
+    private fun renderTestPage(project: WakeWordProject?) {
+        // Rebuilding the page drops the old curve view; forget the stale refs so
+        // in-place slider/playhead updates never touch a detached view.
+        scoreCurveView = null
+        scoreCountsText = null
+        workspace.removeAllViews()
+        workspace.addView(topBar("Test"))
+        if (project == null) {
+            workspace.addView(emptyCard("Create a project and record a take first, then test the model against it."))
+            maybeStatus()
+            return
+        }
+        ensureServerRecordings(project)
+        workspace.addView(testPickerCard(project))
+        val result = scoreResult?.takeIf { scoreProjectSlug == project.slug }
+        if (result != null || loadingScore) {
+            workspace.addView(scoreResultCard(project, result).withTop(dp(12)))
+        }
+        maybeStatus()
+    }
+
+    private fun testPickerCard(project: WakeWordProject): View {
+        val recordings = if (serverRecordingsSlug == project.slug) {
+            serverRecordings.filter { !it.isBackground }
+        } else {
+            emptyList()
+        }
+        return card().apply {
+            addView(text("Model test", 20f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "Score a recorded take against the trained model in continuous mode — the honest streaming test. " +
+                        "Green markers are wake words the model caught; red are misses.",
+                    14f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            when {
+                loadingServerRecordings && recordings.isEmpty() ->
+                    addView(text("Loading recordings…", 14f, mutedColor()).withTop(dp(12)))
+                recordings.isEmpty() ->
+                    addView(text("No recordings on the server yet for this wake word.", 14f, mutedColor()).withTop(dp(12)))
+                else -> recordings.forEach { recording ->
+                    addView(testRecordingRow(project, recording).withTop(dp(8)))
+                }
+            }
+        }
+    }
+
+    private fun testRecordingRow(project: WakeWordProject, recording: ServerRecording): View {
+        val selected = scoreRecordingId == recording.id
+        val subtitle = buildString {
+            append("${recording.durationMs / 1000}s · ${formatRecordedAt(recording.recordedAtMillis)}")
+            recording.deviceLabel?.let { append(" · $it") }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(if (selected) navActiveColor() else promptColor(), dp(12), strokeColor())
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    addView(text(recording.id.takeLast(8), 15f, textColor(), Typeface.BOLD))
+                    addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
+                },
+            )
+            val busy = loadingScore && selected
+            addView(
+                actionButton(if (busy) "Scoring…" else "Score", ButtonStyle.Primary) {
+                    loadScore(project, recording.id)
+                }.apply { isEnabled = !loadingScore },
+            )
+        }
+    }
+
+    private fun scoreResultCard(project: WakeWordProject, result: ScoreResult?): View {
+        return card().apply {
+            if (result == null) {
+                addView(text("Scoring…", 20f, textColor(), Typeface.BOLD))
+                addView(
+                    text(
+                        "Replaying the take through the model. This can take a minute for a long recording.",
+                        14f,
+                        mutedColor(),
+                    ).withTop(dp(6)),
+                )
+                return@apply
+            }
+
+            addView(text("Score  ${result.sourceRecording.takeLast(8)}", 20f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "“${result.phrase}” · continuous mode · ${"%.1f".format(result.durationMs / 1000.0)}s",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(2)),
+            )
+
+            val curve = ScoreCurveView(this@MainActivity).apply {
+                setColors(
+                    curve = ACCENT,
+                    grid = strokeColor(),
+                    hit = Color.rgb(30, 132, 73),
+                    miss = Color.rgb(190, 45, 45),
+                    threshold = mutedColor(),
+                    label = mutedColor(),
+                )
+                setData(result.timesMs, result.scores, result.targets, result.durationMs)
+                setThreshold(scoreThreshold)
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            }
+            scoreCurveView = curve
+            addView(curve.withTop(dp(12)))
+
+            val counts = text(scoreCountsSummary(result, scoreThreshold), 15f, textColor(), Typeface.BOLD)
+            scoreCountsText = counts
+            addView(counts.withTop(dp(10)))
+
+            addView(text("Detection threshold  ${"%.2f".format(scoreThreshold)}", 13f, mutedColor()).withTop(dp(10)))
+            val thresholdLabel = getChildAt(childCount - 1) as TextView
+            addView(
+                SeekBar(this@MainActivity).apply {
+                    max = 100
+                    progress = (scoreThreshold * 100).toInt().coerceIn(0, 100)
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                            scoreThreshold = value / 100.0
+                            thresholdLabel.text = "Detection threshold  ${"%.2f".format(scoreThreshold)}"
+                            scoreCurveView?.setThreshold(scoreThreshold)
+                            scoreCountsText?.text = scoreCountsSummary(result, scoreThreshold)
+                        }
+
+                        override fun onStartTrackingTouch(bar: SeekBar) {}
+                        override fun onStopTrackingTouch(bar: SeekBar) {}
+                    })
+                }.withTop(dp(4)),
+            )
+
+            val playbackKey = "score:${result.sourceRecording}"
+            val playing = activePlaybackKey == playbackKey && player?.isPlaying == true
+            addView(
+                actionButton(if (playing) "◼  Stop playback" else "▶  Play take", ButtonStyle.Secondary) {
+                    playScoreSource(project, result)
+                }.withTop(dp(12)),
+            )
+            addView(
+                text(
+                    "Slide the threshold to see how many wake words the model keeps and how many false alarms it adds. " +
+                        "Nothing here is added to your training data.",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(10)),
+            )
+        }
+    }
+
+    /** True positives / misses / false alarms recomputed live at [threshold]. */
+    private fun scoreCountsSummary(result: ScoreResult, threshold: Double): String {
+        val detected = result.targets.count { it.peakScore >= threshold }
+        val missed = result.targets.size - detected
+        val falseAlarms = countFalseAlarms(result, threshold)
+        return "Detected $detected/${result.targets.size} · missed $missed · false alarms $falseAlarms"
+    }
+
+    /**
+     * Count rising crossings above [threshold] that fall outside every located
+     * wake-phrase window — a client-side estimate of false alarms so the slider
+     * stays live without re-hitting the server.
+     */
+    private fun countFalseAlarms(result: ScoreResult, threshold: Double): Int {
+        if (result.scores.isEmpty()) return 0
+        val windows = result.targets.map { (it.startMs - 150.0) to (it.endMs + 450.0) }
+        var count = 0
+        var prevAbove = false
+        for (index in result.scores.indices) {
+            val above = result.scores[index] >= threshold
+            if (above && !prevAbove) {
+                val timeMs = result.timesMs.getOrElse(index) { 0.0 }
+                val inTarget = windows.any { timeMs >= it.first && timeMs <= it.second }
+                if (!inTarget) count++
+            }
+            prevAbove = above
+        }
+        return count
+    }
+
+    private fun loadScore(project: WakeWordProject, recordingId: String) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        stopScorePlayback()
+        loadingScore = true
+        scoreProjectSlug = project.slug
+        scoreRecordingId = recordingId
+        scoreResult = null
+        statusMessage = "Scoring ${recordingId.takeLast(8)} in continuous mode…"
+        render()
+
+        Thread {
+            try {
+                val result = BundleSyncClient(serverUrl)
+                    .loadScore(project.slug, recordingId, "full", scoreThreshold)
+                runOnUiThread {
+                    scoreProjectSlug = project.slug
+                    scoreResult = result
+                    loadingScore = false
+                    statusMessage =
+                        "Detected ${result.truePositives}/${result.targets.size} wake words in continuous mode"
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    loadingScore = false
+                    statusMessage = error.message ?: "Scoring failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    private fun playScoreSource(project: WakeWordProject, result: ScoreResult) {
+        val playbackKey = "score:${result.sourceRecording}"
+        player?.let { current ->
+            if (activePlaybackKey == playbackKey) {
+                if (current.isPlaying) {
+                    current.pause()
+                    stopScoreTicker()
+                } else {
+                    current.start()
+                    startScoreTicker()
+                }
+                render()
+                return
+            }
+        }
+        stopScorePlayback()
+        activePlaybackKey = playbackKey
+        try {
+            val url = BundleSyncClient(savedServerUrl())
+                .sourceAudioUrl(project.slug, result.sourceRecording)
+            player = MediaPlayer().apply {
+                setDataSource(url)
+                setOnPreparedListener {
+                    it.start()
+                    startScoreTicker()
+                    render()
+                }
+                setOnCompletionListener {
+                    stopScoreTicker()
+                    it.release()
+                    if (player === it) player = null
+                    activePlaybackKey = null
+                    scoreCurveView?.setPlayhead(-1.0)
+                    render()
+                }
+                prepareAsync()
+            }
+            statusMessage = "Loading take audio"
+        } catch (error: Exception) {
+            activePlaybackKey = null
+            player = null
+            statusMessage = error.message ?: "Could not play take"
+        }
+        render()
+    }
+
+    private fun startScoreTicker() {
+        stopScoreTicker()
+        val ticker = object : Runnable {
+            override fun run() {
+                val active = player ?: return
+                scoreCurveView?.setPlayhead(active.currentPosition.toDouble())
+                if (active.isPlaying) {
+                    playbackHandler.postDelayed(this, 60)
+                }
+            }
+        }
+        scorePlaybackTicker = ticker
+        playbackHandler.post(ticker)
+    }
+
+    private fun stopScoreTicker() {
+        scorePlaybackTicker?.let { playbackHandler.removeCallbacks(it) }
+        scorePlaybackTicker = null
+    }
+
+    private fun stopScorePlayback() {
+        stopScoreTicker()
+        player?.release()
+        player = null
+        activePlaybackKey = null
+        scoreCurveView?.setPlayhead(-1.0)
     }
 
     private fun renderSettingsPage() {
@@ -1619,6 +1933,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopAlignmentTicker()
+        stopScoreTicker()
         player?.release()
         player = null
         activePlaybackKey = null
@@ -2205,6 +2521,7 @@ class MainActivity : Activity() {
         Record,
         Review,
         Detail,
+        Test,
         Settings,
     }
 

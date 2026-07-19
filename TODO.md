@@ -32,7 +32,18 @@ discovered. Prefer small, actionable items with clear status.
     the training pool. (Interim: `/score` runs against existing bulk recordings,
     which is enough for the honest diagnostic; a dedicated test channel is only
     needed once the app records test-only takes.)
-  - [ ] App: "record test" prompt flow + score-curve/threshold/pad UI.
+  - [~] App: score-curve/threshold UI + "record test" prompt flow. Done: a
+    **Test** tab (`AppPage.Test`) that lists the wake word's server recordings,
+    scores any of them in `full` continuous mode via `GET /score`, and draws the
+    detection curve (`ScoreCurveView`) with per-utterance green/red hit/miss
+    markers, a dashed threshold line, a live threshold slider that recomputes
+    detected/missed/false-alarm counts client-side, and source playback with a
+    moving playhead. Nothing on this page touches training data. Verified on the
+    emulator against the retrained `all_set` model (real take → 1/1 detected,
+    peak ~0.97, live re-threshold works). Remaining: a dedicated "record a fresh
+    test take" button + silence-pad slider — blocked on the test-only storage
+    channel below (recording+uploading a take today would pollute the training
+    pool).
   - [ ] Host-runnable unit test for the scorer (currently validated only via
     the container smoke test).
   First model under test: `output/all_set/all_set.onnx` — see

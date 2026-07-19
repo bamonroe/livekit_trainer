@@ -268,6 +268,73 @@ class BundleSyncClient(
         )
     }
 
+    /**
+     * Score an already-uploaded, already-transcribed take against the trained
+     * model. `mode` is "full" (continuous rolling window, the honest streaming
+     * test) or "reset" (silence-padded per step). Returns the detection curve
+     * plus per-utterance peak scores. Scoring replays the whole take through the
+     * model, so this can take a while for long recordings.
+     */
+    fun loadScore(
+        wakeWordSlug: String,
+        sourceRecording: String,
+        mode: String = "full",
+        threshold: Double = 0.5,
+    ): ScoreResult {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') +
+                "/score/${urlPart(wakeWordSlug)}/${urlPart(sourceRecording)}" +
+                "?mode=${urlPart(mode)}&threshold=$threshold",
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 180_000
+        val response = readResponse(connection, "Score failed")
+        val root = JSONObject(response)
+        val timesArr = root.getJSONArray("times_ms")
+        val scoresArr = root.getJSONArray("scores")
+        val targetsArr = root.getJSONArray("targets")
+        return ScoreResult(
+            sourceRecording = root.optString("source_recording", sourceRecording),
+            phrase = root.optString("phrase"),
+            mode = root.optString("mode", mode),
+            threshold = root.optDouble("threshold", threshold),
+            durationMs = root.optDouble("duration_ms", 0.0),
+            windowMs = root.optInt("window_ms", 2000),
+            stepMs = root.optInt("step_ms", 0),
+            timesMs = buildList {
+                for (index in 0 until timesArr.length()) add(timesArr.getDouble(index))
+            },
+            scores = buildList {
+                for (index in 0 until scoresArr.length()) add(scoresArr.getDouble(index))
+            },
+            targets = buildList {
+                for (index in 0 until targetsArr.length()) {
+                    val item = targetsArr.getJSONObject(index)
+                    add(
+                        ScoreTarget(
+                            text = item.optString("text").trim(),
+                            startMs = item.optDouble("start_ms", 0.0),
+                            endMs = item.optDouble("end_ms", 0.0),
+                            peakScore = item.optDouble("peak_score", 0.0),
+                            peakTimeMs = item.optDouble("peak_time_ms", 0.0),
+                            detected = item.optBoolean("detected", false),
+                        ),
+                    )
+                }
+            },
+            truePositives = root.optInt("true_positives", 0),
+            falseNegatives = root.optInt("false_negatives", 0),
+            falsePositives = root.optInt("false_positives", 0),
+        )
+    }
+
+    /** Streaming URL for a stored bulk take's full source audio. */
+    fun sourceAudioUrl(wakeWordSlug: String, sourceRecording: String): String {
+        return bulkSourceAudioUrl(wakeWordSlug, sourceRecording)
+    }
+
     /** Re-run alignment and slicing on the server from already-uploaded audio. */
     fun reprocessProject(wakeWordSlug: String): String {
         return postReprocess(serverUrl.trimEnd('/') + "/reprocess/${urlPart(wakeWordSlug)}")
