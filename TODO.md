@@ -7,6 +7,17 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [x] Context-fix recipe baked into the pipeline. Was a manual bind-mount
+  (`train_ctxfix.sh`) + hand-written `all_set_ctx.yaml`; now every training run
+  the app/sync-server launches gets it. `Dockerfile.trainer` copies
+  `patches/augment_ctxfix.py` over `livekit.wakeword.data.augment` (already
+  includes the parallel-augmentation change), and `generate_config.py` emits
+  `augmentation.background_paths` by default (`--no-context-fix` opts out).
+  `livekit-wakeword-trainer:latest` rebuilt and verified: image module carries
+  both the `CTXFIX` re-mix and `ProcessPoolExecutor`. **Next: retrain `all_set`
+  through the app pipeline and re-run `scripts/compare_models.py` — this is the
+  first run that should actually move continuous/full-mode recall off ~0.**
+
 - [x] Offline model-comparison suite. Scorer `POST /compare` scores one uploaded
   take through several models on a shared time grid (keyed by model *dir* name,
   so `all_set` vs `all_set_prev_silencepad` stay distinct despite sharing an
