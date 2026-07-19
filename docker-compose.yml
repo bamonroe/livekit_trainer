@@ -28,10 +28,14 @@ services:
     volumes:
       - ./data:/data
       - ./incoming:/incoming
+      # Read-only view of trained models, used only to fingerprint the .onnx so
+      # cached score curves invalidate when a wake word is retrained.
+      - ./output:/output:ro
     environment:
       BIND_ADDR: "0.0.0.0:8765"
       DATA_ROOT: "/data/real"
       INCOMING_ROOT: "/incoming/bundles"
+      MODELS_DIR: "/output"
       # Where recorded audio is transcribed. This is the source of truth for the
       # Whisper server; the Android app no longer configures it.
       WHISPER_SERVER_URL: "${WHISPER_SERVER_URL:-http://pickle.bam.net:8572}"

@@ -49,6 +49,16 @@ discovered. Prefer small, actionable items with clear status.
     and source playback with a moving playhead. Nothing on this page touches
     training data. (Note: `reset` "Padded" is a fixed silence-pad, not yet a
     variable pad-amount slider; a variable pad would need a scorer param.)
+  - [x] Cache score curves so re-scoring a take is instant. The expensive step
+    is replaying the WAV through the model; the result curve depends only on the
+    audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client
+    re-interprets for free). `score_curves` table keys the curve on
+    `(recording_id, mode, step_ms, keep_ms)` plus a model fingerprint (size +
+    mtime of `output/<slug>/<slug>.onnx`, read via the new read-only `/output`
+    mount + `MODELS_DIR`); a fingerprint mismatch after a retrain misses and
+    re-scores. `nocache=1` forces a fresh run; deleting a recording clears its
+    cached curves. Verified: cold 9.2s → warm ~0.00s (identical curve, same
+    TP/FN), survives a container restart (cache is in the SQLite DB).
   - [ ] Host-runnable unit test for the scorer (currently validated only via
     the container smoke test).
   First model under test: `output/all_set/all_set.onnx` — see

@@ -221,6 +221,19 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             created_at_ms  INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS score_curves (
+            recording_id  TEXT NOT NULL,
+            mode          TEXT NOT NULL,
+            step_ms       INTEGER NOT NULL,
+            keep_ms       INTEGER NOT NULL,
+            model_fp      TEXT NOT NULL,
+            duration_ms   REAL NOT NULL,
+            times_ms      TEXT NOT NULL,
+            scores        TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (recording_id, mode, step_ms, keep_ms)
+        );
+
         CREATE TABLE IF NOT EXISTS clips (
             id            TEXT PRIMARY KEY,
             project_slug  TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
@@ -656,11 +669,91 @@ pub fn project_phrase(
 /// Delete a recording and everything derived from it (transcripts, words,
 /// prompts, slices cascade). WAV files on disk are removed by the caller.
 pub fn delete_recording(conn: &Connection, recording_id: &str) -> Result<bool, rusqlite::Error> {
+    // score_curves has no FK to bulk_recordings (test takes score too), so clear
+    // any cached curves for this recording explicitly when it goes away.
+    conn.execute(
+        "DELETE FROM score_curves WHERE recording_id = ?1",
+        params![recording_id],
+    )?;
     let changed = conn.execute(
         "DELETE FROM bulk_recordings WHERE id = ?1",
         params![recording_id],
     )?;
     Ok(changed > 0)
+}
+
+/// A cached rolling-score curve for a recording, valid only if the stored model
+/// fingerprint still matches the current model. Returns `(duration_ms, times_ms,
+/// scores)`. A fingerprint mismatch is treated as a miss (stale model).
+pub fn cached_score_curve(
+    conn: &Connection,
+    recording_id: &str,
+    mode: &str,
+    step_ms: u64,
+    keep_ms: u64,
+    model_fp: &str,
+) -> Result<Option<(f64, Vec<f64>, Vec<f64>)>, rusqlite::Error> {
+    let row = conn
+        .query_row(
+            "SELECT duration_ms, times_ms, scores FROM score_curves
+             WHERE recording_id = ?1 AND mode = ?2 AND step_ms = ?3
+               AND keep_ms = ?4 AND model_fp = ?5",
+            params![recording_id, mode, step_ms as i64, keep_ms as i64, model_fp],
+            |row| {
+                let duration_ms: f64 = row.get(0)?;
+                let times_json: String = row.get(1)?;
+                let scores_json: String = row.get(2)?;
+                Ok((duration_ms, times_json, scores_json))
+            },
+        )
+        .optional()?;
+    let Some((duration_ms, times_json, scores_json)) = row else {
+        return Ok(None);
+    };
+    // Corrupt cached JSON should behave as a miss, not blow up the request.
+    let (Ok(times_ms), Ok(scores)) = (
+        serde_json::from_str::<Vec<f64>>(&times_json),
+        serde_json::from_str::<Vec<f64>>(&scores_json),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((duration_ms, times_ms, scores)))
+}
+
+/// Cache a freshly computed score curve, replacing any prior entry for the same
+/// recording/mode/params (e.g. after a retrain changed the fingerprint).
+#[allow(clippy::too_many_arguments)]
+pub fn store_score_curve(
+    conn: &Connection,
+    recording_id: &str,
+    mode: &str,
+    step_ms: u64,
+    keep_ms: u64,
+    model_fp: &str,
+    duration_ms: f64,
+    times_ms: &[f64],
+    scores: &[f64],
+    now_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    let times_json = serde_json::to_string(times_ms).unwrap_or_else(|_| "[]".to_string());
+    let scores_json = serde_json::to_string(scores).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT OR REPLACE INTO score_curves
+         (recording_id, mode, step_ms, keep_ms, model_fp, duration_ms, times_ms, scores, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            recording_id,
+            mode,
+            step_ms as i64,
+            keep_ms as i64,
+            model_fp,
+            duration_ms,
+            times_json,
+            scores_json,
+            now_ms
+        ],
+    )?;
+    Ok(())
 }
 
 /// The script for a recording, if known.

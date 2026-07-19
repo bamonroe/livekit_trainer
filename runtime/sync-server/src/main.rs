@@ -63,6 +63,10 @@ struct AppState {
     // Wake-word scorer service URL from SCORER_SERVER_URL. Optional: only the
     // model-test scoring endpoint needs it; the rest of the server works without.
     scorer_url: Arc<Option<String>>,
+    // Trained-model directory (MODELS_DIR), mounted read-only. Used only to
+    // fingerprint the .onnx so cached score curves invalidate when a model is
+    // retrained. May not exist; then the fingerprint is a sentinel.
+    models_root: Arc<PathBuf>,
     db: Arc<Mutex<Connection>>,
 }
 
@@ -432,6 +436,12 @@ async fn main() {
         None => println!("SCORER_SERVER_URL not set; model-test scoring disabled"),
     }
 
+    let models_root = env::var("MODELS_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/output".to_string());
+
     let state = AppState {
         data_root: Arc::new(PathBuf::from(data_root)),
         incoming_root: Arc::new(PathBuf::from(incoming_root)),
@@ -439,6 +449,7 @@ async fn main() {
         settings_path: Arc::new(settings_path),
         whisper_url: Arc::new(whisper_url),
         scorer_url: Arc::new(scorer_url),
+        models_root: Arc::new(PathBuf::from(models_root)),
         db: Arc::new(Mutex::new(db)),
     };
 
@@ -1012,15 +1023,48 @@ async fn score_recording(
         (phrase, words)
     };
 
-    let wav_path = state
-        .data_root
-        .join(&slug)
-        .join("bulk_source")
-        .join(format!("{}.wav", safe_filename(&recording_id)));
-    let wav = fs::read(&wav_path)
-        .map_err(|_| AppError::bad_request(format!("no source audio for {recording_id}")))?;
+    // Fingerprint the trained model so a cached curve is reused only while the
+    // model that produced it is unchanged; retraining flips the fingerprint and
+    // the next request re-scores. `nocache=1` forces a fresh run.
+    let model_fp = model_fingerprint(&state.models_root, &slug);
+    let force = params.get("nocache").map(String::as_str) == Some("1");
 
-    let curve = run_scorer(&scorer_url, wav, &slug, mode, step_ms, keep_ms).await?;
+    let cached = if force {
+        None
+    } else {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::cached_score_curve(&conn, &recording_id, mode, step_ms, keep_ms, &model_fp)
+            .map_err(db_error)?
+    };
+
+    let curve = if let Some((duration_ms, times_ms, scores)) = cached {
+        ScorerCurve { duration_ms, times_ms, scores }
+    } else {
+        let wav_path = state
+            .data_root
+            .join(&slug)
+            .join("bulk_source")
+            .join(format!("{}.wav", safe_filename(&recording_id)));
+        let wav = fs::read(&wav_path)
+            .map_err(|_| AppError::bad_request(format!("no source audio for {recording_id}")))?;
+
+        let curve = run_scorer(&scorer_url, wav, &slug, mode, step_ms, keep_ms).await?;
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::store_score_curve(
+            &conn,
+            &recording_id,
+            mode,
+            step_ms,
+            keep_ms,
+            &model_fp,
+            curve.duration_ms,
+            &curve.times_ms,
+            &curve.scores,
+            now_ms(),
+        )
+        .map_err(db_error)?;
+        curve
+    };
 
     let targets = locate_targets(&phrase, &words, &curve, threshold);
     let true_positives = targets.iter().filter(|t| t.detected).count();
@@ -1056,6 +1100,25 @@ fn parse_query(raw: Option<&str>) -> std::collections::HashMap<String, String> {
         map.insert(key.to_string(), value.to_string());
     }
     map
+}
+
+/// Fingerprint the trained `.onnx` for a wake word so cached score curves stay
+/// valid only while that exact model file is in place. Uses size + modified
+/// time — cheap and flips on any retrain/export. Missing model or unreadable
+/// metadata yields a stable sentinel so caching still works but never masks a
+/// swapped model (a later present model changes the fingerprint).
+fn model_fingerprint(models_root: &Path, slug: &str) -> String {
+    let path = models_root.join(slug).join(format!("{slug}.onnx"));
+    let Ok(meta) = fs::metadata(&path) else {
+        return "nomodel".to_string();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", meta.len(), mtime)
 }
 
 /// POST the WAV to the scorer service and parse its rolling-score curve.
