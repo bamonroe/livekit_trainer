@@ -637,11 +637,30 @@ class MainActivity : Activity() {
         val testTakes = recordings.filter { it.isTest }
         val trainingTakes = recordings.filter { !it.isTest }
         return card().apply {
-            addView(text("Model test", 20f, textColor(), Typeface.BOLD))
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        text("Model test", 20f, textColor(), Typeface.BOLD).apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        },
+                    )
+                    addView(
+                        actionButton(
+                            if (loadingServerRecordings) "Refreshing…" else "Refresh",
+                            ButtonStyle.Secondary,
+                        ) {
+                            reloadServerRecordings(project)
+                        }.apply { isEnabled = !loadingServerRecordings },
+                    )
+                },
+            )
             addView(
                 text(
                     "Score a recorded take against the trained model in continuous mode — the honest streaming test. " +
-                        "Green markers are wake words the model caught; red are misses.",
+                        "Green markers are wake words the model caught; red are misses. Refresh pulls in takes synced " +
+                        "from other devices.",
                     14f,
                     mutedColor(),
                 ).withTop(dp(4)),
@@ -942,15 +961,31 @@ class MainActivity : Activity() {
             val playbackKey = "score:${result.sourceRecording}"
             val playing = activePlaybackKey == playbackKey && player?.isPlaying == true
             addView(
-                actionButton(if (playing) "◼  Stop playback" else "▶  Play take", ButtonStyle.Secondary) {
-                    playScoreSource(project, result)
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton(if (playing) "◼  Stop playback" else "▶  Play take", ButtonStyle.Secondary) {
+                            playScoreSource(project, result)
+                        }.apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        },
+                    )
+                    addView(
+                        actionButton(if (loadingScore) "…" else "↻  Re-score fresh", ButtonStyle.Secondary) {
+                            scoreRecordingId?.let { loadScore(project, it, forceFresh = true) }
+                        }.apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                            isEnabled = !loadingScore
+                        }.withLeft(dp(8)),
+                    )
                 }.withTop(dp(12)),
             )
             addView(
                 text(
                     "Slide the threshold to see how many wake words the model keeps and how many false alarms it adds. " +
                         "Minimum detection width ignores narrow spikes: a run must stay above the line this long to count, " +
-                        "so brief blips stop registering. Nothing here is added to your training data.",
+                        "so brief blips stop registering. Re-score fresh bypasses the cached curve so a changed backend " +
+                        "is re-run. Nothing here is added to your training data.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(10)),
@@ -971,7 +1006,7 @@ class MainActivity : Activity() {
         return "Detected $detected/${result.targets.size} · missed $missed · false alarms $falseAlarms"
     }
 
-    private fun loadScore(project: WakeWordProject, recordingId: String) {
+    private fun loadScore(project: WakeWordProject, recordingId: String, forceFresh: Boolean = false) {
         val serverUrl = savedServerUrl()
         if (serverUrl.isBlank()) {
             statusMessage = "Set a sync server URL in Settings first"
@@ -986,13 +1021,17 @@ class MainActivity : Activity() {
         scoreResult = null
         val mode = scoreMode
         val modeLabel = if (mode == "reset") "padded" else "continuous"
-        statusMessage = "Scoring ${recordingId.takeLast(8)} in $modeLabel mode…"
+        statusMessage = if (forceFresh) {
+            "Re-scoring ${recordingId.takeLast(8)} fresh in $modeLabel mode…"
+        } else {
+            "Scoring ${recordingId.takeLast(8)} in $modeLabel mode…"
+        }
         render()
 
         Thread {
             try {
                 val result = BundleSyncClient(serverUrl)
-                    .loadScore(project.slug, recordingId, mode, scoreThreshold)
+                    .loadScore(project.slug, recordingId, mode, scoreThreshold, noCache = forceFresh)
                 runOnUiThread {
                     scoreProjectSlug = project.slug
                     scoreResult = result
@@ -1944,6 +1983,37 @@ class MainActivity : Activity() {
      * wake word, so takes captured on other devices show up without the user
      * having to tap Refresh. Silent: failures leave the last known list.
      */
+    /**
+     * Force a re-fetch of the server's recording list, even if this project's
+     * list is already loaded — so a device picks up test takes another device
+     * synced without relaunching. The server is the master record.
+     */
+    private fun reloadServerRecordings(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank() || loadingServerRecordings) return
+        loadingServerRecordings = true
+        statusMessage = "Refreshing recordings…"
+        render()
+        Thread {
+            try {
+                val recordings = BundleSyncClient(serverUrl).loadServerRecordings(project.slug)
+                runOnUiThread {
+                    serverRecordingsSlug = project.slug
+                    serverRecordings = recordings
+                    loadingServerRecordings = false
+                    statusMessage = "Recordings refreshed"
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    loadingServerRecordings = false
+                    statusMessage = error.message ?: "Refresh failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
     private fun ensureServerRecordings(project: WakeWordProject) {
         val serverUrl = savedServerUrl()
         if (serverUrl.isBlank()) return

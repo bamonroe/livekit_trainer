@@ -69,6 +69,15 @@ discovered. Prefer small, actionable items with clear status.
     gaps: one borderline 0.49 peak, one genuinely ambiguous pair of wake words
     ~1.2s apart. Honest recall is high; real remaining work is deployment-noise
     robustness, not clean-room recall.
+  - [x] Test tab: Refresh + Re-score fresh. The take list is server-driven (every
+    device sees every synced test take, tagged `is_test`), but it only fetched
+    once per session, so a device wouldn't pick up another device's new takes
+    without relaunching. Added a "Refresh" button on the Model test card
+    (`reloadServerRecordings`, force re-fetch) and a "Re-score fresh" button on
+    the score card that re-runs the take with `nocache=1`, bypassing the cached
+    curve so a changed scoring backend is actually re-run. Verified on the
+    emulator: refresh pulled the tablet's take the phone hadn't seen (4→5), both
+    buttons render and work.
   - [x] Cache score curves so re-scoring a take is instant. The expensive step
     is replaying the WAV through the model; the result curve depends only on the
     audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client

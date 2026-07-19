@@ -281,11 +281,13 @@ class BundleSyncClient(
         sourceRecording: String,
         mode: String = "full",
         threshold: Double = 0.5,
+        noCache: Boolean = false,
     ): ScoreResult {
         val endpoint = URL(
             serverUrl.trimEnd('/') +
                 "/score/${urlPart(wakeWordSlug)}/${urlPart(sourceRecording)}" +
-                "?mode=${urlPart(mode)}&threshold=$threshold",
+                "?mode=${urlPart(mode)}&threshold=$threshold" +
+                if (noCache) "&nocache=1" else "",
         )
         val connection = endpoint.openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
