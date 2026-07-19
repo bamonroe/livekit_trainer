@@ -7,6 +7,18 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [x] Offline model-comparison suite. Scorer `POST /compare` scores one uploaded
+  take through several models on a shared time grid (keyed by model *dir* name,
+  so `all_set` vs `all_set_prev_silencepad` stay distinct despite sharing an
+  `.onnx` filename). `scripts/compare_models.py` replays the app's `test_` takes
+  through a model set and prints per-model recall / false-fires vs the Whisper
+  ground truth in `trainer.db`. **First run finding (2026-07-19):** the newly
+  trained `all_set` is *not* better than `all_set_prev_silencepad` — both 33/33
+  on padded/isolated clips (~0.98 peaks) but ~0/33 in continuous `full` mode
+  even at thr 0.3 (peaks ~0.02). The poor real-world behaviour is the unchanged
+  streaming-recall gap, not a bad model per se; the context-fix augmentation
+  (see memory) is the intended fix and this suite is now the way to prove it.
+
 - [ ] In-app model-test flow (server-scored, decided). A dedicated "record
   test" prompt flow in the app, kept **separate** from training data: gives
   words to say, records one take, Whisper-slices it, and the server scores each
