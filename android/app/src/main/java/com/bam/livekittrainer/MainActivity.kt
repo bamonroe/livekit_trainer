@@ -915,6 +915,15 @@ class MainActivity : Activity() {
             scoreCountsText = counts
             addView(counts.withTop(dp(10)))
 
+            addView(
+                text(
+                    "Orange band = where LiveKit would fire.  ▾ blue = where Whisper heard the phrase.  " +
+                        "Orange with no blue = a wake word the model caught but Whisper missed.",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(6)),
+            )
+
             addView(text("Detection threshold  ${"%.2f".format(scoreThreshold)}", 13f, mutedColor()).withTop(dp(10)))
             val thresholdLabel = getChildAt(childCount - 1) as TextView
             addView(

@@ -78,6 +78,16 @@ discovered. Prefer small, actionable items with clear status.
     curve so a changed scoring backend is actually re-run. Verified on the
     emulator: refresh pulled the tablet's take the phone hadn't seen (4→5), both
     buttons render and work.
+  - [x] Whisper-vs-LiveKit overlay on the score curve. The graph now shades a
+    light-orange band wherever the LiveKit engine would actually fire at the
+    current threshold+width (the same `ScoreEvents` runs that drive the counts),
+    and draws a blue ▾ marker wherever Whisper located the spoken phrase. The gap
+    is the whole point: an orange band with no blue marker is a wake word the
+    model caught but Whisper missed (today counted as a "false alarm" — it often
+    isn't), and the offset between blue marker and orange band shows the model's
+    firing lag. This is the first cut of "is the LiveKit model better than using
+    Whisper to spot the wake word." Next: surface the model-caught/Whisper-missed
+    count explicitly rather than lumping it into false alarms.
   - [x] Cache score curves so re-scoring a take is instant. The expensive step
     is replaying the WAV through the model; the result curve depends only on the
     audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client

@@ -29,6 +29,10 @@ class ScoreCurveView(context: Context) : View(context) {
     private var missColor = Color.rgb(190, 45, 45)
     private var thresholdColor = Color.rgb(190, 45, 45)
     private var labelColor = Color.DKGRAY
+    // Shaded band where the LiveKit engine would actually fire at the current
+    // threshold + width, and the marker for where Whisper located the phrase.
+    private var fireColor = Color.argb(64, 245, 158, 66)
+    private var whisperColor = Color.rgb(90, 100, 210)
 
     private val density = resources.displayMetrics.density
     private fun dp(value: Float): Float = value * density
@@ -48,6 +52,13 @@ class ScoreCurveView(context: Context) : View(context) {
         strokeWidth = dp(1.5f)
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val firePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val whisperPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = dp(1.5f)
+    }
+    private val whisperFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val trianglePath = Path()
     private val thresholdPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = dp(1.5f)
@@ -123,6 +134,18 @@ class ScoreCurveView(context: Context) : View(context) {
             canvas.drawText(String.format("%.1f", level), dp(4f), y + dp(3.5f), labelPaint)
         }
 
+        // Shaded band wherever the LiveKit engine would actually fire at the
+        // current threshold + width — the events that drive the counts. Drawn
+        // behind the curve so the trace still reads on top. This is where a real
+        // trigger would land, lag and all.
+        val events = ScoreEvents.events(timesMs, scores, threshold, minWidthMs)
+        firePaint.color = fireColor
+        for (event in events) {
+            val xl = xForMs(event.startMs)
+            val xr = xForMs(event.endMs)
+            canvas.drawRect(xl, padT, maxOf(xr, xl + dp(1.5f)), padT + plotH, firePaint)
+        }
+
         // Score curve.
         if (scores.size >= 2 && timesMs.size == scores.size) {
             curvePath.reset()
@@ -140,17 +163,32 @@ class ScoreCurveView(context: Context) : View(context) {
         val thrY = yForScore(threshold)
         canvas.drawLine(padL, thrY, padL + plotW, thrY, thresholdPaint)
 
-        // Per-utterance markers: vertical tick + peak dot, colored by whether a
-        // qualifying-width plateau clears the threshold in the target's band
+        // Whisper markers: a downward triangle at the top edge where Whisper
+        // located each spoken wake phrase. Compare against the orange fire band
+        // to see where the two engines agree, and where the model fired on a
+        // phrase Whisper missed (orange with no triangle) or vice versa.
+        whisperPaint.color = whisperColor
+        whisperFill.color = whisperColor
+        val tri = dp(5f)
+        for (target in targets) {
+            val x = xForMs(target.endMs)
+            trianglePath.reset()
+            trianglePath.moveTo(x - tri, padT)
+            trianglePath.lineTo(x + tri, padT)
+            trianglePath.lineTo(x, padT + tri * 1.4f)
+            trianglePath.close()
+            canvas.drawPath(trianglePath, whisperFill)
+            canvas.drawLine(x, padT, x, padT + plotH, whisperPaint)
+        }
+
+        // Per-utterance model markers: peak dot, colored by whether a
+        // qualifying-width plateau clears the threshold in the target's window
         // (green = detected, red = missed) — same rule as the counts.
-        val events = ScoreEvents.events(timesMs, scores, threshold, minWidthMs)
         val detectedFlags = ScoreEvents.detectedFlags(targets, events)
         for ((index, target) in targets.withIndex()) {
             val detected = detectedFlags.getOrElse(index) { false }
             val color = if (detected) hitColor else missColor
             val x = xForMs(target.peakTimeMs)
-            markerPaint.color = color
-            canvas.drawLine(x, padT, x, padT + plotH, markerPaint)
             dotPaint.color = color
             canvas.drawCircle(x, yForScore(target.peakScore), dp(3.5f), dotPaint)
         }
