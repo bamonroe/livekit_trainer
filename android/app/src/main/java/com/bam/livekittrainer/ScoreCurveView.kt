@@ -30,8 +30,11 @@ class ScoreCurveView(context: Context) : View(context) {
     private var thresholdColor = Color.rgb(190, 45, 45)
     private var labelColor = Color.DKGRAY
     // Shaded band where the LiveKit engine would actually fire at the current
-    // threshold + width, and the marker for where Whisper located the phrase.
-    private var fireColor = Color.argb(64, 245, 158, 66)
+    // threshold + width, colored by whether Whisper agrees, and the marker for
+    // where Whisper located the phrase.
+    private var fireColor = Color.argb(64, 245, 158, 66) // agreement (Whisper too)
+    private var modelOnlyColor = Color.argb(95, 150, 70, 205) // model caught, Whisper missed
+    private var falseAlarmColor = Color.argb(45, 140, 140, 140) // low-confidence noise
     private var whisperColor = Color.rgb(90, 100, 210)
 
     private val density = resources.displayMetrics.density
@@ -139,8 +142,14 @@ class ScoreCurveView(context: Context) : View(context) {
         // behind the curve so the trace still reads on top. This is where a real
         // trigger would land, lag and all.
         val events = ScoreEvents.events(timesMs, scores, threshold, minWidthMs)
-        firePaint.color = fireColor
+        val windows = ScoreEvents.windows(targets)
         for (event in events) {
+            val inWhisper = windows.any { event.startMs <= it.second && event.endMs >= it.first }
+            firePaint.color = when {
+                inWhisper -> fireColor
+                event.peak >= ScoreEvents.MODEL_ONLY_CONFIDENCE -> modelOnlyColor
+                else -> falseAlarmColor
+            }
             val xl = xForMs(event.startMs)
             val xr = xForMs(event.endMs)
             canvas.drawRect(xl, padT, maxOf(xr, xl + dp(1.5f)), padT + plotH, firePaint)

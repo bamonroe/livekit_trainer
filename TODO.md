@@ -86,8 +86,16 @@ discovered. Prefer small, actionable items with clear status.
     model caught but Whisper missed (today counted as a "false alarm" — it often
     isn't), and the offset between blue marker and orange band shows the model's
     firing lag. This is the first cut of "is the LiveKit model better than using
-    Whisper to spot the wake word." Next: surface the model-caught/Whisper-missed
-    count explicitly rather than lumping it into false alarms.
+    Whisper to spot the wake word."
+  - [x] Model-only wins counted separately. Fires that land outside every Whisper
+    window are split by confidence: peak ≥ 0.90 → "model-only" (almost certainly a
+    real wake word Whisper missed — the model rarely reaches that on non-wake
+    audio), below → genuine "false alarm". `ScoreEvents.tally` returns the four-way
+    breakdown; the counts line appends "· model-only N" only when N>0, and the
+    graph shades those bands purple (vs orange agreement, grey low-confidence).
+    Verified on the db6f2a54 take: "Detected 1/3 · missed 2 · false alarms 0 ·
+    model-only 1" with a purple band. Caveat: a confident trigger on a near-miss
+    ("hall set") would also land here; play it back to be sure.
   - [x] Cache score curves so re-scoring a take is instant. The expensive step
     is replaying the WAV through the model; the result curve depends only on the
     audio + model + `mode`/`step_ms`/`keep_ms` (not threshold, which the client

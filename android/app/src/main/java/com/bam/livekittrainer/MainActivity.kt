@@ -917,8 +917,9 @@ class MainActivity : Activity() {
 
             addView(
                 text(
-                    "Orange band = where LiveKit would fire.  ▾ blue = where Whisper heard the phrase.  " +
-                        "Orange with no blue = a wake word the model caught but Whisper missed.",
+                    "Bands = where LiveKit fires; ▾ blue = where Whisper heard the phrase.  " +
+                        "Orange = both agree.  Purple = model caught it, Whisper missed (model-only win).  " +
+                        "Grey = low-confidence false alarm.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(6)),
@@ -1009,10 +1010,11 @@ class MainActivity : Activity() {
      */
     private fun scoreCountsSummary(result: ScoreResult, threshold: Double): String {
         val events = ScoreEvents.events(result.timesMs, result.scores, threshold, scoreMinWidthMs)
-        val detected = ScoreEvents.detectedFlags(result.targets, events).count { it }
-        val missed = result.targets.size - detected
-        val falseAlarms = ScoreEvents.falseAlarms(result.targets, events)
-        return "Detected $detected/${result.targets.size} · missed $missed · false alarms $falseAlarms"
+        val t = ScoreEvents.tally(result.targets, events)
+        val base = "Detected ${t.detected}/${result.targets.size} · missed ${t.missed} · false alarms ${t.falseAlarms}"
+        // Only mention the model-only wins when there are any, so the common case
+        // stays uncluttered.
+        return if (t.modelOnly > 0) "$base · model-only ${t.modelOnly}" else base
     }
 
     private fun loadScore(project: WakeWordProject, recordingId: String, forceFresh: Boolean = false) {

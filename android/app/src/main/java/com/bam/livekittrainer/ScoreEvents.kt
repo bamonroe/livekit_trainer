@@ -87,6 +87,44 @@ object ScoreEvents {
         return windows.map { window -> events.any { overlaps(it, window) } }
     }
 
+    /**
+     * A fire that lands outside every Whisper window but peaks this high is
+     * almost certainly a real wake word Whisper failed to transcribe, not noise —
+     * the model rarely reaches this confidence on non-wake audio. These are the
+     * evidence that the LiveKit model beats Whisper at spotting the phrase.
+     */
+    const val MODEL_ONLY_CONFIDENCE = 0.90
+
+    data class Tally(
+        val detected: Int,
+        val missed: Int,
+        val modelOnly: Int,
+        val falseAlarms: Int,
+    )
+
+    /**
+     * Full breakdown against the Whisper targets: how many phrases the model
+     * caught vs missed, and — for fires with no Whisper phrase under them — how
+     * many are high-confidence (likely a wake word Whisper missed) vs low
+     * (genuine false alarms).
+     */
+    fun tally(targets: List<ScoreTarget>, events: List<Event>): Tally {
+        val windows = windows(targets)
+        val detected = windows.count { window -> events.any { overlaps(it, window) } }
+        var modelOnly = 0
+        var falseAlarms = 0
+        for (event in events) {
+            if (windows.any { overlaps(event, it) }) continue
+            if (event.peak >= MODEL_ONLY_CONFIDENCE) modelOnly++ else falseAlarms++
+        }
+        return Tally(
+            detected = detected,
+            missed = targets.size - detected,
+            modelOnly = modelOnly,
+            falseAlarms = falseAlarms,
+        )
+    }
+
     /** Events that fall outside every target's window — the false alarms. */
     fun falseAlarms(
         targets: List<ScoreTarget>,
