@@ -79,6 +79,22 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=50_000)
     parser.add_argument("--target-fp-per-hour", type=float, default=0.2)
     parser.add_argument("--model-size", default="medium")
+    parser.add_argument(
+        "--no-context-fix",
+        dest="context_fix",
+        action="store_false",
+        help=(
+            "Disable the leading-context augmentation recipe. By default the "
+            "config sets augmentation.background_paths so the trainer re-mixes "
+            "real noise and ordinary-speech negatives into the ~1s in front of "
+            "every positive instead of the zero-fill that align_clip_to_end "
+            "leaves. That zero lead is a cue that never occurs on a live mic and "
+            "is the cause of the streaming-recall gap (99%% padded eval, ~1%% "
+            "mid-sentence). The recipe only bites if the trainer image carries "
+            "trainer/patches/augment_ctxfix.py over livekit.wakeword.data.augment."
+        ),
+    )
+    parser.set_defaults(context_fix=True)
     args = parser.parse_args()
 
     config = config_from_args(args)
@@ -142,13 +158,28 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             "# synthetic pool. Pair with assemble_training_data.py --positive-boost."
         )
 
+    real_samples_dir = (args.real_samples_dir or "").strip() or None
+
+    # Leading-context augmentation recipe: fill the pre-phrase window with real
+    # sound instead of the zero-fill align_clip_to_end leaves. Point the trainer
+    # at its own ambient corpus, our ordinary-speech negatives (leading *speech*
+    # context — the case the silence-padded model never saw), and our ambient
+    # background takes. mix_with_background picks one at random per clip.
+    background_paths = None
+    if args.context_fix:
+        background_paths = ["./data/backgrounds"]
+        if real_samples_dir:
+            background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/negative")
+        background_paths.append(f"./data/real/{slug}/background")
+
     return {
         "model_name": slug,
         "target_phrases": dedupe(target_phrases),
         "custom_negative_phrases": negatives,
         "data_dir": "./data",
         "output_dir": "./output",
-        "real_samples_dir": (args.real_samples_dir or "").strip() or None,
+        "real_samples_dir": real_samples_dir,
+        "background_paths": background_paths,
         "batch_n_per_class": batch_n_per_class,
         "header_comment": header_comment,
         "model": {
@@ -194,6 +225,15 @@ def render_yaml(config: dict[str, Any]) -> str:
         lines.append("batch_n_per_class:")
         for key, value in config["batch_n_per_class"].items():
             lines.append(f"  {key}: {value}")
+    if config.get("background_paths"):
+        lines.append("")
+        lines.append("augmentation:")
+        lines.append("  # Leading-context fix: re-mix these into the full 2s window after")
+        lines.append("  # placement so the pre-phrase region carries real noise/speech, not")
+        lines.append("  # zeros. Needs the augment_ctxfix patch in the trainer image to bite.")
+        lines.append("  background_paths:")
+        for path in config["background_paths"]:
+            lines.append(f"    - {yaml_string(path)}")
     lines.extend(
         [
             "",
