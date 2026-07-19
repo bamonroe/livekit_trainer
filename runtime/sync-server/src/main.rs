@@ -3265,6 +3265,170 @@ async fn start_training(
 
 /// Read the training status JSON for a wake word, reconciled with whether the
 /// trainer container is still alive.
+/// The fixed trainer pipeline. `livekit-wakeword run` always executes these six
+/// stages in order, each with a recognizable tqdm sub-progress bar in the log.
+/// This is the template that lets us report per-step percentages.
+const TRAIN_STEPS: [&str; 6] = [
+    "Generate synthetic data",
+    "Augment clips",
+    "Extract features",
+    "Train classifier",
+    "Export to ONNX",
+    "Evaluate model",
+];
+
+/// Rough share of wall-clock each stage takes, so overall percent tracks time
+/// rather than step count. Training dominates. Sums to 100.
+const TRAIN_STEP_WEIGHTS: [u32; 6] = [10, 12, 10, 53, 5, 10];
+
+/// Read only the last `max_bytes` of a file — the trainer log grows to many MB,
+/// and the recent tail is all we need to locate the current stage.
+fn read_tail_bytes(path: &std::path::Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max_bytes))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Extract the last `NN%` token from a tqdm-style line, clamped to 0..=100.
+fn last_percent(line: &str) -> Option<u8> {
+    let bytes = line.as_bytes();
+    let mut found = None;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'%' {
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j < i {
+                if let Ok(n) = line[j..i].parse::<u16>() {
+                    found = Some(n.min(100) as u8);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Map a single log line to a 1-based pipeline step, via either the explicit
+/// "Step N/6" banner or the tqdm description unique to each stage.
+fn line_step(line: &str) -> Option<usize> {
+    if let Some(pos) = line.find("Step ") {
+        let rest = &line[pos + 5..];
+        if let Some(slash) = rest.find("/6") {
+            if let Ok(n) = rest[..slash].trim().parse::<usize>() {
+                if (1..=6).contains(&n) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    if line.contains("Synthesizing clips")
+        || line.contains("VoxCPM clips")
+        || line.contains("Background (")
+    {
+        return Some(1);
+    }
+    if line.contains("Augmenting ") {
+        return Some(2);
+    }
+    if line.contains("Features ") {
+        return Some(3);
+    }
+    if line.contains("Phase ") {
+        return Some(4);
+    }
+    None
+}
+
+/// The tqdm description prefix of a progress line, e.g. "Augmenting positive r0".
+fn tqdm_desc(line: &str) -> String {
+    if let Some(bar) = line.find("%|") {
+        let head = line[..bar]
+            .trim_end()
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end();
+        if let Some(colon) = head.rfind(':') {
+            return head[..colon].trim().to_string();
+        }
+        return head.trim().to_string();
+    }
+    String::new()
+}
+
+/// Parse the trainer log tail into a templated, per-step progress view.
+fn parse_train_progress(text: &str, run_state: &str) -> Value {
+    // Split on both '\r' (tqdm redraws in place) and '\n'.
+    let lines: Vec<&str> = text.split(|c| c == '\n' || c == '\r').collect();
+
+    let mut cur_step = 0usize; // 0 = pre-pipeline (assemble / config / setup)
+    let mut cur_percent = 0u8;
+    let mut active_label = String::new();
+    for &line in &lines {
+        if let Some(step) = line_step(line) {
+            if step > cur_step {
+                cur_step = step;
+                cur_percent = last_percent(line).unwrap_or(0);
+                active_label = tqdm_desc(line);
+            } else if step == cur_step {
+                if let Some(p) = last_percent(line) {
+                    cur_percent = p;
+                }
+                let d = tqdm_desc(line);
+                if !d.is_empty() {
+                    active_label = d;
+                }
+            }
+        }
+    }
+    let done = run_state == "succeeded";
+    if done {
+        cur_step = 6;
+        cur_percent = 100;
+    }
+    if active_label.is_empty() && (1..=6).contains(&cur_step) {
+        active_label = TRAIN_STEPS[cur_step - 1].to_string();
+    }
+
+    let steps: Vec<Value> = TRAIN_STEPS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let idx = i + 1;
+            let (st, percent) = if done || idx < cur_step {
+                ("done", 100u8)
+            } else if idx == cur_step {
+                ("active", cur_percent)
+            } else {
+                ("pending", 0u8)
+            };
+            json!({ "name": name, "state": st, "percent": percent })
+        })
+        .collect();
+
+    let total: u32 = TRAIN_STEP_WEIGHTS.iter().sum();
+    let mut acc = 0u32;
+    for (i, w) in TRAIN_STEP_WEIGHTS.iter().enumerate() {
+        let idx = i + 1;
+        if done || idx < cur_step {
+            acc += w;
+        } else if idx == cur_step {
+            acc += w * cur_percent as u32 / 100;
+        }
+    }
+    let overall = (acc * 100 / total).min(100);
+
+    json!({
+        "steps": steps,
+        "overall_percent": overall,
+        "active_step": cur_step,
+        "active_label": active_label,
+    })
+}
+
 async fn training_status(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
@@ -3309,6 +3473,17 @@ async fn training_status(
         .join(&slug)
         .join(format!("{slug}.onnx"))
         .exists());
+
+    // Templated per-step progress parsed from the trainer log tail.
+    {
+        let run_state = body.get("state").and_then(Value::as_str).unwrap_or("none");
+        if matches!(run_state, "running" | "starting" | "succeeded") {
+            let log_path = state.models_root.join(&slug).join("train.log");
+            if let Some(text) = read_tail_bytes(&log_path, 1_048_576) {
+                body["progress"] = parse_train_progress(&text, run_state);
+            }
+        }
+    }
 
     // Pull the fields we need for benchmarking and ETA out of the status body.
     let run_state = body

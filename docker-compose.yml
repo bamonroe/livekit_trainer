@@ -70,10 +70,10 @@ services:
       dockerfile: Dockerfile
     image: livekit-wakeword-scorer:local
     # Host publish is optional; the sync-server reaches the scorer over the
-    # compose network at scorer:8770. Override the host port with
-    # SCORER_HOST_PORT if 8770 is already taken on the host.
+    # compose network at scorer:8770. The host port is arbitrary (this service
+    # is not internet-exposed); 8780 avoids an unrelated process on 8770.
     ports:
-      - "${SCORER_HOST_PORT:-8770}:8770"
+      - "${SCORER_HOST_PORT:-8780}:8770"
     volumes:
       - ./output:/output:ro
     environment:

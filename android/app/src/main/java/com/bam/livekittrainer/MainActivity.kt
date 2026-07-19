@@ -1454,6 +1454,28 @@ class MainActivity : Activity() {
         return buildString {
             append("State: $label")
             if (state == "running" && step.isNotBlank()) append("  ·  step: $step")
+            val progress = status.optJSONObject("progress")
+            if (progress != null && (state == "running" || state == "starting" || state == "succeeded")) {
+                val overall = progress.optInt("overall_percent", 0)
+                append("  ·  ${overall}% overall")
+                val steps = progress.optJSONArray("steps")
+                if (steps != null) {
+                    for (i in 0 until steps.length()) {
+                        val s = steps.optJSONObject(i) ?: continue
+                        val name = s.optString("name", "")
+                        val stepPct = s.optInt("percent", 0)
+                        val glyph = when (s.optString("state", "pending")) {
+                            "done" -> "✓"
+                            "active" -> "▶"
+                            else -> "·"
+                        }
+                        append("\n  $glyph $name")
+                        if (s.optString("state") == "active") append("  ${stepPct}%")
+                    }
+                    val activeLabel = progress.optString("active_label", "")
+                    if (activeLabel.isNotBlank()) append("\n    ↳ $activeLabel")
+                }
+            }
             if (message.isNotBlank()) append("\n$message")
             if (state == "running" || state == "starting") {
                 append(if (running) "\nTrainer container is alive." else "\nWaiting on trainer container…")
