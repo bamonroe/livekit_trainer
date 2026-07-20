@@ -38,6 +38,7 @@ import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
 import org.json.JSONObject
 
@@ -830,7 +831,17 @@ class MainActivity : Activity() {
     private fun formatRunId(runId: String): String {
         val match = Regex("(\\d{4})(\\d{2})(\\d{2})T(\\d{2})(\\d{2})").find(runId) ?: return runId
         val (y, mo, d, h, mi) = match.destructured
-        return "$y-$mo-$d $h:$mi"
+        // Run IDs are stamped in UTC by the trainer (date -u). Parse as UTC and
+        // render in the device's local zone so the shown time matches the wall
+        // clock of whoever is looking at it.
+        return try {
+            val utc = SimpleDateFormat("yyyyMMddHHmm", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }.parse("$y$mo$d$h$mi")
+            SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(utc!!)
+        } catch (_: Exception) {
+            "$y-$mo-$d $h:$mi"
+        }
     }
 
     /**
