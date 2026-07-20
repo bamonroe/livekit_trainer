@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Per-take capture provenance forwarded by the app: which device and input
 /// route recorded it, the mic's native format before the app's 16 kHz mono
@@ -65,6 +65,11 @@ pub struct RecordingAlignment {
     pub phrase: String,
     pub external_id: Option<String>,
     pub script: String,
+    /// How the take should be sliced: `positive` (wake phrase repeated, cut into
+    /// positives), `negative` (ordinary speech cut into negatives),
+    /// `hard_negative` (near-miss phrases cut into hard negatives), or `mixed`
+    /// (legacy single-script take with all three inferred from context).
+    pub kind: String,
     pub recorded_at: String,
     pub duration_ms: i64,
     pub source_wav: String,
@@ -136,6 +141,7 @@ pub struct RecordingMeta {
     pub id: String,
     pub project_slug: String,
     pub script: String,
+    pub kind: String,
     pub recorded_at: String,
     pub duration_ms: i64,
 }
@@ -344,6 +350,10 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         // server which takes it already holds and skip re-uploading unchanged
         // recordings.
         ("source_sha256", "TEXT"),
+        // Version 7: how this take should be sliced (positive/negative/
+        // hard_negative), replacing the old single mixed-script inference. Legacy
+        // rows read back as 'mixed' via COALESCE and keep their prior behavior.
+        ("kind", "TEXT"),
     ] {
         if !column_exists(conn, "bulk_recordings", name)? {
             conn.execute(
@@ -449,11 +459,14 @@ pub fn store_recording_alignment(
             (id, project_slug, script, recorded_at, duration_ms, source_wav, bundle, imported_at_ms,
              capture_device_manufacturer, capture_device_model, capture_os_version,
              capture_app_version, capture_input_route, capture_source_sample_rate_hz,
-             capture_source_channels, capture_session_id, source_sha256)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             capture_source_channels, capture_session_id, source_sha256, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(id) DO UPDATE SET
             project_slug = excluded.project_slug,
             script = excluded.script,
+            -- Keep a prior kind if this pass carries none (defensive; reprocess
+            -- passes the stored kind back in).
+            kind = COALESCE(excluded.kind, bulk_recordings.kind),
             recorded_at = excluded.recorded_at,
             duration_ms = excluded.duration_ms,
             source_wav = excluded.source_wav,
@@ -488,6 +501,7 @@ pub fn store_recording_alignment(
             capture.source_channels,
             capture.session_id,
             alignment.source_sha256,
+            alignment.kind,
         ],
     )?;
 
@@ -658,7 +672,7 @@ pub fn recordings_for_reprocess(
 ) -> Result<Vec<RecordingMeta>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT id, project_slug, script, COALESCE(recorded_at, ''),
-                COALESCE(duration_ms, 0)
+                COALESCE(duration_ms, 0), COALESCE(kind, 'mixed')
          FROM bulk_recordings WHERE project_slug = ?1 ORDER BY id DESC",
     )?;
     let rows = stmt.query_map(params![slug], |row| {
@@ -668,6 +682,7 @@ pub fn recordings_for_reprocess(
             script: row.get(2)?,
             recorded_at: row.get(3)?,
             duration_ms: row.get(4)?,
+            kind: row.get(5)?,
         })
     })?;
     rows.collect()
@@ -680,7 +695,7 @@ pub fn recording_meta(
 ) -> Result<Option<RecordingMeta>, rusqlite::Error> {
     conn.query_row(
         "SELECT id, project_slug, script, COALESCE(recorded_at, ''),
-                COALESCE(duration_ms, 0)
+                COALESCE(duration_ms, 0), COALESCE(kind, 'mixed')
          FROM bulk_recordings WHERE id = ?1",
         params![recording_id],
         |row| {
@@ -690,6 +705,7 @@ pub fn recording_meta(
                 script: row.get(2)?,
                 recorded_at: row.get(3)?,
                 duration_ms: row.get(4)?,
+                kind: row.get(5)?,
             })
         },
     )
@@ -703,6 +719,7 @@ pub fn recording_meta(
 #[derive(Debug, Clone)]
 pub struct RecordingDetail {
     pub id: String,
+    pub kind: String,
     pub recorded_at: String,
     pub duration_ms: i64,
     pub positive_count: i64,
@@ -731,7 +748,8 @@ pub fn recording_details(
                 (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
                     AND s.status = 'active' AND s.category = 'background'),
                 b.capture_device_manufacturer, b.capture_device_model,
-                b.capture_app_version, b.capture_input_route, b.capture_session_id
+                b.capture_app_version, b.capture_input_route, b.capture_session_id,
+                COALESCE(b.kind, 'mixed')
          FROM bulk_recordings b
          WHERE b.project_slug = ?1
          ORDER BY b.id DESC",
@@ -749,6 +767,7 @@ pub fn recording_details(
             app_version: row.get(8)?,
             input_route: row.get(9)?,
             session_id: row.get(10)?,
+            kind: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -1485,6 +1504,7 @@ mod tests {
             phrase: "all set".to_string(),
             external_id: None,
             script: "all set".to_string(),
+            kind: "positive".to_string(),
             recorded_at: "2026-07-18T00:00:00Z".to_string(),
             duration_ms: 5000,
             source_wav: "/x.wav".to_string(),

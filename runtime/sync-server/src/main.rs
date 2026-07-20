@@ -184,6 +184,10 @@ struct RecordingDetailItem {
     id: String,
     is_background: bool,
     is_test: bool,
+    /// How the take was recorded/sliced: positive/negative/hard_negative/
+    /// background/test, or `mixed` for legacy single-script takes. Lets the app
+    /// group Review by recording kind.
+    kind: String,
     recorded_at: String,
     duration_ms: i64,
     positive_count: i64,
@@ -365,6 +369,10 @@ struct BulkRecording {
     id: String,
     file: String,
     script: String,
+    /// How to slice this take: `positive`, `negative`, `hard_negative`, or (for
+    /// takes from older app builds) empty, which the server treats as `mixed`.
+    #[serde(default)]
+    kind: String,
     #[serde(default)]
     recorded_at: String,
     #[serde(default)]
@@ -830,6 +838,7 @@ async fn run_reprocess(
         align_one_recording(
             &meta.id,
             &meta.script,
+            &meta.kind,
             &meta.recorded_at,
             meta.duration_ms.max(0) as u64,
             &source,
@@ -978,6 +987,7 @@ async fn bulk_recording_details(
         .map(|d| RecordingDetailItem {
             is_background: d.id.starts_with("background_"),
             is_test: d.id.starts_with("test_"),
+            kind: d.kind,
             id: d.id,
             recorded_at: d.recorded_at,
             duration_ms: d.duration_ms,
@@ -1591,7 +1601,12 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), AppError> {
                 "bulk recording {index} missing file"
             )));
         }
-        if recording.script.trim().is_empty() {
+        // Only a mixed/legacy take needs a script to align against. A token
+        // (`positive`) or plain `negative` take is a straight repeated read with
+        // no prompt, so an empty script is expected; a `hard_negative` take does
+        // carry its near-miss prompt but is not required to.
+        let scripted_kind = matches!(recording.kind.trim(), "" | "mixed");
+        if scripted_kind && recording.script.trim().is_empty() {
             return Err(AppError::bad_request(format!(
                 "bulk recording {index} missing script"
             )));
@@ -1912,6 +1927,7 @@ async fn align_bulk_recordings(
         align_one_recording(
             &recording.id,
             &recording.script,
+            &recording.kind,
             &recording.recorded_at,
             recording.duration_ms,
             &source,
@@ -2032,6 +2048,7 @@ async fn align_test_recordings(
         align_one_recording(
             &recording.id,
             &recording.script,
+            &recording.kind,
             &recording.recorded_at,
             recording.duration_ms,
             &source,
@@ -2124,6 +2141,7 @@ async fn align_test_one(
         phrase: phrase.to_string(),
         external_id: external_id.map(ToString::to_string),
         script: script.to_string(),
+        kind: "test".to_string(),
         recorded_at: recorded_at.to_string(),
         duration_ms: duration_ms as i64,
         source_wav: source_wav.to_string_lossy().to_string(),
@@ -2156,6 +2174,7 @@ async fn align_test_one(
 async fn align_one_recording(
     recording_id: &str,
     script: &str,
+    kind: &str,
     recorded_at: &str,
     duration_ms: u64,
     source: &Path,
@@ -2236,16 +2255,33 @@ async fn align_one_recording(
         return Ok(());
     }
 
-    // A wake phrase spoken inside a near-miss context ("...not the wake phrase
-    // X...") must never train as a positive, but it is a valuable hard negative:
-    // the true phrase in an explicitly-negative frame. Split the aligned phrase
-    // occurrences into positives (kept) and hard negatives (filed under the
-    // negative category, tagged distinctly) instead of discarding the latter.
-    let (positive_ranges, hard_negative_ranges): (Vec<_>, Vec<_>) =
-        phrase_ranges(&words, &phrase_words)
+    // Route by take kind. Each straight recording knows what it is, so the server
+    // no longer has to guess positives vs negatives from one mixed script.
+    //  - `positive`: the wake phrase said many times; every aligned occurrence is
+    //    a positive, no near-miss frames to split out.
+    //  - `negative` / `hard_negative`: ordinary speech or near-miss phrases with
+    //    no true wake phrase; the whole read is chopped by the negative pass and
+    //    filed under the matching label.
+    //  - `mixed` (legacy, or older app builds that send no kind): the original
+    //    behavior — split aligned occurrences into positives and the
+    //    near-miss-framed hard negatives inferred from surrounding cue words.
+    let take_kind = kind.trim();
+    let expects_positive = !matches!(take_kind, "negative" | "hard_negative");
+    let (positive_ranges, hard_negative_ranges): (Vec<_>, Vec<_>) = match take_kind {
+        "positive" => (phrase_ranges(&words, &phrase_words), Vec::new()),
+        "negative" | "hard_negative" => (Vec::new(), Vec::new()),
+        _ => phrase_ranges(&words, &phrase_words)
             .into_iter()
-            .partition(|(first, last)| !is_hard_negative_context(&words, *first, *last));
-    if positive_ranges.is_empty() {
+            .partition(|(first, last)| !is_hard_negative_context(&words, *first, *last)),
+    };
+    // Whether to run the generic negative pass, and the label its slices carry.
+    // A token take skips negatives entirely so silent gaps never become clips.
+    let (run_negatives, negative_label): (bool, &str) = match take_kind {
+        "positive" => (false, "negative"),
+        "hard_negative" => (true, "hard_negative"),
+        _ => (true, "negative"),
+    };
+    if expects_positive && positive_ranges.is_empty() {
         summary.warnings.push(format!(
             "{}: no aligned wake phrase occurrences found in transcript {:?}",
             recording_id,
@@ -2399,53 +2435,64 @@ async fn align_one_recording(
             occupied.push((start, end));
         }
 
-        let negative_ranges = negative_ranges(&words, &occupied);
-        for (_, _, word_start, word_end) in negative_ranges.iter() {
-            let (start, end) = padded_bounds(
-                &words,
-                *word_start,
-                *word_end,
-                source_end,
-                CUT_LEAD_PADDING_SECONDS,
-                NEGATIVE_TAIL_PADDING_SECONDS,
-                true,
-            );
-            let (start, end) = clamp_slice_span(start, end, false);
-            let (visible_first, visible_last) =
-                visible_range(&words, *word_start, *word_end, start, end);
-            let slice_words = &words[visible_first..=visible_last];
-            let clip_id = bulk_clip_hash_id(
-                recording_id,
-                recorded_at,
-                duration_ms,
-                "negative",
-                start,
-                end,
-                slice_words,
-            );
-            let phrase_text = slice_words
-                .iter()
-                .map(|word| word.word.trim())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let file_name = format!(
-                "{}_{}.wav",
-                safe_filename(&clip_id),
-                safe_filename(&phrase_text)
-            );
-            let dest = dest_root.join("negative").join(&file_name);
-            if write_wav_slice(source, &dest, start, end)? {
-                slice_rows.push(build_slice_row(
-                    &clip_id,
-                    "negative",
-                    "negative",
-                    &dest,
-                    &file_name,
+        // Generic negative pass: every stretch of speech not already claimed by a
+        // positive or hard-negative cut becomes a negative clip. For a `negative`
+        // or `hard_negative` take `occupied` is empty, so this chops the whole
+        // read; `negative_label` files it under the matching label. Skipped for a
+        // token take so its silent gaps never turn into stray clips.
+        if run_negatives {
+            let negative_ranges = negative_ranges(&words, &occupied);
+            for (_, _, word_start, word_end) in negative_ranges.iter() {
+                let (start, end) = padded_bounds(
+                    &words,
+                    *word_start,
+                    *word_end,
+                    source_end,
+                    CUT_LEAD_PADDING_SECONDS,
+                    NEGATIVE_TAIL_PADDING_SECONDS,
+                    true,
+                );
+                let (start, end) = clamp_slice_span(start, end, false);
+                let (visible_first, visible_last) =
+                    visible_range(&words, *word_start, *word_end, start, end);
+                let slice_words = &words[visible_first..=visible_last];
+                let clip_id = bulk_clip_hash_id(
+                    recording_id,
+                    recorded_at,
+                    duration_ms,
+                    negative_label,
                     start,
                     end,
                     slice_words,
-                ));
-                summary.negatives += 1;
+                );
+                let phrase_text = slice_words
+                    .iter()
+                    .map(|word| word.word.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let file_name = format!(
+                    "{}_{}.wav",
+                    safe_filename(&clip_id),
+                    safe_filename(&phrase_text)
+                );
+                let dest = dest_root.join("negative").join(&file_name);
+                if write_wav_slice(source, &dest, start, end)? {
+                    slice_rows.push(build_slice_row(
+                        &clip_id,
+                        negative_label,
+                        "negative",
+                        &dest,
+                        &file_name,
+                        start,
+                        end,
+                        slice_words,
+                    ));
+                    if negative_label == "hard_negative" {
+                        summary.hard_negatives += 1;
+                    } else {
+                        summary.negatives += 1;
+                    }
+                }
             }
         }
 
@@ -2471,6 +2518,9 @@ async fn align_one_recording(
             phrase: phrase.to_string(),
             external_id: external_id.map(ToString::to_string),
             script: script.to_string(),
+            // Persist the resolved kind so reprocess slices this take the same way
+            // without a manifest; empty (older app) normalizes to legacy mixed.
+            kind: if take_kind.is_empty() { "mixed".to_string() } else { take_kind.to_string() },
             recorded_at: recorded_at.to_string(),
             duration_ms: duration_ms as i64,
             source_wav: source_wav.to_string_lossy().to_string(),
@@ -2593,6 +2643,7 @@ fn slice_background_recording(
         phrase: phrase.to_string(),
         external_id: external_id.map(ToString::to_string),
         script: BACKGROUND_SCRIPT_MARKER.to_string(),
+        kind: "background".to_string(),
         recorded_at: recorded_at.to_string(),
         duration_ms: duration_ms as i64,
         source_wav: source_wav.to_string_lossy().to_string(),
