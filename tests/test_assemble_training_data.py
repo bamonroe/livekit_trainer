@@ -60,6 +60,39 @@ class AssembleTrainingDataTest(unittest.TestCase):
             self.assertTrue(borrowed.is_symlink())
             self.assertTrue(borrowed.resolve().is_file())
 
+    def test_assembles_with_no_own_recordings(self):
+        # A brand-new word with no clips of its own still assembles: the dest
+        # dirs are created, positives are empty, and other words are borrowed in
+        # as negatives/background so a synthetic-only run can proceed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data" / "real"
+            out_root = root / "data" / "train"
+            seed(data_root, "hey_jarvis", positives=4, negatives=5, background=2)
+
+            s = ata.assemble("brand_new", data_root, out_root)
+
+            self.assertEqual(0, s["positive"])
+            self.assertEqual(9, s["negative"])  # jarvis 5 neg + 4 pos as neg
+            self.assertEqual(2, s["background"])
+            dest = out_root / "brand_new"
+            self.assertTrue((dest / "positive").is_dir())
+            self.assertEqual(0, len(list((dest / "positive").glob("*.wav"))))
+
+    def test_assembles_with_empty_data_root(self):
+        # Nothing recorded for any word: purely synthetic pool, no crash.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / "data" / "real"  # never created
+            out_root = root / "data" / "train"
+
+            s = ata.assemble("brand_new", data_root, out_root)
+
+            self.assertEqual(0, s["positive"])
+            self.assertEqual(0, s["negative"])
+            self.assertEqual(0, s["background"])
+            self.assertEqual([], s["other_slugs"])
+
     def test_no_borrow_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

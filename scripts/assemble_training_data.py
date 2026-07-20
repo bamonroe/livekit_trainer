@@ -79,8 +79,15 @@ def main() -> int:
         raise SystemExit(f"unsafe slug: {args.slug!r}")
     if args.positive_boost < 1:
         raise SystemExit("--positive-boost must be 1 or greater")
+    # No own recordings is allowed: the trainer synthesizes positives/negatives
+    # from the phrase, and other wake words' clips are still pooled in as
+    # negatives/background. Warn but continue so a brand-new word can train on a
+    # purely synthetic pool.
     if not (args.data_root / args.slug).is_dir():
-        raise SystemExit(f"no data for slug {args.slug!r} under {args.data_root}")
+        print(
+            f"note: no recorded clips for slug {args.slug!r} under {args.data_root}; "
+            "assembling a synthetic-only pool (borrowed negatives/background only)"
+        )
 
     summary = assemble(
         slug=args.slug,
@@ -116,6 +123,8 @@ def main() -> int:
 
 def other_slugs(data_root: Path, slug: str) -> list[str]:
     """Every other project slug with clips under *data_root*, sorted."""
+    if not data_root.is_dir():
+        return []
     result = []
     for child in sorted(data_root.iterdir()):
         if not child.is_dir() or child.name == slug:
