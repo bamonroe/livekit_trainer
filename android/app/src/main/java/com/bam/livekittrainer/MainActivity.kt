@@ -1223,6 +1223,7 @@ class MainActivity : Activity() {
 
         val size = savedTrainModelSize()
         val personal = savedTrainPersonal()
+        val tokenType = savedTrainTokenType(project.slug)
 
         return card().apply {
             addView(text("Train ${project.phrase}", 20f, textColor(), Typeface.BOLD))
@@ -1252,6 +1253,34 @@ class MainActivity : Activity() {
                     addView(sizeButton("small", false))
                     addView(sizeButton("medium", true))
                     addView(sizeButton("large", true))
+                }.withTop(dp(8)),
+            )
+
+            addView(text("Token type", 15f, mutedColor()).withTop(dp(14)))
+            addView(
+                text(
+                    if (tokenType == "start") {
+                        "Start: the phrase begins an utterance, with no speech before it — trains against a quiet, noisy room lead so it fires from a fresh start."
+                    } else {
+                        "End: the phrase ends an utterance (e.g. \"all set\") — trains with prior speech in the lead so it fires mid- and end-of-sentence."
+                    },
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton("Start", if (tokenType == "start") ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            commitNumbers(); setTrainTokenType(project.slug, "start")
+                        }.weight1(),
+                    )
+                    addView(
+                        actionButton("End", if (tokenType == "end") ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            commitNumbers(); setTrainTokenType(project.slug, "end")
+                        }.weight1().withLeft(dp(8)),
+                    )
                 }.withTop(dp(8)),
             )
 
@@ -1340,7 +1369,7 @@ class MainActivity : Activity() {
             render()
             return
         }
-        val body = buildTrainRequestBody()
+        val body = buildTrainRequestBody(project)
         startingTraining = true
         statusMessage = "Starting training…"
         render()
@@ -1518,14 +1547,15 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun buildTrainRequestBody(): String {
+    private fun buildTrainRequestBody(project: WakeWordProject): String {
         val steps = savedTrainSteps()
         val size = savedTrainModelSize()
         val targetFp = savedTrainTargetFp()
         val personal = savedTrainPersonal()
         val boost = savedTrainPositiveBoost()
+        val tokenType = savedTrainTokenType(project.slug)
         return """
-            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost}
+            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"token_type":"$tokenType"}
         """.trimIndent()
     }
 
@@ -1579,6 +1609,24 @@ class MainActivity : Activity() {
     private fun setTrainPersonal(enabled: Boolean) {
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_TRAIN_PERSONAL, enabled).apply()
+        render()
+    }
+
+    // Token type is a per-wake-word property (a phrase is a start token or an end
+    // token), so it's keyed by slug rather than stored globally like the other
+    // training knobs. "end" is the safe default (matches the classic
+    // end-of-speech phrase the pipeline was built around).
+    private fun trainTokenTypeKey(slug: String): String = "${KEY_TRAIN_TOKEN_TYPE}_$slug"
+
+    private fun savedTrainTokenType(slug: String): String {
+        val value = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getString(trainTokenTypeKey(slug), "end") ?: "end"
+        return if (value == "start") "start" else "end"
+    }
+
+    private fun setTrainTokenType(slug: String, value: String) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit().putString(trainTokenTypeKey(slug), value).apply()
         render()
     }
 
@@ -3460,6 +3508,7 @@ class MainActivity : Activity() {
         const val KEY_TRAIN_TARGET_FP = "train_target_fp"
         const val KEY_TRAIN_PERSONAL = "train_personal"
         const val KEY_TRAIN_POSITIVE_BOOST = "train_positive_boost"
+        const val KEY_TRAIN_TOKEN_TYPE = "train_token_type"
         const val KEY_DARK_MODE = "dark_mode"
         const val KEY_APPEARANCE = "appearance_mode"
         const val APPEARANCE_SYSTEM = "system"
