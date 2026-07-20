@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Per-take capture provenance forwarded by the app: which device and input
 /// route recorded it, the mic's native format before the app's 16 kHz mono
@@ -283,6 +283,24 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_models_slug ON models(slug, created_at_ms DESC);
+
+        -- Pending/active training jobs. The training scheduler runs at most one
+        -- trainer container at a time (single GPU) and dispatches these oldest
+        -- first. `params_json` is a validated ValidatedTrain payload rebuilt into
+        -- the docker argv at dispatch; `state` walks queued -> running ->
+        -- succeeded/failed/canceled.
+        CREATE TABLE IF NOT EXISTS train_queue (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug           TEXT NOT NULL,
+            params_json    TEXT NOT NULL,
+            state          TEXT NOT NULL DEFAULT 'queued',
+            container_name TEXT,
+            enqueued_at_ms INTEGER NOT NULL,
+            started_at_ms  INTEGER,
+            finished_at_ms INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_train_queue_state ON train_queue(state, id);
 
         CREATE INDEX IF NOT EXISTS idx_slices_project ON slices(project_slug, status);
         CREATE INDEX IF NOT EXISTS idx_slices_recording ON slices(recording_id, status);
@@ -702,6 +720,198 @@ pub fn project_phrase(
         |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
     )
     .optional()
+}
+
+/// One row of the training queue.
+#[derive(Debug, Clone)]
+pub struct QueueEntry {
+    pub id: i64,
+    pub slug: String,
+    pub params_json: String,
+    pub state: String,
+    pub container_name: Option<String>,
+    pub enqueued_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+}
+
+fn queue_entry_from_row(row: &rusqlite::Row) -> Result<QueueEntry, rusqlite::Error> {
+    Ok(QueueEntry {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        params_json: row.get(2)?,
+        state: row.get(3)?,
+        container_name: row.get(4)?,
+        enqueued_at_ms: row.get(5)?,
+        started_at_ms: row.get(6)?,
+        finished_at_ms: row.get(7)?,
+    })
+}
+
+const QUEUE_COLS: &str =
+    "id, slug, params_json, state, container_name, enqueued_at_ms, started_at_ms, finished_at_ms";
+
+/// Append a training job to the queue and return its new id.
+pub fn enqueue_training(
+    conn: &Connection,
+    slug: &str,
+    params_json: &str,
+    now_ms: i64,
+) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO train_queue (slug, params_json, state, enqueued_at_ms)
+         VALUES (?1, ?2, 'queued', ?3)",
+        params![slug, params_json, now_ms],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Every queued or running job, oldest first — the live view of the pipeline.
+pub fn active_queue(conn: &Connection) -> Result<Vec<QueueEntry>, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {QUEUE_COLS} FROM train_queue
+         WHERE state IN ('queued', 'running') ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map([], queue_entry_from_row)?;
+    rows.collect()
+}
+
+/// Jobs currently marked running (the scheduler reconciles these against live
+/// containers). Normally at most one.
+pub fn running_queue(conn: &Connection) -> Result<Vec<QueueEntry>, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {QUEUE_COLS} FROM train_queue WHERE state = 'running' ORDER BY id ASC"
+    ))?;
+    let rows = stmt.query_map([], queue_entry_from_row)?;
+    rows.collect()
+}
+
+/// The oldest queued job, if any.
+pub fn next_queued(conn: &Connection) -> Result<Option<QueueEntry>, rusqlite::Error> {
+    conn.query_row(
+        &format!(
+            "SELECT {QUEUE_COLS} FROM train_queue WHERE state = 'queued' ORDER BY id ASC LIMIT 1"
+        ),
+        [],
+        queue_entry_from_row,
+    )
+    .optional()
+}
+
+/// Fetch a single queue entry by id.
+pub fn queue_entry(conn: &Connection, id: i64) -> Result<Option<QueueEntry>, rusqlite::Error> {
+    conn.query_row(
+        &format!("SELECT {QUEUE_COLS} FROM train_queue WHERE id = ?1"),
+        params![id],
+        queue_entry_from_row,
+    )
+    .optional()
+}
+
+/// Mark a queued job as running and record the container launched for it.
+pub fn mark_queue_running(
+    conn: &Connection,
+    id: i64,
+    container_name: &str,
+    now_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE train_queue SET state = 'running', container_name = ?2, started_at_ms = ?3
+         WHERE id = ?1",
+        params![id, container_name, now_ms],
+    )?;
+    Ok(())
+}
+
+/// Move a job to a terminal state (succeeded/failed/canceled), stamping the
+/// finish time.
+pub fn finish_queue_entry(
+    conn: &Connection,
+    id: i64,
+    state: &str,
+    now_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE train_queue SET state = ?2, finished_at_ms = ?3 WHERE id = ?1",
+        params![id, state, now_ms],
+    )?;
+    Ok(())
+}
+
+/// The 1-based position of a job among the currently queued jobs (running counts
+/// as 0). None when the job isn't queued/running.
+pub fn queue_position(conn: &Connection, id: i64) -> Result<Option<i64>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT
+           CASE WHEN state = 'running' THEN 0
+                WHEN state = 'queued' THEN
+                  (SELECT COUNT(*) FROM train_queue q2
+                     WHERE q2.state = 'queued' AND q2.id <= q1.id)
+                ELSE NULL END
+         FROM train_queue q1 WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .optional()
+    .map(|opt| opt.flatten())
+}
+
+/// The active (queued or running) entry for a slug, if any — used so the status
+/// endpoint can report a pending run before its container exists.
+pub fn active_entry_for_slug(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<QueueEntry>, rusqlite::Error> {
+    conn.query_row(
+        &format!(
+            "SELECT {QUEUE_COLS} FROM train_queue
+             WHERE slug = ?1 AND state IN ('queued', 'running') ORDER BY id ASC LIMIT 1"
+        ),
+        params![slug],
+        queue_entry_from_row,
+    )
+    .optional()
+}
+
+/// Cancel every queued/running job for a slug, returning the affected entries so
+/// the caller can kill any live containers. Rows are marked canceled here.
+pub fn cancel_slug_jobs(
+    conn: &Connection,
+    slug: &str,
+    now_ms: i64,
+) -> Result<Vec<QueueEntry>, rusqlite::Error> {
+    let entries = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {QUEUE_COLS} FROM train_queue
+             WHERE slug = ?1 AND state IN ('queued', 'running')"
+        ))?;
+        let rows = stmt.query_map(params![slug], queue_entry_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    conn.execute(
+        "UPDATE train_queue SET state = 'canceled', finished_at_ms = ?2
+         WHERE slug = ?1 AND state IN ('queued', 'running')",
+        params![slug, now_ms],
+    )?;
+    Ok(entries)
+}
+
+/// Cancel a single queue entry by id if it is still queued/running, returning it.
+pub fn cancel_queue_entry(
+    conn: &Connection,
+    id: i64,
+    now_ms: i64,
+) -> Result<Option<QueueEntry>, rusqlite::Error> {
+    let entry = queue_entry(conn, id)?;
+    let Some(entry) = entry else { return Ok(None) };
+    if !matches!(entry.state.as_str(), "queued" | "running") {
+        return Ok(None);
+    }
+    conn.execute(
+        "UPDATE train_queue SET state = 'canceled', finished_at_ms = ?2 WHERE id = ?1",
+        params![id, now_ms],
+    )?;
+    Ok(Some(entry))
 }
 
 /// Record a completed (terminal) training run. Idempotent on (slug, started_at),

@@ -77,6 +77,9 @@ struct AppState {
     // Pass `--gpus all` to the trainer container (TRAINER_USE_GPU != "0").
     trainer_gpu: Arc<bool>,
     db: Arc<Mutex<Connection>>,
+    // Serializes training-queue dispatch so the enqueue-triggered kick and the
+    // periodic scheduler never launch the same queued job twice.
+    dispatch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn now_ms() -> i64 {
@@ -488,6 +491,7 @@ async fn main() {
         trainer_image: Arc::new(trainer_image),
         trainer_gpu: Arc::new(trainer_gpu),
         db: Arc::new(Mutex::new(db)),
+        dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     let app = Router::new()
@@ -517,12 +521,21 @@ async fn main() {
         .route("/train/:slug", post(start_training))
         .route("/train/:slug/status", get(training_status))
         .route("/train/:slug/log", get(training_log))
+        .route("/train/:slug/cancel", post(cancel_training))
+        .route("/queue", get(training_queue))
+        .route("/queue/:id", axum::routing::delete(delete_queue_entry))
         .route(
             "/review/:slug/:category/:file_name",
             get(review_audio).delete(delete_review_clip),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Drive the training queue: reconcile finished runs and dispatch the next
+    // queued job on a timer, independent of any request.
+    if state.host_repo_root.is_some() {
+        tokio::spawn(training_scheduler(state.clone()));
+    }
 
     let addr: SocketAddr = bind_addr.parse().expect("invalid BIND_ADDR");
     let listener = tokio::net::TcpListener::bind(addr)
@@ -3186,7 +3199,69 @@ fn valid_real_samples_dir(dir: &str) -> bool {
         && !dir.contains("..")
 }
 
-/// Launch a full training run for a wake word as a sibling trainer container.
+/// Fully-resolved, validated training hyperparameters. This is what gets stored
+/// in the queue (as JSON) and rebuilt into the trainer container's argv at
+/// dispatch, so a job launched minutes after it was enqueued still runs with the
+/// exact settings the user chose.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidatedTrain {
+    steps: u32,
+    model_size: String,
+    target_fp_per_hour: f64,
+    personal: bool,
+    positive_boost: u32,
+    n_samples: Option<u32>,
+    n_samples_val: Option<u32>,
+    positive_per_batch: Option<u32>,
+    real_samples_dir: String,
+    token_type: String,
+}
+
+/// Validate + default a raw train request into a `ValidatedTrain`, rejecting bad
+/// input at enqueue time so the queue only ever holds runnable jobs.
+fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
+    let steps = request.steps.unwrap_or(50_000).clamp(100, 500_000);
+    let model_size = request.model_size.unwrap_or_else(|| "medium".to_string());
+    if !valid_model_size(&model_size) {
+        return Err(AppError::bad_request(format!(
+            "invalid model_size: {model_size}"
+        )));
+    }
+    let target_fp_per_hour = request.target_fp_per_hour.unwrap_or(0.2);
+    if !(target_fp_per_hour.is_finite() && (0.0..=100.0).contains(&target_fp_per_hour)) {
+        return Err(AppError::bad_request("invalid target_fp_per_hour"));
+    }
+    let real_samples_dir = request
+        .real_samples_dir
+        .unwrap_or_else(|| "./data/train".to_string());
+    if !valid_real_samples_dir(&real_samples_dir) {
+        return Err(AppError::bad_request("invalid real_samples_dir"));
+    }
+    let token_type = request.token_type.unwrap_or_else(|| "end".to_string());
+    if !matches!(token_type.as_str(), "start" | "end") {
+        return Err(AppError::bad_request(
+            "invalid token_type (expected start|end)",
+        ));
+    }
+    Ok(ValidatedTrain {
+        steps,
+        model_size,
+        target_fp_per_hour,
+        personal: request.personal.unwrap_or(false),
+        positive_boost: request.positive_boost.unwrap_or(1).clamp(1, 50),
+        n_samples: request.n_samples,
+        n_samples_val: request.n_samples_val,
+        positive_per_batch: request.positive_per_batch,
+        real_samples_dir,
+        token_type,
+    })
+}
+
+/// Enqueue a full training run. The training scheduler runs one trainer
+/// container at a time and dispatches queued jobs oldest-first, so pressing
+/// "start" several times (across one or many wake words) lines them up instead
+/// of failing. No recorded clips are required: the trainer synthesizes positives
+/// from the phrase, so a brand-new word can still train.
 async fn start_training(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
@@ -3195,13 +3270,13 @@ async fn start_training(
     if !is_safe_slug(&slug) {
         return Err(AppError::bad_request("invalid slug"));
     }
-    let Some(host_repo_root) = (*state.host_repo_root).clone() else {
+    if state.host_repo_root.is_none() {
         return Err(AppError::internal(
             "training disabled: HOST_REPO_ROOT not set on the sync-server",
         ));
-    };
+    }
 
-    // The wake word must exist so we can supply its target phrase.
+    // The wake word must exist so the dispatcher can supply its target phrase.
     let phrase = {
         let conn = state.db.lock().expect("db lock poisoned");
         db::project_phrase(&conn, &slug).map_err(db_error)?
@@ -3213,45 +3288,55 @@ async fn start_training(
         });
     };
 
-    let name = training_container_name(&slug);
-    if container_running(&name).await {
-        return Err(AppError {
-            status: StatusCode::CONFLICT,
-            message: format!("training already running for {slug}"),
-        });
-    }
+    let validated = validate_train(request)?;
+    let params_json = serde_json::to_string(&validated)
+        .map_err(|e| AppError::internal(format!("serialize train params: {e}")))?;
+
+    let (id, position) = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        let id = db::enqueue_training(&conn, &slug, &params_json, now_ms()).map_err(db_error)?;
+        let position = db::queue_position(&conn, id).map_err(db_error)?.unwrap_or(0);
+        (id, position)
+    };
+
+    // Nudge the scheduler so a job enqueued into an idle pipeline starts right
+    // away instead of waiting for the next poll tick.
+    let dispatch_state = state.clone();
+    tokio::spawn(async move {
+        dispatch_training(&dispatch_state).await;
+    });
+
+    Ok(Json(json!({
+        "status": if position <= 1 { "started" } else { "queued" },
+        "slug": slug,
+        "phrase": phrase,
+        "queue_id": id,
+        "position": position,
+        "steps": validated.steps,
+        "model_size": validated.model_size,
+        "personal": validated.personal,
+        "token_type": validated.token_type,
+    })))
+}
+
+/// Launch the trainer container for one validated job and return its container
+/// name. Every hyperparameter travels as a `-e KEY=VALUE` pair (argv, never
+/// shell-interpolated), so nothing here can inject shell.
+async fn launch_train_container(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+) -> Result<String, AppError> {
+    let Some(host_repo_root) = (*state.host_repo_root).clone() else {
+        return Err(AppError::internal(
+            "training disabled: HOST_REPO_ROOT not set on the sync-server",
+        ));
+    };
+    let name = training_container_name(slug);
     // Clear any dead container left behind by a crash so the name is free.
     let _ = run_docker(vec!["rm".into(), "-f".into(), name.clone()]).await;
 
-    // Validate + default the hyperparameters.
-    let steps = request.steps.unwrap_or(50_000).clamp(100, 500_000);
-    let model_size = request.model_size.unwrap_or_else(|| "medium".to_string());
-    if !valid_model_size(&model_size) {
-        return Err(AppError::bad_request(format!(
-            "invalid model_size: {model_size}"
-        )));
-    }
-    let target_fp = request.target_fp_per_hour.unwrap_or(0.2);
-    if !(target_fp.is_finite() && target_fp >= 0.0 && target_fp <= 100.0) {
-        return Err(AppError::bad_request("invalid target_fp_per_hour"));
-    }
-    let personal = request.personal.unwrap_or(false);
-    let positive_boost = request.positive_boost.unwrap_or(1).clamp(1, 50);
-    let real_samples_dir = request
-        .real_samples_dir
-        .unwrap_or_else(|| "./data/train".to_string());
-    if !valid_real_samples_dir(&real_samples_dir) {
-        return Err(AppError::bad_request("invalid real_samples_dir"));
-    }
-    let token_type = request
-        .token_type
-        .unwrap_or_else(|| "end".to_string());
-    if !matches!(token_type.as_str(), "start" | "end") {
-        return Err(AppError::bad_request("invalid token_type (expected start|end)"));
-    }
-
-    // Assemble the docker argv. Every hyperparameter travels as an -e KEY=VALUE
-    // pair (argv, never shell-interpolated), so nothing here can inject shell.
     let mut args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
@@ -3265,28 +3350,28 @@ async fn start_training(
     }
     args.push("-v".into());
     args.push(format!("{host_repo_root}:/work"));
-    push_env(&mut args, "SLUG", slug.clone());
-    push_env(&mut args, "PHRASE", phrase.clone());
-    push_env(&mut args, "STEPS", steps.to_string());
-    push_env(&mut args, "MODEL_SIZE", model_size.clone());
-    push_env(&mut args, "TARGET_FP_PER_HOUR", target_fp.to_string());
+    push_env(&mut args, "SLUG", slug.to_string());
+    push_env(&mut args, "PHRASE", phrase.to_string());
+    push_env(&mut args, "STEPS", vt.steps.to_string());
+    push_env(&mut args, "MODEL_SIZE", vt.model_size.clone());
+    push_env(&mut args, "TARGET_FP_PER_HOUR", vt.target_fp_per_hour.to_string());
     push_env(
         &mut args,
         "PERSONAL",
-        if personal { "1".into() } else { "0".into() },
+        if vt.personal { "1".into() } else { "0".into() },
     );
-    push_env(&mut args, "POSITIVE_BOOST", positive_boost.to_string());
-    if let Some(n) = request.n_samples {
+    push_env(&mut args, "POSITIVE_BOOST", vt.positive_boost.to_string());
+    if let Some(n) = vt.n_samples {
         push_env(&mut args, "N_SAMPLES", n.to_string());
     }
-    if let Some(n) = request.n_samples_val {
+    if let Some(n) = vt.n_samples_val {
         push_env(&mut args, "N_SAMPLES_VAL", n.to_string());
     }
-    if let Some(n) = request.positive_per_batch {
+    if let Some(n) = vt.positive_per_batch {
         push_env(&mut args, "POSITIVE_PER_BATCH", n.to_string());
     }
-    push_env(&mut args, "REAL_SAMPLES_DIR", real_samples_dir.clone());
-    push_env(&mut args, "TOKEN_TYPE", token_type.clone());
+    push_env(&mut args, "REAL_SAMPLES_DIR", vt.real_samples_dir.clone());
+    push_env(&mut args, "TOKEN_TYPE", vt.token_type.clone());
     args.push((*state.trainer_image).clone());
     args.push("bash".into());
     args.push("-lc".into());
@@ -3300,19 +3385,193 @@ async fn start_training(
             stderr.trim()
         )));
     }
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(name)
+}
+
+/// Render a queue row for the API, folding in its live position.
+fn queue_entry_json(entry: &db::QueueEntry, position: Option<i64>) -> Value {
+    let params: Value =
+        serde_json::from_str(&entry.params_json).unwrap_or_else(|_| json!({}));
+    json!({
+        "id": entry.id,
+        "slug": entry.slug,
+        "state": entry.state,
+        "position": position,
+        "container_name": entry.container_name,
+        "enqueued_at_ms": entry.enqueued_at_ms,
+        "started_at_ms": entry.started_at_ms,
+        "finished_at_ms": entry.finished_at_ms,
+        "params": params,
+    })
+}
+
+/// The live training pipeline: every queued or running job, oldest first.
+async fn training_queue(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let entries = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::active_queue(&conn).map_err(db_error)?
+    };
+    // Position: running jobs are 0, queued jobs count 1..N in id order.
+    let mut queued_rank = 0i64;
+    let jobs: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let position = if e.state == "running" {
+                Some(0)
+            } else {
+                queued_rank += 1;
+                Some(queued_rank)
+            };
+            queue_entry_json(e, position)
+        })
+        .collect();
+    Ok(Json(json!({ "status": "ok", "jobs": jobs })))
+}
+
+/// Cancel every queued/running job for a wake word: mark the rows canceled and
+/// kill any live trainer container. The killed container's `--rm` cleanup plus
+/// the status endpoint's reconciliation report it as stopped.
+async fn cancel_training(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request("invalid slug"));
+    }
+    let canceled = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::cancel_slug_jobs(&conn, &slug, now_ms()).map_err(db_error)?
+    };
+    // Kill any container that was actually running for these jobs.
+    for entry in &canceled {
+        if let Some(name) = &entry.container_name {
+            let _ = run_docker(vec!["rm".into(), "-f".into(), name.clone()]).await;
+        }
+    }
+    // Also kill the by-convention container name in case a run started without a
+    // recorded container_name yet.
+    let _ = run_docker(vec![
+        "rm".into(),
+        "-f".into(),
+        training_container_name(&slug),
+    ])
+    .await;
 
     Ok(Json(json!({
-        "status": "started",
+        "status": "canceled",
         "slug": slug,
-        "phrase": phrase,
-        "container_id": container_id,
-        "container_name": name,
-        "steps": steps,
-        "model_size": model_size,
-        "personal": personal,
-        "token_type": token_type,
+        "canceled": canceled.len(),
     })))
+}
+
+/// Cancel a single queue entry by id (a queued job, or the running one).
+async fn delete_queue_entry(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<Value>, AppError> {
+    let entry = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::cancel_queue_entry(&conn, id, now_ms()).map_err(db_error)?
+    };
+    let Some(entry) = entry else {
+        return Err(AppError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no active queue entry {id}"),
+        });
+    };
+    if let Some(name) = &entry.container_name {
+        let _ = run_docker(vec!["rm".into(), "-f".into(), name.clone()]).await;
+    } else if entry.state == "running" {
+        let _ = run_docker(vec![
+            "rm".into(),
+            "-f".into(),
+            training_container_name(&entry.slug),
+        ])
+        .await;
+    }
+    Ok(Json(json!({
+        "status": "canceled",
+        "id": id,
+        "slug": entry.slug,
+    })))
+}
+
+/// Advance the training pipeline once: reconcile any running job against its
+/// live container, then launch the next queued job if the pipeline is idle.
+/// Cheap and idempotent, so it is safe to call on a timer and after every
+/// enqueue.
+async fn dispatch_training(state: &AppState) {
+    // One dispatch at a time: the enqueue kick and the periodic scheduler share
+    // this, so a queued job is never launched by both at once.
+    let _guard = state.dispatch_lock.lock().await;
+
+    // 1. Reconcile: a job marked running whose container has exited is finished.
+    let running = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::running_queue(&conn).unwrap_or_default()
+    };
+    let mut pipeline_busy = false;
+    for entry in running {
+        let name = entry
+            .container_name
+            .clone()
+            .unwrap_or_else(|| training_container_name(&entry.slug));
+        if container_running(&name).await {
+            pipeline_busy = true;
+        } else {
+            // The trainer container is gone; the real outcome lives in the
+            // per-slug train_status.json. Retire the queue row either way.
+            let conn = state.db.lock().expect("db lock poisoned");
+            let _ = db::finish_queue_entry(&conn, entry.id, "done", now_ms());
+        }
+    }
+    if pipeline_busy {
+        return;
+    }
+
+    // 2. Dispatch: launch the oldest queued job, if any.
+    let next = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::next_queued(&conn).unwrap_or_default()
+    };
+    let Some(entry) = next else { return };
+
+    // The project must still exist to supply its phrase; otherwise drop the job.
+    let phrase = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::project_phrase(&conn, &entry.slug).ok().flatten()
+    };
+    let Some((phrase, _)) = phrase else {
+        let conn = state.db.lock().expect("db lock poisoned");
+        let _ = db::finish_queue_entry(&conn, entry.id, "failed", now_ms());
+        return;
+    };
+    let Ok(vt) = serde_json::from_str::<ValidatedTrain>(&entry.params_json) else {
+        let conn = state.db.lock().expect("db lock poisoned");
+        let _ = db::finish_queue_entry(&conn, entry.id, "failed", now_ms());
+        return;
+    };
+
+    match launch_train_container(state, &entry.slug, &phrase, &vt).await {
+        Ok(name) => {
+            let conn = state.db.lock().expect("db lock poisoned");
+            let _ = db::mark_queue_running(&conn, entry.id, &name, now_ms());
+        }
+        Err(err) => {
+            eprintln!("training dispatch failed for {}: {}", entry.slug, err.message);
+            let conn = state.db.lock().expect("db lock poisoned");
+            let _ = db::finish_queue_entry(&conn, entry.id, "failed", now_ms());
+        }
+    }
+}
+
+/// Background loop that keeps the training pipeline moving: reconcile finished
+/// runs and dispatch the next queued job every few seconds.
+async fn training_scheduler(state: AppState) {
+    loop {
+        dispatch_training(&state).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 /// Read the training status JSON for a wake word, reconciled with whether the
@@ -3629,6 +3888,28 @@ async fn training_status(
                 let elapsed = (now_ms() - started).max(0);
                 body["elapsed_ms"] = json!(elapsed);
                 body["remaining_ms"] = json!((estimated_total - elapsed).max(0));
+            }
+        }
+    }
+
+    // Overlay the queue: a pending job (not yet launched) reports as "queued"
+    // with its position, even though the trainer has written no status file yet.
+    // Done last so the terminal-run bookkeeping above still ran for any prior run.
+    {
+        let entry = {
+            let conn = state.db.lock().expect("db lock poisoned");
+            db::active_entry_for_slug(&conn, &slug).map_err(db_error)?
+        };
+        if let Some(entry) = entry {
+            body["queue_id"] = json!(entry.id);
+            if entry.state == "queued" && !running {
+                let position = {
+                    let conn = state.db.lock().expect("db lock poisoned");
+                    db::queue_position(&conn, entry.id).ok().flatten()
+                };
+                body["state"] = json!("queued");
+                body["message"] = json!("waiting in the training queue");
+                body["queue_position"] = json!(position);
             }
         }
     }
