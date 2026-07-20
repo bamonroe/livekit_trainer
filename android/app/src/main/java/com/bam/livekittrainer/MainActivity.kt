@@ -3013,9 +3013,29 @@ class MainActivity : Activity() {
         if (serverUrl.isBlank()) return
         Thread {
             try {
-                val serverProjects = BundleSyncClient(serverUrl).loadProjects()
-                val known = store.loadProjects().map { it.slug }.toSet()
-                val added = serverProjects.filter { it.slug !in known }
+                val client = BundleSyncClient(serverUrl)
+                val serverProjects = client.loadProjects()
+                val serverSlugs = serverProjects.map { it.slug }.toSet()
+                val localProjects = store.loadProjects()
+                val localSlugs = localProjects.map { it.slug }.toSet()
+
+                // Push up: any project made locally (including on the old
+                // build, before project-registration existed) that the server
+                // doesn't have yet, so it propagates to the user's other
+                // devices. Best-effort per project.
+                localProjects
+                    .filter { it.slug !in serverSlugs }
+                    .forEach { project ->
+                        try {
+                            client.createProject(project)
+                        } catch (_: Exception) {
+                            // Retry on the next resume.
+                        }
+                    }
+
+                // Pull down: any project created on another device the local
+                // store is missing.
+                val added = serverProjects.filter { it.slug !in localSlugs }
                 if (added.isEmpty()) return@Thread
                 added.forEach { store.addProject(it.normalizedForLocalImport()) }
                 runOnUiThread {
