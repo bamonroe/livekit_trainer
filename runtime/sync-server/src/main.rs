@@ -3132,6 +3132,9 @@ struct TrainRequest {
     positive_boost: Option<u32>,
     positive_per_batch: Option<u32>,
     real_samples_dir: Option<String>,
+    // "start" | "end". Selects the leading-context recipe (see
+    // generate_config.py --token-type). Defaults to "end" when omitted.
+    token_type: Option<String>,
 }
 
 fn training_container_name(slug: &str) -> String {
@@ -3240,6 +3243,12 @@ async fn start_training(
     if !valid_real_samples_dir(&real_samples_dir) {
         return Err(AppError::bad_request("invalid real_samples_dir"));
     }
+    let token_type = request
+        .token_type
+        .unwrap_or_else(|| "end".to_string());
+    if !matches!(token_type.as_str(), "start" | "end") {
+        return Err(AppError::bad_request("invalid token_type (expected start|end)"));
+    }
 
     // Assemble the docker argv. Every hyperparameter travels as an -e KEY=VALUE
     // pair (argv, never shell-interpolated), so nothing here can inject shell.
@@ -3277,6 +3286,7 @@ async fn start_training(
         push_env(&mut args, "POSITIVE_PER_BATCH", n.to_string());
     }
     push_env(&mut args, "REAL_SAMPLES_DIR", real_samples_dir.clone());
+    push_env(&mut args, "TOKEN_TYPE", token_type.clone());
     args.push((*state.trainer_image).clone());
     args.push("bash".into());
     args.push("-lc".into());
@@ -3301,6 +3311,7 @@ async fn start_training(
         "steps": steps,
         "model_size": model_size,
         "personal": personal,
+        "token_type": token_type,
     })))
 }
 

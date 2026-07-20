@@ -94,6 +94,21 @@ def main() -> int:
             "trainer/patches/augment_ctxfix.py over livekit.wakeword.data.augment."
         ),
     )
+    parser.add_argument(
+        "--token-type",
+        choices=["start", "end"],
+        default="end",
+        help=(
+            "Where the phrase sits in an utterance, which decides the leading "
+            "context the recipe trains on. 'end' (default, e.g. \"all set\") lands "
+            "at the end of speech, so its realistic lead is prior words — the "
+            "ordinary-speech negatives are mixed into the pre-phrase window. "
+            "'start' begins an utterance from a quiet-but-noisy room with no "
+            "speech before it, so only ambient background is mixed in; leading "
+            "speech is deliberately withheld so a start token never learns to "
+            "expect words in front of the trigger."
+        ),
+    )
     parser.set_defaults(context_fix=True)
     args = parser.parse_args()
 
@@ -161,14 +176,17 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     real_samples_dir = (args.real_samples_dir or "").strip() or None
 
     # Leading-context augmentation recipe: fill the pre-phrase window with real
-    # sound instead of the zero-fill align_clip_to_end leaves. Point the trainer
-    # at its own ambient corpus, our ordinary-speech negatives (leading *speech*
-    # context — the case the silence-padded model never saw), and our ambient
-    # background takes. mix_with_background picks one at random per clip.
+    # sound instead of the zero-fill align_clip_to_end leaves. Always include the
+    # trainer's ambient corpus and our own ambient background takes. Whether the
+    # ordinary-speech negatives join depends on token type: an END token (end of
+    # speech) has prior words in front, so it trains on leading speech; a START
+    # token begins an utterance from a quiet room, so speech is withheld and only
+    # ambient noise fills the lead. mix_with_background picks one at random per
+    # clip.
     background_paths = None
     if args.context_fix:
         background_paths = ["./data/backgrounds"]
-        if real_samples_dir:
+        if args.token_type == "end" and real_samples_dir:
             background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/negative")
         background_paths.append(f"./data/real/{slug}/background")
 
@@ -180,6 +198,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "output_dir": "./output",
         "real_samples_dir": real_samples_dir,
         "background_paths": background_paths,
+        "token_type": args.token_type,
         "batch_n_per_class": batch_n_per_class,
         "header_comment": header_comment,
         "model": {
@@ -226,11 +245,13 @@ def render_yaml(config: dict[str, Any]) -> str:
         for key, value in config["batch_n_per_class"].items():
             lines.append(f"  {key}: {value}")
     if config.get("background_paths"):
+        token_type = config.get("token_type", "end")
+        lead = "noise + prior speech" if token_type == "end" else "ambient noise only (no leading speech)"
         lines.append("")
         lines.append("augmentation:")
-        lines.append("  # Leading-context fix: re-mix these into the full 2s window after")
-        lines.append("  # placement so the pre-phrase region carries real noise/speech, not")
-        lines.append("  # zeros. Needs the augment_ctxfix patch in the trainer image to bite.")
+        lines.append(f"  # Leading-context fix ({token_type} token: {lead}): re-mix these into")
+        lines.append("  # the full 2s window after placement so the pre-phrase region carries")
+        lines.append("  # real sound, not zeros. Needs the augment_ctxfix patch in the image.")
         lines.append("  background_paths:")
         for path in config["background_paths"]:
             lines.append(f"    - {yaml_string(path)}")

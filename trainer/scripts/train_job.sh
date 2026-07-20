@@ -24,6 +24,11 @@ N_SAMPLES="${N_SAMPLES:-}"
 N_SAMPLES_VAL="${N_SAMPLES_VAL:-}"
 POSITIVE_PER_BATCH="${POSITIVE_PER_BATCH:-}"
 REAL_SAMPLES_DIR="${REAL_SAMPLES_DIR:-./data/train}"
+# start | end. Decides the leading-context recipe: an end token (end of speech,
+# e.g. "all set") trains with prior speech in front; a start token begins an
+# utterance from a quiet room, so only ambient noise fills the lead. See
+# scripts/generate_config.py --token-type.
+TOKEN_TYPE="${TOKEN_TYPE:-end}"
 
 cd /work
 
@@ -60,7 +65,7 @@ fail() {
 }
 
 : > "$LOG"
-echo "== train_job slug=$SLUG phrase='$PHRASE' steps=$STEPS size=$MODEL_SIZE personal=$PERSONAL boost=$POSITIVE_BOOST started $STARTED ==" | tee -a "$LOG"
+echo "== train_job slug=$SLUG phrase='$PHRASE' token=$TOKEN_TYPE steps=$STEPS size=$MODEL_SIZE personal=$PERSONAL boost=$POSITIVE_BOOST started $STARTED ==" | tee -a "$LOG"
 
 # 1. Assemble the pooled real-samples tree.
 write_status "running" "assemble" 0 "assembling pooled data"
@@ -73,7 +78,7 @@ write_status "running" "generate" 0 "generating config"
 CONFIG="trainer/configs/$SLUG.yaml"
 gen_args=(--slug "$SLUG" --phrase "$PHRASE" --out "$CONFIG"
   --steps "$STEPS" --model-size "$MODEL_SIZE" --target-fp-per-hour "$TARGET_FP_PER_HOUR"
-  --real-samples-dir "$REAL_SAMPLES_DIR")
+  --real-samples-dir "$REAL_SAMPLES_DIR" --token-type "$TOKEN_TYPE")
 # Durable hard negatives: the app regenerates this config on every run, so the
 # curated near-miss list lives in a sidecar file and is always fed back in
 # rather than being silently overwritten to empty.
