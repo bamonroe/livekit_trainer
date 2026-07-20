@@ -414,6 +414,38 @@ class BundleSyncClient(
         return JSONObject(readResponse(connection, "Training status failed"))
     }
 
+    /** Cancel the running and queued training jobs for a wake word. */
+    fun cancelTraining(wakeWordSlug: String): JSONObject {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/train/${urlPart(wakeWordSlug)}/cancel")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        connection.doOutput = true
+        connection.setFixedLengthStreamingMode(0)
+        return JSONObject(readResponse(connection, "Cancel training failed"))
+    }
+
+    /** The live training pipeline: every queued or running job, oldest first. */
+    fun trainingQueue(): JSONObject {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/queue")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        return JSONObject(readResponse(connection, "Training queue failed"))
+    }
+
+    /** Cancel one queue entry by its id. */
+    fun deleteQueueEntry(id: Long): JSONObject {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/queue/$id")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "DELETE"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        return JSONObject(readResponse(connection, "Cancel queue entry failed"))
+    }
+
     /** Tail of the training log for a wake word. */
     fun trainingLog(wakeWordSlug: String, tail: Int = 200): String {
         val endpoint = URL(

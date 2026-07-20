@@ -78,6 +78,10 @@ class MainActivity : Activity() {
     // a running-status refresh never rebuilds the form and clobbers typed input.
     private var trainStatusView: TextView? = null
     private var trainLogView: TextView? = null
+    // Container for the live training-queue rows, repopulated on every poll.
+    private var trainQueueContainer: LinearLayout? = null
+    // Cancel button for the current word; shown only while it has an active run.
+    private var trainCancelButton: Button? = null
     // Bumped every time we (re)enter the Train page or start a run, so a stale
     // scheduled poll from an earlier page/run stops itself.
     private var trainPollToken: Int = 0
@@ -1166,18 +1170,23 @@ class MainActivity : Activity() {
         trainPollToken += 1
         trainStatusView = null
         trainLogView = null
+        trainQueueContainer = null
+        trainCancelButton = null
         workspace.removeAllViews()
         workspace.addView(topBar("Train"))
         if (project == null) {
-            workspace.addView(emptyCard("Create a wake word project and collect some recordings before training."))
+            workspace.addView(emptyCard("Create a wake word project first. Recordings help, but you can train a synthetic-only model without any."))
             maybeStatus()
             return
         }
         workspace.addView(trainingFormCard(project))
         workspace.addView(trainingStatusCard(project).withTop(dp(12)))
+        workspace.addView(trainingQueueCard(project).withTop(dp(12)))
         maybeStatus()
-        // Pull the current status once on entry; it self-schedules while running.
+        // Pull the current status and queue once on entry; they self-schedule
+        // while anything is running or queued.
         refreshTrainingStatus(project, showErrors = false)
+        refreshTrainingQueue()
     }
 
     private fun trainingFormCard(project: WakeWordProject): View {
@@ -1229,7 +1238,7 @@ class MainActivity : Activity() {
             addView(text("Train ${project.phrase}", 20f, textColor(), Typeface.BOLD))
             addView(
                 text(
-                    "Runs on the sync server's GPU. Data is assembled from every wake word's clips, with this word's own clips as the positives.",
+                    "Runs on the sync server's GPU. Data is assembled from every wake word's clips, with this word's own clips as the positives. No recordings? It still trains a synthetic-only model. Start several and they queue up, one at a time.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(4)),
@@ -1319,7 +1328,7 @@ class MainActivity : Activity() {
             addView(boostInput.withTop(dp(6)))
 
             addView(
-                actionButton("Start training", ButtonStyle.Primary) {
+                actionButton("Start / queue training", ButtonStyle.Primary) {
                     commitNumbers()
                     startTraining(project)
                 }.withTop(dp(16)),
@@ -1339,6 +1348,10 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         trainLogView = logView
+        val cancelButton = actionButton("Cancel", ButtonStyle.Danger) {
+            cancelTraining(project)
+        }.apply { visibility = View.GONE }
+        trainCancelButton = cancelButton
         return card().apply {
             addView(text("Status", 20f, textColor(), Typeface.BOLD))
             addView(statusView.withTop(dp(8)))
@@ -1357,7 +1370,93 @@ class MainActivity : Activity() {
                     )
                 }.withTop(dp(12)),
             )
+            addView(cancelButton.withTop(dp(8)))
             addView(logView.withTop(dp(12)))
+        }
+    }
+
+    private fun trainingQueueCard(project: WakeWordProject): View {
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        trainQueueContainer = container
+        return card().apply {
+            addView(text("Training queue", 20f, textColor(), Typeface.BOLD))
+            addView(
+                text(
+                    "Runs one at a time on the server. Newly started runs line up here.",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(container.withTop(dp(10)))
+        }
+    }
+
+    private fun refreshTrainingQueue() {
+        val serverUrl = savedServerUrl()
+        val container = trainQueueContainer ?: return
+        if (serverUrl.isBlank()) {
+            container.removeAllViews()
+            container.addView(text("Set a sync server URL in Settings first", 13f, mutedColor()))
+            return
+        }
+        val token = trainPollToken
+        Thread {
+            try {
+                val queue = BundleSyncClient(serverUrl).trainingQueue()
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    renderTrainingQueue(queue)
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    trainQueueContainer?.apply {
+                        removeAllViews()
+                        addView(text("Queue error: ${error.message}", 13f, mutedColor()))
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun renderTrainingQueue(queue: org.json.JSONObject) {
+        val container = trainQueueContainer ?: return
+        container.removeAllViews()
+        val jobs = queue.optJSONArray("jobs")
+        if (jobs == null || jobs.length() == 0) {
+            container.addView(text("Nothing queued.", 13f, mutedColor()))
+            return
+        }
+        for (i in 0 until jobs.length()) {
+            val job = jobs.optJSONObject(i) ?: continue
+            val id = job.optLong("id", -1L)
+            val slug = job.optString("slug", "?")
+            val state = job.optString("state", "?")
+            val position = if (job.isNull("position")) -1 else job.optInt("position", -1)
+            val params = job.optJSONObject("params")
+            val steps = params?.optInt("steps", 0) ?: 0
+            val size = params?.optString("model_size", "") ?: ""
+            val label = buildString {
+                if (state == "running") append("▶ ") else if (position > 0) append("$position. ")
+                append(slug)
+                val bits = mutableListOf<String>()
+                if (state == "running") bits.add("running") else bits.add(state)
+                if (steps > 0) bits.add("$steps steps")
+                if (size.isNotBlank()) bits.add(size)
+                append("  (").append(bits.joinToString(", ")).append(")")
+            }
+            container.addView(
+                LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    addView(text(label, 13f, textColor()).weight1())
+                    addView(
+                        actionButton("Cancel", ButtonStyle.Danger) {
+                            if (id >= 0) cancelQueueEntry(id)
+                        }.withLeft(dp(8)),
+                    )
+                }.withTop(if (i == 0) dp(0) else dp(8)),
+            )
         }
     }
 
@@ -1376,10 +1475,15 @@ class MainActivity : Activity() {
         Thread {
             try {
                 val result = BundleSyncClient(serverUrl).startTraining(project.slug, body)
-                val name = result.optString("container_name", "")
+                val queued = result.optString("status", "") == "queued"
+                val position = result.optInt("position", 0)
                 runOnUiThread {
                     startingTraining = false
-                    statusMessage = "Training started${if (name.isNotBlank()) " ($name)" else ""}"
+                    statusMessage = if (queued && position > 0) {
+                        "Queued at position $position"
+                    } else {
+                        "Training started"
+                    }
                     render()
                 }
             } catch (error: Exception) {
@@ -1388,6 +1492,46 @@ class MainActivity : Activity() {
                     statusMessage = error.message ?: "Start training failed"
                     render()
                 }
+            }
+        }.start()
+    }
+
+    private fun cancelTraining(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        val token = trainPollToken
+        Thread {
+            try {
+                BundleSyncClient(serverUrl).cancelTraining(project.slug)
+                runOnUiThread {
+                    if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                    statusMessage = "Cancelled ${project.phrase}"
+                    refreshTrainingStatus(project, showErrors = false)
+                    refreshTrainingQueue()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    statusMessage = error.message ?: "Cancel failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    private fun cancelQueueEntry(id: Long) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        val token = trainPollToken
+        Thread {
+            try {
+                BundleSyncClient(serverUrl).deleteQueueEntry(id)
+            } catch (_: Exception) {
+                // Fall through to a refresh; the row may already be gone.
+            }
+            runOnUiThread {
+                if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
+                refreshTrainingQueue()
+                activeProjectOrNull()?.let { refreshTrainingStatus(it, showErrors = false) }
             }
         }.start()
     }
@@ -1406,7 +1550,10 @@ class MainActivity : Activity() {
                     if (currentPage != AppPage.Train || token != trainPollToken) return@runOnUiThread
                     trainStatusView?.text = formatTrainingStatus(status)
                     val state = status.optString("state", "")
-                    if (state == "running" || state == "starting") {
+                    val active = state == "running" || state == "starting" || state == "queued"
+                    // Cancel is available whenever this word has a live/pending run.
+                    trainCancelButton?.visibility = if (active) View.VISIBLE else View.GONE
+                    if (active) {
                         scheduleTrainPoll(project)
                     }
                 }
@@ -1426,6 +1573,7 @@ class MainActivity : Activity() {
         trainHandler.postDelayed({
             if (currentPage == AppPage.Train && token == trainPollToken) {
                 refreshTrainingStatus(project, showErrors = false)
+                refreshTrainingQueue()
             }
         }, 4_000)
     }
@@ -1466,9 +1614,11 @@ class MainActivity : Activity() {
         val message = status.optString("message", "")
         val running = status.optBoolean("container_running", false)
         val hasModel = status.optBoolean("has_model", false)
+        val queuePosition = if (status.isNull("queue_position")) -1 else status.optInt("queue_position", -1)
         val label = when (state) {
             "running" -> "Running"
             "starting" -> "Starting"
+            "queued" -> if (queuePosition > 0) "Queued (position $queuePosition)" else "Queued"
             "succeeded" -> "Succeeded"
             "failed" -> "Failed"
             "stopped" -> "Stopped"

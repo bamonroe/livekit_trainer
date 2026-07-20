@@ -7,6 +7,25 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [x] Training queue + cancel + no-recording training. Three fixes shipped
+  together: (1) the sync-server now backs training with a `train_queue` DB table
+  and a background scheduler (`dispatch_training`/`training_scheduler`) that runs
+  one trainer container at a time and dispatches queued jobs oldest-first, so
+  pressing Start several times (any mix of wake words) lines them up instead of
+  the old "already running" 409. New endpoints: `GET /queue`,
+  `POST /train/:slug/cancel`, `DELETE /queue/:id`; `/train/:slug` now enqueues
+  and returns `{status: started|queued, queue_id, position}`; `/train/:slug/status`
+  overlays a `queued` state + position. Dispatch is serialized by a tokio
+  `dispatch_lock` so the enqueue kick and the 3s scheduler never double-launch.
+  (2) `assemble_training_data.py` no longer hard-fails when a slug has no
+  recorded clips — it assembles a synthetic-only pool (borrowed negatives/
+  background only), and `other_slugs` tolerates a missing data root; the trainer
+  synthesizes positives from the phrase, so a brand-new word can train with zero
+  recordings. (3) The app's Train page: "Start / queue training", a Cancel button
+  (shown while a run is live/queued), and a live Training queue card with
+  per-job cancel. Sync-server rebuilt + restarted; app APK builds. Tap-test the
+  queue/cancel flow on the emulator when convenient.
+
 - [x] Start-vs-end token type, end to end. A phrase is a start token (begins an
   utterance, quiet-room lead) or an end token (ends speech, e.g. "all set",
   prior-speech lead); they need opposite leading context. Wired through:
