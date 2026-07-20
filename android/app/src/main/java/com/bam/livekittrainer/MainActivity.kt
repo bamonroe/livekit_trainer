@@ -186,6 +186,16 @@ class MainActivity : Activity() {
         root.addView(bottomNav)
         setContentView(root)
         render()
+        // Projects are server-shared: pull anything created on another device so
+        // it appears here without a manual step.
+        syncProjectsFromServer()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Reconcile projects again when returning to the app, so a wake word
+        // created on another device shows up promptly.
+        syncProjectsFromServer()
     }
 
     private fun render() {
@@ -362,6 +372,7 @@ class MainActivity : Activity() {
                     currentPage = AppPage.Record
                     statusMessage = "Created project “$phrase”"
                     render()
+                    pushProjectToServer(project)
                 }
             }
             .show()
@@ -2975,6 +2986,49 @@ class MainActivity : Activity() {
         return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .getString(KEY_SYNC_SERVER_URL, DEFAULT_SYNC_SERVER_URL)
             ?: DEFAULT_SYNC_SERVER_URL
+    }
+
+    /** Register a freshly-created project on the server so the user's other
+     *  devices see it without waiting for a recording. Best-effort: a failure
+     *  is left for the next automatic pull/sync to reconcile, not surfaced. */
+    private fun pushProjectToServer(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        Thread {
+            try {
+                BundleSyncClient(serverUrl).createProject(project)
+            } catch (_: Exception) {
+                // Silent: the project is saved locally and will register on the
+                // next sync; no need to interrupt the create flow.
+            }
+        }.start()
+    }
+
+    /** Pull the server's project list and merge any missing projects into the
+     *  local store, so a project created on another device appears here on its
+     *  own. Silent — it never steals the current page or status line; it only
+     *  re-renders if it actually added something new. */
+    private fun syncProjectsFromServer() {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        Thread {
+            try {
+                val serverProjects = BundleSyncClient(serverUrl).loadProjects()
+                val known = store.loadProjects().map { it.slug }.toSet()
+                val added = serverProjects.filter { it.slug !in known }
+                if (added.isEmpty()) return@Thread
+                added.forEach { store.addProject(it.normalizedForLocalImport()) }
+                runOnUiThread {
+                    if (selectedProjectId == null) {
+                        selectedProjectId = store.loadProjects().firstOrNull()?.id
+                    }
+                    render()
+                }
+            } catch (_: Exception) {
+                // Offline or server down: keep whatever is local; try again next
+                // resume. Never disrupt the user over a background refresh.
+            }
+        }.start()
     }
 
 

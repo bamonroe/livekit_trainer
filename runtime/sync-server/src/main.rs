@@ -130,6 +130,18 @@ struct ProjectsResponse {
     projects: Vec<ProjectSummary>,
 }
 
+/// A project a device is registering with the server so it propagates to the
+/// user's other devices even before any recording exists for it. The device's
+/// own project id travels as `external_id` so the round-tripped project keeps a
+/// stable identity across devices.
+#[derive(Debug, Deserialize)]
+struct CreateProjectRequest {
+    #[serde(alias = "external_id")]
+    id: Option<String>,
+    slug: String,
+    phrase: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ProjectSummary {
     id: String,
@@ -497,7 +509,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/settings", get(get_settings).post(update_settings))
-        .route("/projects", get(projects))
+        .route("/projects", get(projects).post(create_project))
         .route("/sync", post(sync))
         .route("/reprocess/:slug", post(reprocess_project))
         .route("/reprocess/:slug/:recording_id", post(reprocess_recording))
@@ -608,6 +620,33 @@ async fn projects(State(state): State<AppState>) -> Result<Json<ProjectsResponse
         status: "ok",
         projects,
     }))
+}
+
+/// Register a project on the server so it shows up on the user's other devices
+/// without waiting for a recording to be synced. Idempotent on slug: creating
+/// the same wake word again just refreshes its phrase and id.
+async fn create_project(
+    State(state): State<AppState>,
+    Json(request): Json<CreateProjectRequest>,
+) -> Result<Json<Value>, AppError> {
+    let slug = request.slug.trim().to_string();
+    let phrase = request.phrase.trim().to_string();
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!("unsafe slug: {slug:?}")));
+    }
+    if phrase.is_empty() {
+        return Err(AppError::bad_request("phrase is required"));
+    }
+    let external_id = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::upsert_project(&conn, &slug, &phrase, external_id, now_ms()).map_err(db_error)?;
+    }
+    Ok(Json(json!({ "status": "ok", "slug": slug })))
 }
 
 async fn sync(

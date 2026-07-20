@@ -86,6 +86,32 @@ class BundleSyncClient(
         }
     }
 
+    /** Register a project on the server so it propagates to the user's other
+     *  devices even before any recording exists. Idempotent on slug. */
+    fun createProject(project: WakeWordProject) {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/projects")
+        val payload = JSONObject().apply {
+            put("id", project.id)
+            put("slug", project.slug)
+            put("phrase", project.phrase)
+        }
+        val body = payload.toString().toByteArray(Charsets.UTF_8)
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        connection.doOutput = true
+        connection.setRequestProperty("Content-Type", "application/json")
+        connection.setFixedLengthStreamingMode(body.size)
+        try {
+            connection.outputStream.use { it.write(body) }
+        } catch (error: IOException) {
+            connection.disconnect()
+            throw error
+        }
+        readResponse(connection, "Create server project failed")
+    }
+
     fun loadProjectCounts(): Map<String, ProjectCounts> {
         val endpoint = URL(serverUrl.trimEnd('/') + "/projects")
         val connection = endpoint.openConnection() as HttpURLConnection
