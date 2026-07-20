@@ -11,6 +11,8 @@ GET  /health          -> {"status","models_dir","loaded":[...]}
 POST /score           multipart form:
     file       WAV (16 kHz mono, 16-bit PCM)
     slug       wake-word slug; model resolved at <MODELS_DIR>/<slug>/<slug>.onnx
+    run        optional archived run id; resolves <slug>/runs/<run>/<slug>.onnx
+               so a specific past model version can be scored, not just current
     mode       "full" (continuous rolling window) | "reset" (silence-pad)
     step_ms    scan resolution (default 10)
     keep_ms    reset mode: real audio kept before the silence pad (default 700)
@@ -49,20 +51,33 @@ app = Flask(__name__)
 _scorers: dict[str, Scorer] = {}
 
 
-def resolve_onnx(model: str) -> Path:
+def resolve_onnx(model: str, run: str | None = None) -> Path:
     """Locate the .onnx for a model *directory* name. Prefers the
     conventional <model>/<model>.onnx; otherwise the single .onnx in the dir.
     The dir name (not the file name, which can collide across variants) is the
-    stable identifier callers use."""
-    d = MODELS_DIR / model
-    if not d.is_dir():
+    stable identifier callers use.
+
+    When `run` is given, resolve a specific archived training run under
+    <model>/runs/<run>/ instead of the mutable current model, so any past model
+    version can be scored head-to-head without being overwritten by a retrain."""
+    base = MODELS_DIR / model
+    if not base.is_dir():
         raise FileNotFoundError(f"no model directory {model!r} under {MODELS_DIR}")
+    if run:
+        if not run.isalnum():
+            raise FileNotFoundError(f"unsafe run id {run!r}")
+        d = base / "runs" / run
+        if not d.is_dir():
+            raise FileNotFoundError(f"no run {run!r} for model {model!r}")
+    else:
+        d = base
     preferred = d / f"{model}.onnx"
     if preferred.exists():
         return preferred
     onnxes = sorted(d.glob("*.onnx"))
     if not onnxes:
-        raise FileNotFoundError(f"no .onnx in model directory {model!r}")
+        raise FileNotFoundError(f"no .onnx in model directory {model!r}"
+                                + (f" run {run!r}" if run else ""))
     if len(onnxes) > 1:
         raise FileNotFoundError(
             f"ambiguous model {model!r}: {[p.name for p in onnxes]}; "
@@ -71,12 +86,28 @@ def resolve_onnx(model: str) -> Path:
     return onnxes[0]
 
 
-def get_scorer(model: str) -> Scorer:
-    if model not in _scorers:
-        # Key the scorer's public name by the caller's dir name so /compare
-        # results stay distinct even when two variants share an .onnx filename.
-        _scorers[model] = Scorer(str(resolve_onnx(model)), model_name=model)
-    return _scorers[model]
+def _cache_key(path: Path) -> str:
+    """Cache key that changes when the file on disk changes. Keying by
+    (path, mtime) makes a retrain that overwrites the current .onnx reload
+    automatically — the old bug served a stale session forever — and lets many
+    archived runs coexist in the cache at once."""
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    return f"{path}:{mtime}"
+
+
+def get_scorer(model: str, run: str | None = None) -> Scorer:
+    path = resolve_onnx(model, run)
+    key = _cache_key(path)
+    scorer = _scorers.get(key)
+    if scorer is None:
+        # Public name keeps runs distinct in /compare output and logs.
+        name = f"{model}@{run}" if run else model
+        scorer = Scorer(str(path), model_name=name)
+        _scorers[key] = scorer
+    return scorer
 
 
 def available_models() -> list[str]:
@@ -113,12 +144,13 @@ def score():
     slug = request.form.get("slug", "").strip()
     if not slug:
         return jsonify(error="missing 'slug'"), 400
+    run = request.form.get("run", "").strip() or None
     mode = request.form.get("mode", "full")
     step_ms = int(request.form.get("step_ms", 10))
     keep_ms = int(request.form.get("keep_ms", 700))
     try:
         audio = read_wav(request.files["file"].read())
-        scorer = get_scorer(slug)
+        scorer = get_scorer(slug, run)
     except (FileNotFoundError, ValueError) as e:
         return jsonify(error=str(e)), 400
 
@@ -128,7 +160,7 @@ def score():
         times, scores = scorer.score_full(audio, step_ms=step_ms)
 
     return jsonify(
-        model=scorer.name, mode=mode, window_ms=2000, step_ms=step_ms,
+        model=scorer.name, run=run, mode=mode, window_ms=2000, step_ms=step_ms,
         keep_ms=keep_ms if mode == "reset" else None,
         duration_ms=round(len(audio) / 16000 * 1000, 1),
         times_ms=[round(float(t), 1) for t in times],

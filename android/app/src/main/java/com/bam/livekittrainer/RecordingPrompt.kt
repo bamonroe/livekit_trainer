@@ -110,17 +110,20 @@ object PromptGenerator {
         }
 
         // One short warmup run so mic level settles before the first positive.
-        emitShortRun(3 + random.nextInt(3))
+        emitShortRun(2 + random.nextInt(2))
         repeat(placementCount) { index ->
             lines.add(compactWakeLine(phrase, random, index))
-            emitShortRun(3 + random.nextInt(4))
-            // A near-miss after roughly every other positive, with its own short
-            // random tail so it doesn't butt straight into the next wake.
-            if (index % 2 == 1) {
+            // Just a word or two of surrounding speech per wake — enough context
+            // for the streaming-recall fix, but roughly half the filler of before
+            // so positives land about twice as densely.
+            emitShortRun(1 + random.nextInt(2))
+            // A near-miss only every fourth positive (was every other), with a
+            // minimal tail, so hard negatives stop crowding out the positives.
+            if (index % 4 == 3) {
                 nextHardNegative()?.let { nearMiss ->
                     usedHardNegatives.add(nearMiss)
                     lines.add(compactHardNegativeLine(nearMiss, random))
-                    emitShortRun(2 + random.nextInt(3))
+                    emitShortRun(1 + random.nextInt(2))
                 }
             }
         }

@@ -30,6 +30,26 @@ REAL_SAMPLES_DIR="${REAL_SAMPLES_DIR:-./data/train}"
 # scripts/generate_config.py --token-type.
 TOKEN_TYPE="${TOKEN_TYPE:-end}"
 
+# Realistic-positive compositing knobs (trainer/patches/augment_realistic.py).
+# REALISTIC=1 (default) writes a per-run sidecar YAML from these and points
+# AUG_REALISTIC_CONFIG at it, so each positive is composited as one clear voice
+# on a background bed (optional filler -> gap -> wake word -> room-tone margin)
+# instead of overlapping speech on the phrase. All have defaults matching the
+# sidecar defaults; the sync-server forwards the app's chosen values.
+REALISTIC="${REALISTIC:-1}"
+LEAD_PROBABILITY="${LEAD_PROBABILITY:-0.75}"
+REAL_LEAD_FRACTION="${REAL_LEAD_FRACTION:-0.6}"
+SYNTHETIC_LEAD="${SYNTHETIC_LEAD:-1}"
+MAX_LEAD_MS="${MAX_LEAD_MS:-900}"
+LEAD_GAP_MIN_MS="${LEAD_GAP_MIN_MS:-40}"
+LEAD_GAP_MAX_MS="${LEAD_GAP_MAX_MS:-300}"
+MARGIN_MIN_MS="${MARGIN_MIN_MS:-100}"
+MARGIN_MAX_MS="${MARGIN_MAX_MS:-700}"
+SNR_MIN_DB="${SNR_MIN_DB:-0}"
+SNR_MAX_DB="${SNR_MAX_DB:-18}"
+BACKGROUND_AUGMENT="${BACKGROUND_AUGMENT:-1}"
+VOICE_PEAK="${VOICE_PEAK:-0.7}"
+
 cd /work
 
 OUT_DIR="output/$SLUG"
@@ -92,8 +112,46 @@ NEGATIVES_FILE="trainer/configs/$SLUG.negatives.txt"
 [ -n "$N_SAMPLES" ] && gen_args+=(--n-samples "$N_SAMPLES")
 [ -n "$N_SAMPLES_VAL" ] && gen_args+=(--n-samples-val "$N_SAMPLES_VAL")
 [ -n "$POSITIVE_PER_BATCH" ] && gen_args+=(--positive-per-batch "$POSITIVE_PER_BATCH")
+# Realistic mode emits an ambience-only background bed; speech becomes sequential
+# lead-in filler via the sidecar written below.
+[ "$REALISTIC" = "1" ] && gen_args+=(--realistic)
 python3 scripts/generate_config.py "${gen_args[@]}" >>"$LOG" 2>&1 \
   || fail generate $? "generate_config failed"
+
+# 2b. Realistic-positive sidecar: recipe knobs + real-speech lead-in paths, read
+# by augment_realistic.py via AUG_REALISTIC_CONFIG. Written fresh each run from
+# the forwarded knobs so the app fully controls the compositing.
+SIDECAR="trainer/configs/$SLUG.realistic.yaml"
+if [ "$REALISTIC" = "1" ]; then
+  write_status "running" "generate" 0 "writing realistic sidecar"
+  bool_yaml() { [ "$1" = "1" ] && echo true || echo false; }
+  # Keep min<=max for the range knobs (augment_realistic uses randint/uniform).
+  ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -g | head -1)" = "$1" ]; }
+  ge "$LEAD_GAP_MIN_MS" "$LEAD_GAP_MAX_MS" || LEAD_GAP_MAX_MS="$LEAD_GAP_MIN_MS"
+  ge "$MARGIN_MIN_MS" "$MARGIN_MAX_MS" || MARGIN_MAX_MS="$MARGIN_MIN_MS"
+  ge "$SNR_MIN_DB" "$SNR_MAX_DB" || SNR_MAX_DB="$SNR_MIN_DB"
+  cat > "$SIDECAR" <<EOF
+# Auto-generated per run by train_job.sh from the app's realistic-augmentation
+# knobs. Loaded by trainer/patches/augment_realistic.py via AUG_REALISTIC_CONFIG.
+# token_position mirrors the training token type (start|end).
+token_position: $TOKEN_TYPE
+# Real recorded speech, used as SEQUENTIAL lead-in filler (not mixed on top).
+voice_lead_paths:
+  - $REAL_SAMPLES_DIR/$SLUG/negative
+  - ./data/real/$SLUG/negative
+lead_probability: $LEAD_PROBABILITY
+real_lead_fraction: $REAL_LEAD_FRACTION
+synthetic_lead: $(bool_yaml "$SYNTHETIC_LEAD")
+max_lead_ms: $MAX_LEAD_MS
+lead_gap_ms: [$LEAD_GAP_MIN_MS, $LEAD_GAP_MAX_MS]
+margin_ms: [$MARGIN_MIN_MS, $MARGIN_MAX_MS]
+snr_db_range: [$SNR_MIN_DB, $SNR_MAX_DB]
+background_augment: $(bool_yaml "$BACKGROUND_AUGMENT")
+voice_peak: $VOICE_PEAK
+EOF
+  export AUG_REALISTIC_CONFIG="/work/$SIDECAR"
+  echo "== realistic sidecar $SIDECAR (token=$TOKEN_TYPE snr=[$SNR_MIN_DB,$SNR_MAX_DB] lead_p=$LEAD_PROBABILITY) ==" | tee -a "$LOG"
+fi
 
 # 3. Setup: synthesize positives/negatives and fetch corpora.
 write_status "running" "setup" 0 "livekit-wakeword setup"
@@ -119,6 +177,7 @@ for f in "$SLUG.onnx" "$SLUG.pt" "${SLUG}_metrics.json" "${SLUG}_eval.json" "${S
 done
 [ -f "$CONFIG" ] && cp -p "$CONFIG" "$RUN_DIR/config.yaml"
 [ -f "$NEGATIVES_FILE" ] && cp -p "$NEGATIVES_FILE" "$RUN_DIR/negatives.txt"
+[ "$REALISTIC" = "1" ] && [ -f "$SIDECAR" ] && cp -p "$SIDECAR" "$RUN_DIR/realistic.yaml"
 
 ONNX_SHA="$(sha256 "$OUT_DIR/$SLUG.onnx")"
 PT_SHA="$(sha256 "$OUT_DIR/$SLUG.pt")"

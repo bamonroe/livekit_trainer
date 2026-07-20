@@ -1,0 +1,37 @@
+# Realistic-positive compositing knobs for the all_set model.
+# Loaded by trainer/patches/augment_realistic.py via AUG_REALISTIC_CONFIG.
+# See that module's docstring and memory: streaming-recall-gap.
+#
+# all_set is an END-token model: the wake word sits at the tail of the window,
+# preceded by (optional) filler speech and followed by a background-only margin.
+
+token_position: end
+
+# Real recorded speech used as SEQUENTIAL lead-in filler (concatenated before
+# the phrase, never mixed on top). These are the user's own ordinary-speech
+# negatives — the primary source of realistic pre-phrase context.
+voice_lead_paths:
+  - ./data/train/all_set/negative
+  - ./data/real/all_set/negative
+
+# 75% of positives get filler before the phrase; of those, 60% use the user's
+# real speech and 40% a synthesized negative clip (same TTS engine). The
+# remaining 25% are the bare phrase — still on a bed with a margin, never zeros.
+lead_probability: 0.75
+real_lead_fraction: 0.6
+synthetic_lead: true
+
+# Filler length cap and the background-only gap between filler and phrase.
+max_lead_ms: 900
+lead_gap_ms: [40, 300]
+
+# Background-only room tone after the phrase (end-token open edge).
+margin_ms: [100, 700]
+
+# Background bed level vs the voice, in dB SNR. 0 => a busy room as loud as the
+# speaker; 18 => a quiet room. One clear voice, never a second voice at 0 dB.
+snr_db_range: [0.0, 18.0]
+background_augment: true
+
+voice_peak: 0.7
+splice_fade_ms: 6

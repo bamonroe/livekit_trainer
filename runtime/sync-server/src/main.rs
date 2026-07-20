@@ -267,6 +267,8 @@ struct ScoreResponse {
     wake_word_slug: String,
     source_recording: String,
     phrase: String,
+    /// The archived run id scored, or null when the current model was used.
+    run: Option<String>,
     mode: String,
     window_ms: u64,
     step_ms: u64,
@@ -1102,6 +1104,13 @@ async fn score_recording(
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite())
         .unwrap_or(0.5);
+    // Optional archived run id: score a specific past model version instead of
+    // the mutable current model, so retraining never overwrites a run's scores.
+    let run = match params.get("run").map(String::as_str) {
+        Some(r) if is_safe_run_id(r) => Some(r.to_string()),
+        Some(_) => return Err(AppError::bad_request("unsafe run id")),
+        None => None,
+    };
 
     let scorer_url = resolve_scorer_url(&state, &headers).ok_or_else(|| {
         AppError::bad_request("scorer not configured; set SCORER_SERVER_URL or x-scorer-server-url")
@@ -1119,8 +1128,13 @@ async fn score_recording(
 
     // Fingerprint the trained model so a cached curve is reused only while the
     // model that produced it is unchanged; retraining flips the fingerprint and
-    // the next request re-scores. `nocache=1` forces a fresh run.
-    let model_fp = model_fingerprint(&state.models_root, &slug);
+    // the next request re-scores. `nocache=1` forces a fresh run. An archived run
+    // is immutable, so its id alone is a stable fingerprint and keeps each run's
+    // cached curves distinct from the current model's and from each other.
+    let model_fp = match &run {
+        Some(r) => format!("run-{r}"),
+        None => model_fingerprint(&state.models_root, &slug),
+    };
     let force = params.get("nocache").map(String::as_str) == Some("1");
 
     let cached = if force {
@@ -1142,7 +1156,7 @@ async fn score_recording(
         let wav = fs::read(&wav_path)
             .map_err(|_| AppError::bad_request(format!("no source audio for {recording_id}")))?;
 
-        let curve = run_scorer(&scorer_url, wav, &slug, mode, step_ms, keep_ms).await?;
+        let curve = run_scorer(&scorer_url, wav, &slug, run.as_deref(), mode, step_ms, keep_ms).await?;
         let conn = state.db.lock().expect("db lock poisoned");
         db::store_score_curve(
             &conn,
@@ -1170,6 +1184,7 @@ async fn score_recording(
         wake_word_slug: slug,
         source_recording: recording_id,
         phrase,
+        run,
         mode: mode.to_string(),
         window_ms: 2000,
         step_ms,
@@ -1288,6 +1303,7 @@ async fn run_scorer(
     scorer_url: &str,
     wav: Vec<u8>,
     slug: &str,
+    run: Option<&str>,
     mode: &str,
     step_ms: u64,
     keep_ms: u64,
@@ -1296,12 +1312,15 @@ async fn run_scorer(
         .file_name(format!("{slug}.wav"))
         .mime_str("audio/wav")
         .map_err(|error| AppError::internal(format!("prepare scorer upload: {error}")))?;
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("slug", slug.to_string())
         .text("mode", mode.to_string())
         .text("step_ms", step_ms.to_string())
         .text("keep_ms", keep_ms.to_string());
+    if let Some(run) = run {
+        form = form.text("run", run.to_string());
+    }
     let endpoint = format!("{}/score", scorer_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .post(endpoint)
@@ -3215,6 +3234,21 @@ struct TrainRequest {
     // "start" | "end". Selects the leading-context recipe (see
     // generate_config.py --token-type). Defaults to "end" when omitted.
     token_type: Option<String>,
+    // Realistic-positive compositing knobs (augment_realistic.py). All optional;
+    // omitted values fall back to the trainer's sidecar defaults.
+    realistic: Option<bool>,
+    lead_probability: Option<f64>,
+    real_lead_fraction: Option<f64>,
+    synthetic_lead: Option<bool>,
+    max_lead_ms: Option<u32>,
+    lead_gap_min_ms: Option<u32>,
+    lead_gap_max_ms: Option<u32>,
+    margin_min_ms: Option<u32>,
+    margin_max_ms: Option<u32>,
+    snr_min_db: Option<f64>,
+    snr_max_db: Option<f64>,
+    background_augment: Option<bool>,
+    voice_peak: Option<f64>,
 }
 
 fn training_container_name(slug: &str) -> String {
@@ -3282,6 +3316,21 @@ struct ValidatedTrain {
     positive_per_batch: Option<u32>,
     real_samples_dir: String,
     token_type: String,
+    // Realistic-positive compositing (see augment_realistic.py). Fully resolved
+    // and clamped so the trainer container can render the sidecar verbatim.
+    realistic: bool,
+    lead_probability: f64,
+    real_lead_fraction: f64,
+    synthetic_lead: bool,
+    max_lead_ms: u32,
+    lead_gap_min_ms: u32,
+    lead_gap_max_ms: u32,
+    margin_min_ms: u32,
+    margin_max_ms: u32,
+    snr_min_db: f64,
+    snr_max_db: f64,
+    background_augment: bool,
+    voice_peak: f64,
 }
 
 /// Validate + default a raw train request into a `ValidatedTrain`, rejecting bad
@@ -3310,6 +3359,36 @@ fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
             "invalid token_type (expected start|end)",
         ));
     }
+
+    // --- realistic-positive compositing knobs --------------------------------
+    // Clamp fractions to [0,1], millisecond spans to a sane window, and dB to a
+    // reasonable range; keep each range's min <= max so the trainer's randint /
+    // uniform never sees an inverted interval.
+    let clamp01 = |v: f64| v.clamp(0.0, 1.0);
+    let realistic = request.realistic.unwrap_or(true);
+    let lead_probability = clamp01(request.lead_probability.unwrap_or(0.75));
+    let real_lead_fraction = clamp01(request.real_lead_fraction.unwrap_or(0.6));
+    let voice_peak = request.voice_peak.unwrap_or(0.7).clamp(0.05, 1.0);
+    let max_lead_ms = request.max_lead_ms.unwrap_or(900).min(2000);
+    let mut lead_gap_min_ms = request.lead_gap_min_ms.unwrap_or(40).min(2000);
+    let mut lead_gap_max_ms = request.lead_gap_max_ms.unwrap_or(300).min(2000);
+    if lead_gap_min_ms > lead_gap_max_ms {
+        std::mem::swap(&mut lead_gap_min_ms, &mut lead_gap_max_ms);
+    }
+    let mut margin_min_ms = request.margin_min_ms.unwrap_or(100).min(2000);
+    let mut margin_max_ms = request.margin_max_ms.unwrap_or(700).min(2000);
+    if margin_min_ms > margin_max_ms {
+        std::mem::swap(&mut margin_min_ms, &mut margin_max_ms);
+    }
+    let mut snr_min_db = request.snr_min_db.unwrap_or(0.0).clamp(-10.0, 60.0);
+    let mut snr_max_db = request.snr_max_db.unwrap_or(18.0).clamp(-10.0, 60.0);
+    if !(snr_min_db.is_finite() && snr_max_db.is_finite()) {
+        return Err(AppError::bad_request("invalid snr range"));
+    }
+    if snr_min_db > snr_max_db {
+        std::mem::swap(&mut snr_min_db, &mut snr_max_db);
+    }
+
     Ok(ValidatedTrain {
         steps,
         model_size,
@@ -3321,6 +3400,19 @@ fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
         positive_per_batch: request.positive_per_batch,
         real_samples_dir,
         token_type,
+        realistic,
+        lead_probability,
+        real_lead_fraction,
+        synthetic_lead: request.synthetic_lead.unwrap_or(true),
+        max_lead_ms,
+        lead_gap_min_ms,
+        lead_gap_max_ms,
+        margin_min_ms,
+        margin_max_ms,
+        snr_min_db,
+        snr_max_db,
+        background_augment: request.background_augment.unwrap_or(true),
+        voice_peak,
     })
 }
 
@@ -3417,6 +3509,17 @@ async fn launch_train_container(
     }
     args.push("-v".into());
     args.push(format!("{host_repo_root}:/work"));
+    // Mount the realistic-positive augment module over the installed one (same
+    // mechanism as train_ctxfix.sh), so a training run composites positives as
+    // one clear voice on a background bed without needing a trainer-image
+    // rebuild. train_job.sh writes the sidecar this reads (AUG_REALISTIC_CONFIG).
+    if vt.realistic {
+        args.push("-v".into());
+        args.push(format!(
+            "{host_repo_root}/trainer/patches/augment_realistic.py:\
+/opt/conda/lib/python3.11/site-packages/livekit/wakeword/data/augment.py:ro"
+        ));
+    }
     push_env(&mut args, "SLUG", slug.to_string());
     push_env(&mut args, "PHRASE", phrase.to_string());
     push_env(&mut args, "STEPS", vt.steps.to_string());
@@ -3439,6 +3542,32 @@ async fn launch_train_container(
     }
     push_env(&mut args, "REAL_SAMPLES_DIR", vt.real_samples_dir.clone());
     push_env(&mut args, "TOKEN_TYPE", vt.token_type.clone());
+    // Realistic-positive compositing knobs -> train_job.sh sidecar.
+    push_env(
+        &mut args,
+        "REALISTIC",
+        if vt.realistic { "1".into() } else { "0".into() },
+    );
+    push_env(&mut args, "LEAD_PROBABILITY", vt.lead_probability.to_string());
+    push_env(&mut args, "REAL_LEAD_FRACTION", vt.real_lead_fraction.to_string());
+    push_env(
+        &mut args,
+        "SYNTHETIC_LEAD",
+        if vt.synthetic_lead { "1".into() } else { "0".into() },
+    );
+    push_env(&mut args, "MAX_LEAD_MS", vt.max_lead_ms.to_string());
+    push_env(&mut args, "LEAD_GAP_MIN_MS", vt.lead_gap_min_ms.to_string());
+    push_env(&mut args, "LEAD_GAP_MAX_MS", vt.lead_gap_max_ms.to_string());
+    push_env(&mut args, "MARGIN_MIN_MS", vt.margin_min_ms.to_string());
+    push_env(&mut args, "MARGIN_MAX_MS", vt.margin_max_ms.to_string());
+    push_env(&mut args, "SNR_MIN_DB", vt.snr_min_db.to_string());
+    push_env(&mut args, "SNR_MAX_DB", vt.snr_max_db.to_string());
+    push_env(
+        &mut args,
+        "BACKGROUND_AUGMENT",
+        if vt.background_augment { "1".into() } else { "0".into() },
+    );
+    push_env(&mut args, "VOICE_PEAK", vt.voice_peak.to_string());
     // The job stamps its own image tag into the model manifest for provenance.
     push_env(&mut args, "TRAINER_IMAGE", (*state.trainer_image).clone());
     args.push((*state.trainer_image).clone());

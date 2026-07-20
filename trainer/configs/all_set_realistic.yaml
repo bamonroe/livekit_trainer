@@ -1,0 +1,55 @@
+# all_set retrain with realistic-positive compositing.
+#
+# Successor to all_set_ctx.yaml. Where ctx merely re-mixed background across the
+# window (and overlapped real speech ON TOP of the phrase at similar level), this
+# config composites each positive as one clear voice on a background bed:
+#   optional filler speech -> gap -> WAKE WORD -> trailing room-tone margin,
+# with the bed drawn mostly from recorded ambience at a wide 0-18 dB SNR.
+#
+# The recipe knobs live in the sidecar trainer/configs/all_set.realistic.yaml,
+# loaded via AUG_REALISTIC_CONFIG. Run with trainer/scripts/train_realistic.sh,
+# which mounts trainer/patches/augment_realistic.py over the installed module.
+
+model_name: "all_set"
+target_phrases:
+  - "all set"
+
+custom_negative_phrases:
+  - "oil set"
+  - "all let"
+  - "all get"
+  - "all met"
+  - "all net"
+  - "all bet"
+  - "all yet"
+  - "all seat"
+  - "all sent"
+  - "wall set"
+  - "hall set"
+  - "paul set"
+  - "off set"
+  - "all not set"
+
+data_dir: "./data"
+output_dir: "./output"
+real_samples_dir: "./data/train"
+
+model:
+  model_type: "conv_attention"
+  model_size: "medium"
+
+augmentation:
+  # AMBIENCE ONLY for the background bed. Real *speech* is no longer listed here
+  # — it is used as sequential filler via the sidecar's voice_lead_paths, not
+  # overlapped as background. Keep this list to room tone / noise.
+  background_paths:
+    - "./data/backgrounds"
+    - "./data/real/all_set/background"
+    - "./data/train/all_set/background"
+  rir_paths:
+    - "./data/rirs"
+
+n_samples: 50000
+n_samples_val: 8000
+steps: 120000
+target_fp_per_hour: 0.2

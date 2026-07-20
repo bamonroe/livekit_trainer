@@ -1,0 +1,28 @@
+# Realistic-positive compositing knobs for the hey_buddy model.
+# Loaded by trainer/patches/augment_realistic.py via AUG_REALISTIC_CONFIG.
+#
+# hey_buddy is a START-token model: the wake word sits at the HEAD of the
+# window, preceded by a background-only margin and (optionally) followed by
+# filler speech — the mirror image of the all_set end-token layout.
+
+token_position: start
+
+voice_lead_paths:
+  - ./data/train/hey_buddy/negative
+  - ./data/real/hey_buddy/negative
+
+lead_probability: 0.75
+real_lead_fraction: 0.6
+synthetic_lead: true
+
+max_lead_ms: 900
+lead_gap_ms: [40, 300]
+
+# Background-only room tone BEFORE the phrase (start-token open edge).
+margin_ms: [100, 700]
+
+snr_db_range: [0.0, 18.0]
+background_augment: true
+
+voice_peak: 0.7
+splice_fade_ms: 6

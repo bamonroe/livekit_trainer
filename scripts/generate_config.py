@@ -111,6 +111,19 @@ def main() -> int:
     )
     parser.set_defaults(context_fix=True)
     parser.add_argument(
+        "--realistic",
+        action="store_true",
+        help=(
+            "Realistic-positive compositing mode. Emit an AMBIENCE-ONLY "
+            "augmentation.background_paths (room tone / ambient background only, "
+            "no ordinary-speech negatives in the bed). Under this mode real "
+            "speech is used as SEQUENTIAL lead-in filler via the augment_realistic "
+            "sidecar (voice_lead_paths, loaded from AUG_REALISTIC_CONFIG), not "
+            "overlapped on the phrase. Pairs with "
+            "trainer/patches/augment_realistic.py; train_job.sh writes the sidecar."
+        ),
+    )
+    parser.add_argument(
         "--params-json",
         type=Path,
         default=None,
@@ -217,12 +230,21 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     # token begins an utterance from a quiet room, so speech is withheld and only
     # ambient noise fills the lead. mix_with_background picks one at random per
     # clip.
+    realistic = getattr(args, "realistic", False)
     background_paths = None
     if args.context_fix:
         background_paths = ["./data/backgrounds"]
-        if args.token_type == "end" and real_samples_dir:
-            background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/negative")
-        background_paths.append(f"./data/real/{slug}/background")
+        if realistic:
+            # Realistic mode: the bed is AMBIENCE ONLY. Ordinary-speech negatives
+            # are used as sequential lead-in filler (voice_lead_paths in the
+            # sidecar), never mixed into the bed, so we deliberately omit them.
+            background_paths.append(f"./data/real/{slug}/background")
+            if real_samples_dir:
+                background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/background")
+        else:
+            if args.token_type == "end" and real_samples_dir:
+                background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/negative")
+            background_paths.append(f"./data/real/{slug}/background")
 
     return {
         "model_name": slug,

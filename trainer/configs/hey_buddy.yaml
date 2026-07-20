@@ -1,0 +1,27 @@
+model_name: "hey_buddy"
+target_phrases:
+  - "hey buddy"
+
+custom_negative_phrases:
+  []
+
+data_dir: "./data"
+output_dir: "./output"
+real_samples_dir: "./data/train"
+
+augmentation:
+  # Leading-context fix (start token: ambient noise only (no leading speech)): re-mix these into
+  # the full 2s window after placement so the pre-phrase region carries
+  # real sound, not zeros. Needs the augment_ctxfix patch in the image.
+  background_paths:
+    - "./data/backgrounds"
+    - "./data/real/hey_buddy/background"
+
+model:
+  model_type: "conv_attention"
+  model_size: "medium"
+
+n_samples: 20000
+n_samples_val: 4000
+steps: 50000
+target_fp_per_hour: 0.2

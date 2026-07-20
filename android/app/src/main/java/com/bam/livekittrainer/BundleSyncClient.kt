@@ -209,6 +209,9 @@ class BundleSyncClient(
     private fun JSONObject.optStringOrNull(key: String): String? =
         if (isNull(key)) null else optString(key).ifBlank { null }
 
+    private fun JSONObject.optDoubleOrNull(key: String): Double? =
+        if (has(key) && !isNull(key)) optDouble(key).takeIf { !it.isNaN() } else null
+
     private fun parseIsoMillis(value: String): Long =
         if (value.isBlank()) {
             0L
@@ -308,12 +311,14 @@ class BundleSyncClient(
         mode: String = "full",
         threshold: Double = 0.5,
         noCache: Boolean = false,
+        run: String? = null,
     ): ScoreResult {
         val endpoint = URL(
             serverUrl.trimEnd('/') +
                 "/score/${urlPart(wakeWordSlug)}/${urlPart(sourceRecording)}" +
                 "?mode=${urlPart(mode)}&threshold=$threshold" +
-                if (noCache) "&nocache=1" else "",
+                (if (noCache) "&nocache=1" else "") +
+                (if (run != null) "&run=${urlPart(run)}" else ""),
         )
         val connection = endpoint.openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
@@ -327,6 +332,7 @@ class BundleSyncClient(
         return ScoreResult(
             sourceRecording = root.optString("source_recording", sourceRecording),
             phrase = root.optString("phrase"),
+            run = root.optStringOrNull("run"),
             mode = root.optString("mode", mode),
             threshold = root.optDouble("threshold", threshold),
             durationMs = root.optDouble("duration_ms", 0.0),
@@ -357,6 +363,44 @@ class BundleSyncClient(
             falseNegatives = root.optInt("false_negatives", 0),
             falsePositives = root.optInt("false_positives", 0),
         )
+    }
+
+    /**
+     * Every archived trained model version for a wake word, newest first, from
+     * the server's `/models/runs` provenance ledger. Each carries its own eval
+     * scores so the Test page can pick a specific past model to score against
+     * instead of only the current one. The endpoint returns runs across all wake
+     * words; this filters to the given slug.
+     */
+    fun loadModelRuns(wakeWordSlug: String): List<ModelRun> {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/models/runs")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val response = readResponse(connection, "Model runs failed")
+        val runs = JSONObject(response).optJSONArray("runs") ?: return emptyList()
+        return buildList {
+            for (index in 0 until runs.length()) {
+                val item = runs.getJSONObject(index)
+                if (item.optString("slug") != wakeWordSlug) continue
+                val runId = item.optStringOrNull("run_id") ?: continue
+                val eval = item.optJSONObject("eval")
+                add(
+                    ModelRun(
+                        slug = wakeWordSlug,
+                        runId = runId,
+                        isCurrent = item.optInt("is_current", 0) == 1,
+                        finishedAt = item.optStringOrNull("finished_at"),
+                        steps = if (item.isNull("steps")) null else item.optInt("steps"),
+                        personal = item.optBoolean("personal", false),
+                        contextFix = if (item.isNull("context_fix")) null else item.optBoolean("context_fix"),
+                        recall = eval?.optDoubleOrNull("recall"),
+                        fpph = eval?.optDoubleOrNull("fpph"),
+                    ),
+                )
+            }
+        }
     }
 
     /** Streaming URL for a stored bulk take's full source audio. */

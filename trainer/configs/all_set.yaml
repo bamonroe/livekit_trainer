@@ -1,3 +1,6 @@
+# personal preset: real recorded positives weighted against a reduced
+# synthetic pool. Pair with assemble_training_data.py --positive-boost.
+
 model_name: "all_set"
 target_phrases:
   - "all set"
@@ -22,11 +25,26 @@ data_dir: "./data"
 output_dir: "./output"
 real_samples_dir: "./data/train"
 
+batch_n_per_class:
+  positive: 100
+  adversarial_negative: 50
+  ACAV100M_sample: 1024
+  background_noise: 50
+
+augmentation:
+  # Leading-context fix (end token: noise + prior speech): re-mix these into
+  # the full 2s window after placement so the pre-phrase region carries
+  # real sound, not zeros. Needs the augment_ctxfix patch in the image.
+  background_paths:
+    - "./data/backgrounds"
+    - "./data/train/all_set/negative"
+    - "./data/real/all_set/background"
+
 model:
   model_type: "conv_attention"
-  model_size: "medium"
+  model_size: "small"
 
-n_samples: 20000
-n_samples_val: 4000
+n_samples: 3000
+n_samples_val: 600
 steps: 50000
 target_fp_per_hour: 0.2

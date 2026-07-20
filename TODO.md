@@ -7,6 +7,32 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [~] Realistic-positive compositing (successor to the context-fix re-mix).
+  `patches/augment_ctxfix.py` only re-mixed background across the window and
+  *overlapped* real speech ON TOP of the synthetic phrase at similar level — two
+  voices at once, not how a trigger actually hits a mic. New
+  `patches/augment_realistic.py` composites each positive as **one clear voice on
+  a background bed**: optional filler (the user's own recorded speech, or a
+  synthesized negative clip — concatenated in *sequence*, not mixed) → a
+  background-only gap → the wake word → a background-only room-tone margin on the
+  token's open edge (trailing for end-token, leading for start-token). One
+  continuous bed spans the window at a **wide 0–18 dB SNR** (quiet room up to a
+  busy room as loud as the voice, but never a second voice at 0 dB); the bed is
+  pre-augmented (EQ + RIR) for room diversity and drawn mostly from recorded
+  ambience. Knobs live in a sidecar YAML (`configs/*.realistic.yaml`) loaded via
+  `AUG_REALISTIC_CONFIG`; run with `scripts/train_realistic.sh <config> [sidecar]`
+  (mounts the patch over the installed module, same as ctxfix). New files:
+  `patches/augment_realistic.py`, `configs/all_set_realistic.yaml`,
+  `configs/all_set.realistic.yaml`, `configs/hey_buddy.realistic.yaml`,
+  `scripts/train_realistic.sh`. Geometry unit-tested (end/start placement,
+  filler+gap, 0 dB no-clip, overlong-voice tail preserved); in-container smoke on
+  real files in progress. **Next: full `all_set` train via `train_realistic.sh`,
+  then verify continuous/full-mode recall with `/score` (the real test — see
+  [streaming-recall-gap]). Known gap: synthetic filler currently draws from the
+  near-miss negative pool, not ordinary-word TTS; real-speech filler covers
+  ordinary words. If this beats ctxfix, bake into `Dockerfile.trainer` +
+  `generate_config.py` and retire `augment_ctxfix.py`.**
+
 - [x] Training queue + cancel + no-recording training. Three fixes shipped
   together: (1) the sync-server now backs training with a `train_queue` DB table
   and a background scheduler (`dispatch_training`/`training_scheduler`) that runs

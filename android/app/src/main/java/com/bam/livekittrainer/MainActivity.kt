@@ -117,6 +117,14 @@ class MainActivity : Activity() {
     // Scoring mode: "full" = continuous rolling window (honest streaming test),
     // "reset" = silence-padded per step (matches isolated-clip training).
     private var scoreMode: String = "full"
+    // Which trained model version to score against. null = the current exported
+    // model (server default); otherwise a specific archived run id. Every run is
+    // kept with its own scores, so past models can be picked and compared instead
+    // of being shadowed by the latest retrain.
+    private var scoreRun: String? = null
+    private var modelRuns: List<ModelRun> = emptyList()
+    private var modelRunsSlug: String? = null
+    private var loadingModelRuns: Boolean = false
     private var scoreCurveView: ScoreCurveView? = null
     private var scoreCountsText: TextView? = null
     // Test-page take-list collapse state. Test takes are the ones you usually
@@ -465,6 +473,7 @@ class MainActivity : Activity() {
             return
         }
         ensureServerRecordings(project)
+        ensureModelRuns(project)
         workspace.addView(testRecorderCard(project))
         // The score card sits directly under the recorder, above the take list,
         // so tapping Score on a take doesn't leave the result buried far below a
@@ -704,6 +713,7 @@ class MainActivity : Activity() {
                     mutedColor(),
                 ).withTop(dp(4)),
             )
+            addModelPicker(project)
             when {
                 loadingServerRecordings && recordings.isEmpty() ->
                     addView(text("Loading recordings…", 14f, mutedColor()).withTop(dp(12)))
@@ -731,6 +741,96 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    /**
+     * Model-version picker. Scores the take against a specific archived training
+     * run — each kept with its own eval scores — instead of only the current
+     * exported model, so a retrain never overwrites the model you were comparing.
+     * "Current model" (run = null) is whatever the server currently has deployed.
+     */
+    private fun LinearLayout.addModelPicker(project: WakeWordProject) {
+        addView(
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(12), dp(4), dp(4))
+                addView(
+                    text("Model version", 15f, textColor(), Typeface.BOLD).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    },
+                )
+                addView(
+                    actionButton(if (loadingModelRuns) "Loading…" else "Refresh", ButtonStyle.Secondary) {
+                        reloadModelRuns(project)
+                    }.apply { isEnabled = !loadingModelRuns },
+                )
+            },
+        )
+        addView(modelRunRow(project, run = null, selected = scoreRun == null).withTop(dp(8)))
+        val runs = if (modelRunsSlug == project.slug) modelRuns else emptyList()
+        if (runs.isEmpty() && !loadingModelRuns) {
+            addView(
+                text("No archived runs yet — train a model to build version history.", 13f, mutedColor())
+                    .withTop(dp(6)),
+            )
+        }
+        runs.forEach { run ->
+            addView(modelRunRow(project, run = run, selected = scoreRun == run.runId).withTop(dp(8)))
+        }
+    }
+
+    /** One selectable model-version row: null [run] is the current model. */
+    private fun modelRunRow(project: WakeWordProject, run: ModelRun?, selected: Boolean): View {
+        val title: String
+        val subtitle: String
+        if (run == null) {
+            title = "Current model"
+            subtitle = "The model the server currently has deployed"
+        } else {
+            val tags = buildList {
+                if (run.isCurrent) add("current")
+                if (run.personal) add("personal")
+                if (run.contextFix == true) add("ctx-fix")
+            }
+            title = formatRunId(run.runId) + if (tags.isEmpty()) "" else "  · ${tags.joinToString(" · ")}"
+            subtitle = modelRunLabel(run)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = rounded(if (selected) navActiveColor() else promptColor(), dp(12), strokeColor())
+            setOnClickListener { selectScoreRun(project, run?.runId) }
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    addView(text(title, 15f, if (selected) ACCENT else textColor(), Typeface.BOLD))
+                    addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
+                },
+            )
+            if (selected) addView(text("✓", 18f, ACCENT, Typeface.BOLD))
+        }
+    }
+
+    /** Pick a model version and re-score the selected take against it immediately. */
+    private fun selectScoreRun(project: WakeWordProject, runId: String?) {
+        if (scoreRun == runId) return
+        scoreRun = runId
+        val recordingId = scoreRecordingId
+        if (recordingId != null && scoreProjectSlug == project.slug && !loadingScore) {
+            loadScore(project, recordingId)
+        } else {
+            render()
+        }
+    }
+
+    /** `20260720T121718Z` -> `2026-07-20 12:17`; leaves unrecognized ids as-is. */
+    private fun formatRunId(runId: String): String {
+        val match = Regex("(\\d{4})(\\d{2})(\\d{2})T(\\d{2})(\\d{2})").find(runId) ?: return runId
+        val (y, mo, d, h, mi) = match.destructured
+        return "$y-$mo-$d $h:$mi"
     }
 
     /**
@@ -892,9 +992,10 @@ class MainActivity : Activity() {
 
             addView(text("Score  ${result.sourceRecording.takeLast(8)}", 20f, textColor(), Typeface.BOLD))
             val modeName = if (result.mode == "reset") "padded" else "continuous"
+            val modelName = result.run?.let { "model ${formatRunId(it)}" } ?: "current model"
             addView(
                 text(
-                    "“${result.phrase}” · $modeName mode · ${"%.1f".format(result.durationMs / 1000.0)}s",
+                    "“${result.phrase}” · $modelName · $modeName mode · ${"%.1f".format(result.durationMs / 1000.0)}s",
                     13f,
                     mutedColor(),
                 ).withTop(dp(2)),
@@ -1081,7 +1182,7 @@ class MainActivity : Activity() {
         Thread {
             try {
                 val result = BundleSyncClient(serverUrl)
-                    .loadScore(project.slug, recordingId, mode, scoreThreshold, noCache = forceFresh)
+                    .loadScore(project.slug, recordingId, mode, scoreThreshold, noCache = forceFresh, run = scoreRun)
                 runOnUiThread {
                     scoreProjectSlug = project.slug
                     scoreResult = result
@@ -1231,6 +1332,33 @@ class MainActivity : Activity() {
             setText(savedTrainPositiveBoost().toString())
             styleInput()
         }
+
+        // --- Realistic-augmentation numeric inputs ---------------------------
+        // A small factory keeps the dozen compositing knobs consistent. Whole =
+        // integer millisecond fields; decimal = 0..1 fractions / dB.
+        fun numInput(hintText: String, value: String, decimal: Boolean) = EditText(this).apply {
+            hint = hintText
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER or
+                (if (decimal) InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED else 0)
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(value)
+            styleInput()
+        }
+        val r = savedRealistic()
+        val leadProbInput = numInput("Filler chance 0-1", formatFp(r.leadProbability), true)
+        val realFracInput = numInput("Your-voice fraction 0-1", formatFp(r.realLeadFraction), true)
+        val maxLeadInput = numInput("Max filler ms", r.maxLeadMs.toString(), false)
+        val gapMinInput = numInput("Gap min ms", r.leadGapMinMs.toString(), false)
+        val gapMaxInput = numInput("Gap max ms", r.leadGapMaxMs.toString(), false)
+        val marginMinInput = numInput("Margin min ms", r.marginMinMs.toString(), false)
+        val marginMaxInput = numInput("Margin max ms", r.marginMaxMs.toString(), false)
+        val snrMinInput = numInput("Noise dB min", formatFp(r.snrMinDb), true)
+        val snrMaxInput = numInput("Noise dB max", formatFp(r.snrMaxDb), true)
+        val voicePeakInput = numInput("Voice level 0-1", formatFp(r.voicePeak), true)
+
         // Persist the free-text numbers so a re-render (from a toggle below or the
         // status poller) restores them instead of resetting to the saved value.
         fun commitNumbers() {
@@ -1238,6 +1366,18 @@ class MainActivity : Activity() {
                 stepsInput.text.toString().trim().toIntOrNull(),
                 targetFpInput.text.toString().trim().toFloatOrNull(),
                 boostInput.text.toString().trim().toIntOrNull(),
+            )
+            saveRealisticNumbers(
+                leadProbability = leadProbInput.text.toString().trim().toFloatOrNull(),
+                realLeadFraction = realFracInput.text.toString().trim().toFloatOrNull(),
+                maxLeadMs = maxLeadInput.text.toString().trim().toIntOrNull(),
+                leadGapMinMs = gapMinInput.text.toString().trim().toIntOrNull(),
+                leadGapMaxMs = gapMaxInput.text.toString().trim().toIntOrNull(),
+                marginMinMs = marginMinInput.text.toString().trim().toIntOrNull(),
+                marginMaxMs = marginMaxInput.text.toString().trim().toIntOrNull(),
+                snrMinDb = snrMinInput.text.toString().trim().toFloatOrNull(),
+                snrMaxDb = snrMaxInput.text.toString().trim().toFloatOrNull(),
+                voicePeak = voicePeakInput.text.toString().trim().toFloatOrNull(),
             )
         }
 
@@ -1337,6 +1477,96 @@ class MainActivity : Activity() {
 
             addView(text("Positive boost", 15f, mutedColor()).withTop(dp(14)))
             addView(boostInput.withTop(dp(6)))
+
+            // --- Realistic augmentation -------------------------------------
+            addView(text("Realistic augmentation", 16f, textColor(), Typeface.BOLD).withTop(dp(20)))
+            addView(
+                text(
+                    if (r.realistic) {
+                        "On: each positive is one clear voice on a background bed — optional filler speech, a gap, the wake word, then room tone — instead of your voice layered on the synthetic phrase."
+                    } else {
+                        "Off: legacy augmentation (background re-mixed across the window)."
+                    },
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton("Off", if (!r.realistic) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            commitNumbers(); setRealisticBool(KEY_TRAIN_REALISTIC, false)
+                        }.weight1(),
+                    )
+                    addView(
+                        actionButton("On", if (r.realistic) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                            commitNumbers(); setRealisticBool(KEY_TRAIN_REALISTIC, true)
+                        }.weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(8)),
+            )
+
+            if (r.realistic) {
+                fun rowLabel(label: String, help: String) {
+                    addView(text(label, 15f, mutedColor()).withTop(dp(14)))
+                    addView(text(help, 11f, mutedColor()).withTop(dp(2)))
+                }
+                fun pair(a: EditText, b: EditText) = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(a.weight1())
+                    addView(b.weight1().withLeft(dp(8)))
+                }.withTop(dp(6))
+
+                rowLabel("Filler & your voice", "Chance a positive gets filler speech before the word, and how much of that is your own recorded voice vs synthetic.")
+                addView(pair(leadProbInput, realFracInput))
+
+                rowLabel("Noise level (dB SNR)", "Background bed loudness range under the voice. 0 = as loud as you speak; higher = quieter room.")
+                addView(pair(snrMinInput, snrMaxInput))
+
+                rowLabel("Room-tone margin (ms)", "Background-only stretch on the open edge (after an end-token word, before a start-token word).")
+                addView(pair(marginMinInput, marginMaxInput))
+
+                rowLabel("Filler gap (ms)", "Silent-ish background gap between the filler speech and the wake word.")
+                addView(pair(gapMinInput, gapMaxInput))
+
+                rowLabel("Max filler & voice level", "Longest filler clip (ms) and the peak the composited voice is normalized to (0-1).")
+                addView(pair(maxLeadInput, voicePeakInput))
+
+                addView(text("Synthetic filler", 15f, mutedColor()).withTop(dp(14)))
+                addView(
+                    LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        addView(
+                            actionButton("Off", if (!r.syntheticLead) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                                commitNumbers(); setRealisticBool(KEY_TRAIN_SYNTH_LEAD, false)
+                            }.weight1(),
+                        )
+                        addView(
+                            actionButton("On", if (r.syntheticLead) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                                commitNumbers(); setRealisticBool(KEY_TRAIN_SYNTH_LEAD, true)
+                            }.weight1().withLeft(dp(8)),
+                        )
+                    }.withTop(dp(6)),
+                )
+
+                addView(text("Vary the background bed (EQ + reverb)", 15f, mutedColor()).withTop(dp(14)))
+                addView(
+                    LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        addView(
+                            actionButton("Off", if (!r.backgroundAugment) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                                commitNumbers(); setRealisticBool(KEY_TRAIN_BG_AUGMENT, false)
+                            }.weight1(),
+                        )
+                        addView(
+                            actionButton("On", if (r.backgroundAugment) ButtonStyle.Primary else ButtonStyle.Secondary) {
+                                commitNumbers(); setRealisticBool(KEY_TRAIN_BG_AUGMENT, true)
+                            }.weight1().withLeft(dp(8)),
+                        )
+                    }.withTop(dp(6)),
+                )
+            }
 
             addView(
                 actionButton("Start / queue training", ButtonStyle.Primary) {
@@ -1715,8 +1945,9 @@ class MainActivity : Activity() {
         val personal = savedTrainPersonal()
         val boost = savedTrainPositiveBoost()
         val tokenType = savedTrainTokenType(project.slug)
+        val r = savedRealistic()
         return """
-            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"token_type":"$tokenType"}
+            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"token_type":"$tokenType","realistic":${r.realistic},"lead_probability":${r.leadProbability},"real_lead_fraction":${r.realLeadFraction},"synthetic_lead":${r.syntheticLead},"max_lead_ms":${r.maxLeadMs},"lead_gap_min_ms":${r.leadGapMinMs},"lead_gap_max_ms":${r.leadGapMaxMs},"margin_min_ms":${r.marginMinMs},"margin_max_ms":${r.marginMaxMs},"snr_min_db":${r.snrMinDb},"snr_max_db":${r.snrMaxDb},"background_augment":${r.backgroundAugment},"voice_peak":${r.voicePeak}}
         """.trimIndent()
     }
 
@@ -1788,6 +2019,77 @@ class MainActivity : Activity() {
     private fun setTrainTokenType(slug: String, value: String) {
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .edit().putString(trainTokenTypeKey(slug), value).apply()
+        render()
+    }
+
+    /** Resolved realistic-positive compositing knobs (augment_realistic.py). */
+    private data class RealisticSettings(
+        val realistic: Boolean,
+        val leadProbability: Float,
+        val realLeadFraction: Float,
+        val syntheticLead: Boolean,
+        val maxLeadMs: Int,
+        val leadGapMinMs: Int,
+        val leadGapMaxMs: Int,
+        val marginMinMs: Int,
+        val marginMaxMs: Int,
+        val snrMinDb: Float,
+        val snrMaxDb: Float,
+        val backgroundAugment: Boolean,
+        val voicePeak: Float,
+    )
+
+    // Realistic-augmentation knobs are global training defaults (like model size
+    // and boost), not per-wake-word. Defaults mirror the sync-server / train_job
+    // sidecar defaults so an untouched form reproduces the server's own recipe.
+    private fun savedRealistic(): RealisticSettings {
+        val p = getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+        return RealisticSettings(
+            realistic = p.getBoolean(KEY_TRAIN_REALISTIC, true),
+            leadProbability = p.getFloat(KEY_TRAIN_LEAD_PROB, 0.75f).coerceIn(0f, 1f),
+            realLeadFraction = p.getFloat(KEY_TRAIN_REAL_LEAD_FRAC, 0.6f).coerceIn(0f, 1f),
+            syntheticLead = p.getBoolean(KEY_TRAIN_SYNTH_LEAD, true),
+            maxLeadMs = p.getInt(KEY_TRAIN_MAX_LEAD_MS, 900).coerceIn(0, 2000),
+            leadGapMinMs = p.getInt(KEY_TRAIN_LEAD_GAP_MIN, 40).coerceIn(0, 2000),
+            leadGapMaxMs = p.getInt(KEY_TRAIN_LEAD_GAP_MAX, 300).coerceIn(0, 2000),
+            marginMinMs = p.getInt(KEY_TRAIN_MARGIN_MIN, 100).coerceIn(0, 2000),
+            marginMaxMs = p.getInt(KEY_TRAIN_MARGIN_MAX, 700).coerceIn(0, 2000),
+            snrMinDb = p.getFloat(KEY_TRAIN_SNR_MIN, 0f).coerceIn(-10f, 60f),
+            snrMaxDb = p.getFloat(KEY_TRAIN_SNR_MAX, 18f).coerceIn(-10f, 60f),
+            backgroundAugment = p.getBoolean(KEY_TRAIN_BG_AUGMENT, true),
+            voicePeak = p.getFloat(KEY_TRAIN_VOICE_PEAK, 0.7f).coerceIn(0.05f, 1f),
+        )
+    }
+
+    private fun saveRealisticNumbers(
+        leadProbability: Float?,
+        realLeadFraction: Float?,
+        maxLeadMs: Int?,
+        leadGapMinMs: Int?,
+        leadGapMaxMs: Int?,
+        marginMinMs: Int?,
+        marginMaxMs: Int?,
+        snrMinDb: Float?,
+        snrMaxDb: Float?,
+        voicePeak: Float?,
+    ) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE).edit().apply {
+            if (leadProbability != null) putFloat(KEY_TRAIN_LEAD_PROB, leadProbability.coerceIn(0f, 1f))
+            if (realLeadFraction != null) putFloat(KEY_TRAIN_REAL_LEAD_FRAC, realLeadFraction.coerceIn(0f, 1f))
+            if (maxLeadMs != null) putInt(KEY_TRAIN_MAX_LEAD_MS, maxLeadMs.coerceIn(0, 2000))
+            if (leadGapMinMs != null) putInt(KEY_TRAIN_LEAD_GAP_MIN, leadGapMinMs.coerceIn(0, 2000))
+            if (leadGapMaxMs != null) putInt(KEY_TRAIN_LEAD_GAP_MAX, leadGapMaxMs.coerceIn(0, 2000))
+            if (marginMinMs != null) putInt(KEY_TRAIN_MARGIN_MIN, marginMinMs.coerceIn(0, 2000))
+            if (marginMaxMs != null) putInt(KEY_TRAIN_MARGIN_MAX, marginMaxMs.coerceIn(0, 2000))
+            if (snrMinDb != null) putFloat(KEY_TRAIN_SNR_MIN, snrMinDb.coerceIn(-10f, 60f))
+            if (snrMaxDb != null) putFloat(KEY_TRAIN_SNR_MAX, snrMaxDb.coerceIn(-10f, 60f))
+            if (voicePeak != null) putFloat(KEY_TRAIN_VOICE_PEAK, voicePeak.coerceIn(0.05f, 1f))
+        }.apply()
+    }
+
+    private fun setRealisticBool(key: String, value: Boolean) {
+        getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .edit().putBoolean(key, value).apply()
         render()
     }
 
@@ -2708,6 +3010,50 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
+    }
+
+    /** Load the trained model versions for a project once, lazily, for the picker. */
+    private fun ensureModelRuns(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        if (loadingModelRuns || modelRunsSlug == project.slug) return
+        reloadModelRuns(project)
+    }
+
+    private fun reloadModelRuns(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank() || loadingModelRuns) return
+        loadingModelRuns = true
+        Thread {
+            try {
+                val runs = BundleSyncClient(serverUrl).loadModelRuns(project.slug)
+                runOnUiThread {
+                    modelRunsSlug = project.slug
+                    modelRuns = runs
+                    loadingModelRuns = false
+                    // Drop a stale selection if that run no longer exists.
+                    if (scoreRun != null && runs.none { it.runId == scoreRun }) {
+                        scoreRun = null
+                    }
+                    render()
+                }
+            } catch (_: Exception) {
+                runOnUiThread {
+                    loadingModelRuns = false
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    /** Compact label for a model run: eval recall/false-positive rate + date. */
+    private fun modelRunLabel(run: ModelRun): String = buildString {
+        run.recall?.let { append("recall ${"%.0f".format(it * 100)}%") }
+        run.fpph?.let {
+            if (isNotEmpty()) append(" · ")
+            append("FP/h ${"%.2f".format(it)}")
+        }
+        if (isEmpty()) append("run ${run.runId.takeLast(8)}")
     }
 
     private fun syncAlignmentMessage(response: String): String {
@@ -3733,6 +4079,19 @@ class MainActivity : Activity() {
         const val KEY_TRAIN_PERSONAL = "train_personal"
         const val KEY_TRAIN_POSITIVE_BOOST = "train_positive_boost"
         const val KEY_TRAIN_TOKEN_TYPE = "train_token_type"
+        const val KEY_TRAIN_REALISTIC = "train_realistic"
+        const val KEY_TRAIN_LEAD_PROB = "train_lead_prob"
+        const val KEY_TRAIN_REAL_LEAD_FRAC = "train_real_lead_frac"
+        const val KEY_TRAIN_SYNTH_LEAD = "train_synth_lead"
+        const val KEY_TRAIN_MAX_LEAD_MS = "train_max_lead_ms"
+        const val KEY_TRAIN_LEAD_GAP_MIN = "train_lead_gap_min"
+        const val KEY_TRAIN_LEAD_GAP_MAX = "train_lead_gap_max"
+        const val KEY_TRAIN_MARGIN_MIN = "train_margin_min"
+        const val KEY_TRAIN_MARGIN_MAX = "train_margin_max"
+        const val KEY_TRAIN_SNR_MIN = "train_snr_min"
+        const val KEY_TRAIN_SNR_MAX = "train_snr_max"
+        const val KEY_TRAIN_BG_AUGMENT = "train_bg_augment"
+        const val KEY_TRAIN_VOICE_PEAK = "train_voice_peak"
         const val KEY_DARK_MODE = "dark_mode"
         const val KEY_APPEARANCE = "appearance_mode"
         const val APPEARANCE_SYSTEM = "system"
