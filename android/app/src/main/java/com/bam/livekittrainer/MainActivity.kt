@@ -63,6 +63,11 @@ class MainActivity : Activity() {
     private var selectedProjectId: String? = null
     private var selectedBulkRecordingId: String? = null
     private var activeProject: WakeWordProject? = null
+    // Which speech-take kind the shared recorder is currently capturing
+    // (positive/negative/hard_negative), or null when it is idle or capturing a
+    // background/test take. Lets the four Record-page buttons show independent
+    // state and route the saved take to the right slicing kind.
+    private var activeTakeKind: String? = null
     // True while the shared recorder is capturing a background-noise take rather
     // than a bulk script, so the two record buttons show independent state.
     private var backgroundRecordingActive: Boolean = false
@@ -402,8 +407,12 @@ class MainActivity : Activity() {
             return
         }
         val bulkRecordings = store.loadBulkRecordings(project.id)
-        workspace.addView(bulkScriptCard(project, bulkRecordings))
         val backgroundRecordings = store.loadBackgroundRecordings(project.id)
+        // Four straight recorders, each a plain record-and-stop take of one kind.
+        // Only hard negatives carry a prompt (the near-miss phrases to read).
+        workspace.addView(tokenRecordCard(project, bulkRecordings))
+        workspace.addView(negativeRecordCard(project, bulkRecordings).withTop(dp(12)))
+        workspace.addView(hardNegativeRecordCard(project, bulkRecordings).withTop(dp(12)))
         workspace.addView(backgroundNoiseCard(project, backgroundRecordings).withTop(dp(12)))
         maybeStatus()
     }
@@ -422,14 +431,31 @@ class MainActivity : Activity() {
         val serverForSlug =
             if (serverRecordingsSlug == project.slug) serverRecordings else emptyList()
         workspace.addView(syncCard(project, bulkRecordings))
-        workspace.addView(
-            recordingsCard(
-                project,
-                bulkRecordings,
-                // Test takes are managed on the Test page, not the training pool.
-                serverForSlug.filter { !it.isBackground && !it.isTest },
-            ).withTop(dp(12)),
+        // Test takes are managed on the Test page, not the training pool.
+        val speechServer = serverForSlug.filter { !it.isBackground && !it.isTest }
+        // One card per recording kind so each straight recorder has its own
+        // review section. A legacy/mixed take falls into the "Other" bucket.
+        val sections = listOf(
+            BulkRecording.KIND_POSITIVE to "Wake word takes",
+            BulkRecording.KIND_NEGATIVE to "Negative takes",
+            BulkRecording.KIND_HARD_NEGATIVE to "Hard negative takes",
+            "other" to "Other takes",
         )
+        var anySpeech = false
+        for ((bucket, title) in sections) {
+            val serverBucket = speechServer.filter { reviewKindBucket(it.kind) == bucket }
+            val localBucket = bulkRecordings.filter { reviewKindBucket(it.kind) == bucket }
+            if (serverBucket.isEmpty() && localBucket.isEmpty()) continue
+            anySpeech = true
+            workspace.addView(
+                recordingsCard(project, title, localBucket, serverBucket).withTop(dp(12)),
+            )
+        }
+        if (!anySpeech) {
+            workspace.addView(
+                recordingsCard(project, "Wake word takes", emptyList(), emptyList()).withTop(dp(12)),
+            )
+        }
         val serverBackground = serverForSlug.filter { it.isBackground }
         if (backgroundRecordings.isNotEmpty() || serverBackground.isNotEmpty()) {
             workspace.addView(
@@ -488,18 +514,6 @@ class MainActivity : Activity() {
     }
 
     private fun testRecorderCard(project: WakeWordProject): View {
-        val wakePlacements = savedBulkWakePlacements()
-        val scriptContent = PromptGenerator.bulkScriptContent(
-            project,
-            lexicon,
-            store.promptBatch(project.id),
-            // Offset the batch seed so the test script differs from the training
-            // script even at the same shuffle revision.
-            testScriptRevision + 7919,
-            wakePlacements,
-            style = savedScriptStyle(),
-        )
-        val script = scriptContent.text
         val recordingThisProject =
             recorder.isRecording && testRecordingActive && activeProject?.id == project.id
         val localTests = store.loadTestRecordings(project.id)
@@ -510,36 +524,22 @@ class MainActivity : Activity() {
         }
         val pending = localTests.count { it.id !in serverIds }
         return card().apply {
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    addView(
-                        text("Record a test take", 20f, textColor(), Typeface.BOLD).apply {
-                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                        },
-                    )
-                    addView(actionButton("Shuffle", ButtonStyle.Secondary) {
-                        testScriptRevision += 1
-                        statusMessage = "Generated a new test script"
-                        render()
-                    }.apply { isEnabled = !recordingThisProject })
-                },
-            )
+            addView(text("Record a test take", 20f, textColor(), Typeface.BOLD))
             addView(
                 text(
-                    "Read this in one take, then upload it to score the model. Test takes are transcribed for scoring only — never sliced into training data.",
+                    "Say whatever you want to try against the model — the wake word, near-misses, " +
+                        "ordinary speech, in any mix. Then upload it to score the model. Test takes " +
+                        "are transcribed for scoring only — never sliced into training data.",
                     13f,
                     mutedColor(),
                 ).withTop(dp(4)),
             )
-            addView(bulkScriptText(scriptContent, project.phrase).withTop(dp(12)))
             addView(
                 actionButton(
                     if (recordingThisProject) "◼  Stop recording" else "●  Record test take",
                     if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Primary,
                 ) {
-                    toggleTestRecording(project, script)
+                    toggleTestRecording(project, "")
                 }.tall().withTop(dp(14)),
             )
             if (pending > 0 && !recordingThisProject) {
@@ -574,6 +574,7 @@ class MainActivity : Activity() {
                         projectSlug = project.slug,
                         filePath = result.output.absolutePath,
                         script = result.prompt.instruction,
+                        kind = BulkRecording.KIND_TEST,
                         recordedAtMillis = result.recordedAtMillis,
                         durationMs = result.durationMs,
                         sampleRateHz = result.sampleRateHz,
@@ -2289,8 +2290,17 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Which Review section a take kind belongs to. */
+    private fun reviewKindBucket(kind: String): String = when (kind) {
+        BulkRecording.KIND_POSITIVE -> BulkRecording.KIND_POSITIVE
+        BulkRecording.KIND_NEGATIVE -> BulkRecording.KIND_NEGATIVE
+        BulkRecording.KIND_HARD_NEGATIVE -> BulkRecording.KIND_HARD_NEGATIVE
+        else -> "other"
+    }
+
     private fun recordingsCard(
         project: WakeWordProject,
+        title: String,
         localBulk: List<BulkRecording>,
         serverBulk: List<ServerRecording>,
     ): View {
@@ -2300,12 +2310,12 @@ class MainActivity : Activity() {
         val pending = localBulk.filter { it.id !in serverIds }
         val total = serverBulk.size + pending.size
         return card().apply {
-            addView(text("Bulk recordings  $total", 18f, textColor(), Typeface.BOLD))
+            addView(text("$title  $total", 18f, textColor(), Typeface.BOLD))
             if (total == 0) {
                 val message = if (loadingServerRecordings) {
                     "Loading recordings from the server…"
                 } else {
-                    "No bulk recordings yet. Record one on the Record tab."
+                    "No recordings yet. Record one on the Record tab."
                 }
                 addView(text(message, 14f, mutedColor()).withTop(dp(8)))
             } else {
@@ -2346,11 +2356,7 @@ class MainActivity : Activity() {
             addView(text(formatRecordedAt(recording.recordedAtMillis), 12f, mutedColor()).withTop(dp(2)))
             addView(text(deviceAttribution(recording), 12f, mutedColor()).withTop(dp(2)))
             addView(
-                text(
-                    "${recording.positiveCount} positive · ${recording.negativeCount} negative",
-                    12f,
-                    mutedColor(),
-                ).withTop(dp(2)),
+                text(sliceTally(recording), 12f, mutedColor()).withTop(dp(2)),
             )
             addView(
                 LinearLayout(this@MainActivity).apply {
@@ -2364,6 +2370,15 @@ class MainActivity : Activity() {
                 }.withTop(dp(8)),
             )
         }
+    }
+
+    /** Slice counts phrased for the take's kind (hard negatives read as such). */
+    private fun sliceTally(recording: ServerRecording): String = when (recording.kind) {
+        BulkRecording.KIND_POSITIVE -> "${recording.positiveCount} positive"
+        BulkRecording.KIND_NEGATIVE -> "${recording.negativeCount} negative"
+        // Hard negatives are filed under the negative category server-side.
+        BulkRecording.KIND_HARD_NEGATIVE -> "${recording.negativeCount} hard negative"
+        else -> "${recording.positiveCount} positive · ${recording.negativeCount} negative"
     }
 
     /** "This phone" for takes from this device, else the capturing device name. */
@@ -2434,19 +2449,85 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun bulkScriptCard(project: WakeWordProject, bulkRecordings: List<BulkRecording>): View {
-        val wakePlacements = savedBulkWakePlacements()
-        val scriptContent = PromptGenerator.bulkScriptContent(
+    /** A plain record-and-stop card for one speech-take kind, with no prompt. */
+    private fun speechRecordCard(
+        project: WakeWordProject,
+        kind: String,
+        title: String,
+        description: String,
+        buttonIdle: String,
+        buttonStyle: ButtonStyle,
+        takes: List<BulkRecording>,
+        script: String,
+    ): View {
+        val mine = takes.filter { it.kind == kind }
+        val totalSeconds = mine.sumOf { it.durationMs } / 1000
+        val recordingThisKind =
+            recorder.isRecording && activeTakeKind == kind && activeProject?.id == project.id
+        return card().apply {
+            addView(text(title, 20f, textColor(), Typeface.BOLD))
+            addView(text(description, 13f, mutedColor()).withTop(dp(4)))
+            addView(
+                text(
+                    "${mine.size} saved takes · ${totalSeconds}s captured",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(10)),
+            )
+            addView(
+                actionButton(
+                    if (recordingThisKind) "◼  Stop recording" else buttonIdle,
+                    if (recordingThisKind) ButtonStyle.Danger else buttonStyle,
+                ) {
+                    toggleSpeechRecording(project, kind, script)
+                }.tall().withTop(dp(14)),
+            )
+        }
+    }
+
+    private fun tokenRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View =
+        speechRecordCard(
+            project,
+            BulkRecording.KIND_POSITIVE,
+            title = "Record the wake word",
+            description = "Say “${project.phrase}” over and over with a short gap between each one. " +
+                "The server slices every clean repetition into its own positive clip.",
+            buttonIdle = "●  Record wake word",
+            buttonStyle = ButtonStyle.Primary,
+            takes = takes,
+            script = "",
+        )
+
+    private fun negativeRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View =
+        speechRecordCard(
+            project,
+            BulkRecording.KIND_NEGATIVE,
+            title = "Record negatives",
+            description = "Say ordinary sentences and unrelated speech — anything that is not the " +
+                "wake word. The server chops the take into negative clips.",
+            buttonIdle = "●  Record negatives",
+            buttonStyle = ButtonStyle.Secondary,
+            takes = takes,
+            script = "",
+        )
+
+    /**
+     * The only prompted recorder: it lists near-miss phrases for the user to read
+     * aloud a few times each, and files the whole take as hard negatives.
+     */
+    private fun hardNegativeRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View {
+        val mine = takes.filter { it.kind == BulkRecording.KIND_HARD_NEGATIVE }
+        val hardNegatives = PromptGenerator.hardNegativeScript(
             project,
             lexicon,
             store.promptBatch(project.id),
             bulkScriptRevision,
-            wakePlacements,
-            style = savedScriptStyle(),
         )
-        val script = scriptContent.text
-        val recordingThisProject =
-            recorder.isRecording && !backgroundRecordingActive && !testRecordingActive &&
+        // The script is guidance for the reader; the server slices by kind, not by
+        // matching these words, so the joined text is enough provenance.
+        val script = hardNegatives.joinToString(", ")
+        val recordingThisKind =
+            recorder.isRecording && activeTakeKind == BulkRecording.KIND_HARD_NEGATIVE &&
                 activeProject?.id == project.id
         return card().apply {
             addView(
@@ -2454,35 +2535,67 @@ class MainActivity : Activity() {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
                     addView(
-                        text("Bulk script", 20f, textColor(), Typeface.BOLD).apply {
+                        text("Hard negatives", 20f, textColor(), Typeface.BOLD).apply {
                             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                         },
                     )
                     addView(actionButton("Shuffle", ButtonStyle.Secondary) {
                         bulkScriptRevision += 1
-                        statusMessage = "Generated a new bulk script"
+                        statusMessage = "New near-miss prompts"
                         render()
                     })
                 },
             )
-            addView(text("Read the whole script in one take. Bold green is the wake phrase; red are near-misses.", 13f, mutedColor()).withTop(dp(4)))
-            addView(bulkScriptText(scriptContent, project.phrase).withTop(dp(12)))
-            addView(text("$wakePlacements wake placements · ${bulkRecordings.size} saved takes", 13f, mutedColor()).withTop(dp(10)))
+            addView(
+                text(
+                    "Read each near-miss aloud a few times, with a short gap between them. " +
+                        "These sound close to the wake word but must never trigger it.",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            addView(hardNegativePromptView(hardNegatives).withTop(dp(12)))
+            addView(text("${mine.size} saved takes", 13f, mutedColor()).withTop(dp(10)))
             addView(
                 actionButton(
-                    if (recordingThisProject) "◼  Stop recording" else "●  Record script",
-                    if (recordingThisProject) ButtonStyle.Danger else ButtonStyle.Primary,
+                    if (recordingThisKind) "◼  Stop recording" else "●  Record hard negatives",
+                    if (recordingThisKind) ButtonStyle.Danger else ButtonStyle.Secondary,
                 ) {
-                    toggleBulkRecording(project, script)
+                    toggleSpeechRecording(project, BulkRecording.KIND_HARD_NEGATIVE, script)
                 }.tall().withTop(dp(14)),
             )
         }
     }
 
-    private fun toggleBulkRecording(project: WakeWordProject, script: String) {
+    /** The near-miss phrases rendered one per line in the hard-negative red. */
+    private fun hardNegativePromptView(hardNegatives: List<String>): TextView {
+        val body = if (hardNegatives.isEmpty()) {
+            "No near-miss phrases available for this wake word yet."
+        } else {
+            hardNegatives.joinToString("\n") { "• $it" }
+        }
+        return text("", 17f, Color.rgb(190, 45, 45)).apply {
+            text = body
+            setLineSpacing(dp(4).toFloat(), 1.0f)
+        }
+    }
+
+    /**
+     * Start or stop a speech take of [kind]. All three speech kinds share the
+     * bulk recorder and the `bulk_` file layout; only [BulkRecording.kind] and the
+     * (optional) [script] differ, so the server can slice the take correctly.
+     */
+    private fun toggleSpeechRecording(project: WakeWordProject, kind: String, script: String) {
         if (recorder.isRecording) {
+            // Ignore taps on a different recorder while one take is capturing.
+            if (activeTakeKind != kind || activeProject?.id != project.id) {
+                statusMessage = "Finish the current recording first"
+                render()
+                return
+            }
             val result = recorder.stop()
             activeProject = null
+            activeTakeKind = null
             if (result != null) {
                 store.addBulkRecording(
                     BulkRecording(
@@ -2490,7 +2603,8 @@ class MainActivity : Activity() {
                         projectId = project.id,
                         projectSlug = project.slug,
                         filePath = result.output.absolutePath,
-                        script = result.prompt.instruction,
+                        script = script,
+                        kind = kind,
                         recordedAtMillis = result.recordedAtMillis,
                         durationMs = result.durationMs,
                         sampleRateHz = result.sampleRateHz,
@@ -2500,8 +2614,8 @@ class MainActivity : Activity() {
                         capture = captureMetadataFor(result),
                     ),
                 )
-                bulkScriptRevision += 1
-                statusMessage = "Saved bulk recording ${result.output.name}"
+                if (kind == BulkRecording.KIND_HARD_NEGATIVE) bulkScriptRevision += 1
+                statusMessage = "Saved ${recordKindLabel(kind)} take ${result.output.name}"
             }
             render()
             return
@@ -2510,12 +2624,21 @@ class MainActivity : Activity() {
         try {
             recorder.startBulk(project, script)
             activeProject = project
-            statusMessage = "Recording bulk script"
+            activeTakeKind = kind
+            statusMessage = "Recording ${recordKindLabel(kind)}"
             render()
         } catch (error: IllegalStateException) {
-            statusMessage = error.message ?: "Could not start bulk recording"
+            statusMessage = error.message ?: "Could not start recording"
             render()
         }
+    }
+
+    /** A short human label for a take kind, for status lines and Review headers. */
+    private fun recordKindLabel(kind: String): String = when (kind) {
+        BulkRecording.KIND_POSITIVE -> "wake word"
+        BulkRecording.KIND_NEGATIVE -> "negatives"
+        BulkRecording.KIND_HARD_NEGATIVE -> "hard negatives"
+        else -> "take"
     }
 
     /**
@@ -3574,6 +3697,7 @@ class MainActivity : Activity() {
             projectSlug = project.slug,
             filePath = "",
             script = "",
+            kind = recording.kind,
             recordedAtMillis = recording.recordedAtMillis,
             durationMs = recording.durationMs,
             sampleRateHz = 16_000,

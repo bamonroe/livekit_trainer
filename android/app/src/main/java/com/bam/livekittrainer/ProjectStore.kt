@@ -454,6 +454,13 @@ class ProjectStore(context: Context) {
             if (oldVersion < 7) {
                 createTestRecordingsTable(db)
             }
+            if (oldVersion < 8) {
+                // Per-take slicing kind. Existing bulk takes were mixed scripts;
+                // test takes stay test. Both are added via guarded ALTERs so an
+                // upgraded DB matches a fresh CREATE.
+                addColumnIfMissing(db, TABLE_BULK_RECORDINGS, "kind", "TEXT NOT NULL DEFAULT 'mixed'")
+                addColumnIfMissing(db, TABLE_TEST_RECORDINGS, "kind", "TEXT NOT NULL DEFAULT 'test'")
+            }
         }
 
         override fun onConfigure(db: SQLiteDatabase) {
@@ -476,6 +483,7 @@ class ProjectStore(context: Context) {
                     channels INTEGER NOT NULL,
                     encoding TEXT NOT NULL,
                     condition_tags TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT 'mixed',
                     $CAPTURE_COLUMNS_SQL,
                     FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
                 )
@@ -522,12 +530,23 @@ class ProjectStore(context: Context) {
                     channels INTEGER NOT NULL,
                     encoding TEXT NOT NULL,
                     condition_tags TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT 'test',
                     $CAPTURE_COLUMNS_SQL,
                     FOREIGN KEY(project_id) REFERENCES $TABLE_PROJECTS(id) ON DELETE CASCADE
                 )
                 """.trimIndent(),
             )
             db.execSQL("CREATE INDEX IF NOT EXISTS test_recordings_project_id_idx ON $TABLE_TEST_RECORDINGS(project_id)")
+        }
+
+        private fun addColumnIfMissing(
+            db: SQLiteDatabase,
+            table: String,
+            name: String,
+            decl: String,
+        ) {
+            if (name in existingColumns(db, table)) return
+            db.execSQL("ALTER TABLE $table ADD COLUMN $name $decl")
         }
 
         private fun addCaptureColumns(db: SQLiteDatabase, table: String) {
@@ -552,7 +571,7 @@ class ProjectStore(context: Context) {
 
     private companion object {
         const val DATABASE_NAME = "wake_word_collection.db"
-        const val DATABASE_VERSION = 7
+        const val DATABASE_VERSION = 8
         const val LEGACY_PREFS = "wake_word_projects"
 
         // Per-take provenance columns shared by the bulk and background tables.
@@ -617,6 +636,7 @@ private fun BulkRecording.toContentValues(): ContentValues =
         put("project_slug", projectSlug)
         put("file_path", filePath)
         put("script", script)
+        put("kind", kind)
         put("recorded_at_millis", recordedAtMillis)
         put("duration_ms", durationMs)
         put("sample_rate_hz", sampleRateHz)
@@ -699,6 +719,7 @@ private fun Cursor.toBulkRecording(): BulkRecording =
         projectSlug = getStringValue("project_slug"),
         filePath = getStringValue("file_path"),
         script = getStringValue("script"),
+        kind = getOptionalStringValue("kind").ifBlank { BulkRecording.KIND_POSITIVE },
         recordedAtMillis = getLongValue("recorded_at_millis"),
         durationMs = getLongValue("duration_ms"),
         sampleRateHz = getIntValue("sample_rate_hz"),

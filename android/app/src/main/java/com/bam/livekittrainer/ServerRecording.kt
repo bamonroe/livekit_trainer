@@ -10,6 +10,12 @@ data class ServerRecording(
     val id: String,
     val isBackground: Boolean,
     val isTest: Boolean = false,
+    /**
+     * How the take was sliced: [BulkRecording.KIND_POSITIVE], `KIND_NEGATIVE`,
+     * `KIND_HARD_NEGATIVE`, `background`, `test`, or `mixed` for legacy
+     * single-script takes. Lets Review group recordings by kind.
+     */
+    val kind: String = "mixed",
     val recordedAtMillis: Long,
     val durationMs: Long,
     val positiveCount: Int,

@@ -175,6 +175,7 @@ class BundleExporter(private val context: Context) {
             .put("id", id)
             .put("file", file)
             .put("script", script)
+            .put("kind", kind)
             .put("recorded_at", Instant.ofEpochMilli(recordedAtMillis).toString())
             .put("duration_ms", durationMs)
             .put("sample_rate_hz", sampleRateHz)

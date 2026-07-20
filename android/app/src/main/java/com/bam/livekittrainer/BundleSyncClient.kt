@@ -190,6 +190,7 @@ class BundleSyncClient(
                         id = item.getString("id"),
                         isBackground = item.optBoolean("is_background", false),
                         isTest = item.optBoolean("is_test", false),
+                        kind = item.optString("kind", "mixed").ifBlank { "mixed" },
                         recordedAtMillis = parseIsoMillis(item.optString("recorded_at")),
                         durationMs = item.optLong("duration_ms", 0L),
                         positiveCount = item.optInt("positive_count", 0),

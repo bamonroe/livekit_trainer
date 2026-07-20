@@ -457,6 +457,25 @@ object PromptGenerator {
         return templates[random.nextInt(templates.size)].sentenceCase()
     }
 
+    /**
+     * A hard-negative-only prompt: a shuffled set of near-miss phrases for the
+     * user to read aloud, several each with short gaps, so the server can chop
+     * the take into hard negatives. Unlike the mixed bulk script this has no wake
+     * phrase and no ordinary filler — only the tricky look-alikes.
+     */
+    fun hardNegativeScript(
+        project: WakeWordProject,
+        lexicon: PromptLexicon = PromptLexicon.Empty,
+        batchNumber: Int = 0,
+        revision: Int = 0,
+        count: Int = 12,
+    ): List<String> {
+        val random = stableRandom("${project.slug}:hardneg:$batchNumber:$revision")
+        return hardNegativeCandidates(project.phrase, lexicon, random)
+            .shuffled(random)
+            .take(count.coerceIn(1, 48))
+    }
+
     private fun hardNegativeCandidates(
         phrase: String,
         lexicon: PromptLexicon,
