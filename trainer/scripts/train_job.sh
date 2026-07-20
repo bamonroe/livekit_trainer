@@ -69,16 +69,20 @@ echo "== train_job slug=$SLUG phrase='$PHRASE' token=$TOKEN_TYPE steps=$STEPS si
 
 # 1. Assemble the pooled real-samples tree.
 write_status "running" "assemble" 0 "assembling pooled data"
-assemble_args=(--slug "$SLUG" --positive-boost "$POSITIVE_BOOST")
+ASSEMBLE_SUMMARY="$OUT_DIR/assemble_summary.json"
+assemble_args=(--slug "$SLUG" --positive-boost "$POSITIVE_BOOST"
+  --summary-json "$ASSEMBLE_SUMMARY")
 python3 scripts/assemble_training_data.py "${assemble_args[@]}" >>"$LOG" 2>&1 \
   || fail assemble $? "assemble_training_data failed"
 
 # 2. Generate the YAML config from the chosen hyperparameters.
 write_status "running" "generate" 0 "generating config"
 CONFIG="trainer/configs/$SLUG.yaml"
+CONFIG_PARAMS="$OUT_DIR/config_params.json"
 gen_args=(--slug "$SLUG" --phrase "$PHRASE" --out "$CONFIG"
   --steps "$STEPS" --model-size "$MODEL_SIZE" --target-fp-per-hour "$TARGET_FP_PER_HOUR"
-  --real-samples-dir "$REAL_SAMPLES_DIR" --token-type "$TOKEN_TYPE")
+  --real-samples-dir "$REAL_SAMPLES_DIR" --token-type "$TOKEN_TYPE"
+  --params-json "$CONFIG_PARAMS")
 # Durable hard negatives: the app regenerates this config on every run, so the
 # curated near-miss list lives in a sidecar file and is always fed back in
 # rather than being silently overwritten to empty.
@@ -118,13 +122,33 @@ done
 
 ONNX_SHA="$(sha256 "$OUT_DIR/$SLUG.onnx")"
 PT_SHA="$(sha256 "$OUT_DIR/$SLUG.pt")"
+ONNX_BYTES="$([ -f "$OUT_DIR/$SLUG.onnx" ] && stat -c %s "$OUT_DIR/$SLUG.onnx" || echo 0)"
+# The repo is bind-mounted from the host and owned by a different uid, so git
+# refuses to operate on it ("dubious ownership") and the commit stamped "unknown".
+# Marking it a safe directory lets the container read the exact code revision.
+git config --global --add safe.directory /work 2>/dev/null || true
 GIT_COMMIT="$(git -C /work rev-parse HEAD 2>/dev/null || echo unknown)"
 FINISHED="$(now)"
-esc_phrase_m="$(json_escape "$PHRASE")"
 
-cat > "$RUN_DIR/manifest.json" <<EOF
-{"slug":"$SLUG","phrase":"$esc_phrase_m","run_id":"$RUNID","onnx_path":"runs/$RUNID/$SLUG.onnx","onnx_sha256":"$ONNX_SHA","pt_sha256":"$PT_SHA","steps":$STEPS,"model_size":"$MODEL_SIZE","personal":$([ "$PERSONAL" = "1" ] && echo true || echo false),"positive_boost":$POSITIVE_BOOST,"target_fp_per_hour":$TARGET_FP_PER_HOUR,"git_commit":"$GIT_COMMIT","started_at":"$STARTED","finished_at":"$FINISHED"}
-EOF
+# Assemble the complete provenance manifest: every knob the run turned, the real
+# vs synthetic clip counts, the resolved hyperparameters, the eval metrics, the
+# code revision, and the model checksums. Built in python from the sidecars so
+# the record is a single source of truth the sync-server folds into the models
+# table. Robust to any sidecar being absent (older/failed step).
+MANIFEST_ENV_SLUG="$SLUG" MANIFEST_ENV_PHRASE="$PHRASE" \
+  MANIFEST_ENV_RUNID="$RUNID" MANIFEST_ENV_ONNX_SHA="$ONNX_SHA" \
+  MANIFEST_ENV_PT_SHA="$PT_SHA" MANIFEST_ENV_ONNX_BYTES="$ONNX_BYTES" \
+  MANIFEST_ENV_STEPS="$STEPS" MANIFEST_ENV_MODEL_SIZE="$MODEL_SIZE" \
+  MANIFEST_ENV_PERSONAL="$PERSONAL" MANIFEST_ENV_POSITIVE_BOOST="$POSITIVE_BOOST" \
+  MANIFEST_ENV_TARGET_FP="$TARGET_FP_PER_HOUR" MANIFEST_ENV_TOKEN_TYPE="$TOKEN_TYPE" \
+  MANIFEST_ENV_GIT_COMMIT="$GIT_COMMIT" MANIFEST_ENV_STARTED="$STARTED" \
+  MANIFEST_ENV_FINISHED="$FINISHED" MANIFEST_ENV_IMAGE="${TRAINER_IMAGE:-}" \
+  MANIFEST_ENV_PARAMS="$CONFIG_PARAMS" MANIFEST_ENV_SUMMARY="$ASSEMBLE_SUMMARY" \
+  MANIFEST_ENV_EVAL="$OUT_DIR/${SLUG}_eval.json" \
+  MANIFEST_ENV_METRICS="$OUT_DIR/${SLUG}_metrics.json" \
+  MANIFEST_ENV_OUT="$RUN_DIR/manifest.json" \
+  python3 scripts/write_manifest.py >>"$LOG" 2>&1 \
+  || echo "== WARNING: write_manifest failed; model kept, provenance incomplete ==" | tee -a "$LOG"
 
 printf '%s\n' "$RUNID" > "$OUT_DIR/CURRENT"
 echo "== archived run $RUNID (onnx sha256 ${ONNX_SHA:-none}) ==" | tee -a "$LOG"

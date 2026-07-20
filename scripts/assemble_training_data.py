@@ -24,6 +24,7 @@ data root is modified. Point the training config's ``real_samples_dir`` at the
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -73,6 +74,16 @@ def main() -> int:
             "pool (default: 1 = no boost)"
         ),
     )
+    parser.add_argument(
+        "--summary-json",
+        type=Path,
+        default=None,
+        help=(
+            "Also write the pooled-clip counts (own/borrowed positive, negative, "
+            "background) to this JSON file, so the training pipeline can record "
+            "exactly how much real voice went into the model."
+        ),
+    )
     args = parser.parse_args()
 
     if not SAFE_SLUG.fullmatch(args.slug):
@@ -118,6 +129,14 @@ def main() -> int:
     )
     if summary["other_slugs"]:
         print(f"  pooled from: {', '.join(summary['other_slugs'])}")
+    if args.summary_json is not None:
+        # A machine-readable copy of the counts above, so the training pipeline
+        # can fold the exact real-clip totals (and the boost multiplier) into the
+        # model's provenance record.
+        args.summary_json.parent.mkdir(parents=True, exist_ok=True)
+        args.summary_json.write_text(
+            json.dumps({**summary, "positive_boost": args.positive_boost}, indent=2)
+        )
     return 0
 
 

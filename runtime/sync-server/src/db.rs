@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Per-take capture provenance forwarded by the app: which device and input
 /// route recorded it, the mic's native format before the app's 16 kHz mono
@@ -279,6 +279,24 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             finished_at   TEXT,
             created_at_ms INTEGER NOT NULL,
             is_current    INTEGER NOT NULL DEFAULT 0,
+            -- Version 6: full training provenance. Every knob that shaped the
+            -- model, the real vs synthetic data counts, and the complete manifest
+            -- verbatim (params_json) so nothing is ever lost even as knobs evolve.
+            model_type          TEXT,
+            token_type          TEXT,
+            positive_boost      INTEGER,
+            n_samples           INTEGER,
+            n_samples_val       INTEGER,
+            positive_per_batch  INTEGER,
+            target_fp_per_hour  REAL,
+            context_fix         INTEGER,
+            real_positive       INTEGER,
+            real_negative       INTEGER,
+            real_background     INTEGER,
+            trainer_image       TEXT,
+            onnx_bytes          INTEGER,
+            eval                TEXT,
+            params_json         TEXT,
             UNIQUE(slug, run_id)
         );
 
@@ -330,6 +348,33 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         if !column_exists(conn, "bulk_recordings", name)? {
             conn.execute(
                 &format!("ALTER TABLE bulk_recordings ADD COLUMN {name} {decl}"),
+                [],
+            )?;
+        }
+    }
+
+    // Version 6: full training-provenance columns on `models`. Guarded ALTERs so
+    // databases created before v6 evolve to the same shape as a fresh CREATE.
+    for (name, decl) in [
+        ("model_type", "TEXT"),
+        ("token_type", "TEXT"),
+        ("positive_boost", "INTEGER"),
+        ("n_samples", "INTEGER"),
+        ("n_samples_val", "INTEGER"),
+        ("positive_per_batch", "INTEGER"),
+        ("target_fp_per_hour", "REAL"),
+        ("context_fix", "INTEGER"),
+        ("real_positive", "INTEGER"),
+        ("real_negative", "INTEGER"),
+        ("real_background", "INTEGER"),
+        ("trainer_image", "TEXT"),
+        ("onnx_bytes", "INTEGER"),
+        ("eval", "TEXT"),
+        ("params_json", "TEXT"),
+    ] {
+        if !column_exists(conn, "models", name)? {
+            conn.execute(
+                &format!("ALTER TABLE models ADD COLUMN {name} {decl}"),
                 [],
             )?;
         }
@@ -963,6 +1008,23 @@ pub struct ModelRecord {
     pub metrics: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    // Version 6 provenance: every knob and the real vs synthetic data counts,
+    // plus the full manifest verbatim in `params_json`.
+    pub model_type: Option<String>,
+    pub token_type: Option<String>,
+    pub positive_boost: Option<i64>,
+    pub n_samples: Option<i64>,
+    pub n_samples_val: Option<i64>,
+    pub positive_per_batch: Option<i64>,
+    pub target_fp_per_hour: Option<f64>,
+    pub context_fix: Option<bool>,
+    pub real_positive: Option<i64>,
+    pub real_negative: Option<i64>,
+    pub real_background: Option<i64>,
+    pub trainer_image: Option<String>,
+    pub onnx_bytes: Option<i64>,
+    pub eval: Option<String>,
+    pub params_json: Option<String>,
 }
 
 /// Record a versioned trained model. Ensures the wake word exists, inserts the
@@ -979,8 +1041,14 @@ pub fn record_model(
     let changed = conn.execute(
         "INSERT OR IGNORE INTO models
             (slug, run_id, onnx_path, onnx_sha256, pt_sha256, steps, model_size,
-             personal, git_commit, metrics, started_at, finished_at, created_at_ms, is_current)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)",
+             personal, git_commit, metrics, started_at, finished_at, created_at_ms,
+             is_current, model_type, token_type, positive_boost, n_samples,
+             n_samples_val, positive_per_batch, target_fp_per_hour, context_fix,
+             real_positive, real_negative, real_background, trainer_image,
+             onnx_bytes, eval, params_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0,
+             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
+             ?27, ?28)",
         params![
             model.slug,
             model.run_id,
@@ -995,6 +1063,21 @@ pub fn record_model(
             model.started_at,
             model.finished_at,
             now_ms,
+            model.model_type,
+            model.token_type,
+            model.positive_boost,
+            model.n_samples,
+            model.n_samples_val,
+            model.positive_per_batch,
+            model.target_fp_per_hour,
+            model.context_fix.map(|b| b as i64),
+            model.real_positive,
+            model.real_negative,
+            model.real_background,
+            model.trainer_image,
+            model.onnx_bytes,
+            model.eval,
+            model.params_json,
         ],
     )?;
     if make_current {
@@ -1005,6 +1088,51 @@ pub fn record_model(
         )?;
     }
     Ok(changed > 0)
+}
+
+/// Every recorded model with its full training provenance, newest first, each
+/// row rendered as a JSON object string. `metrics`, `eval`, and `params_json`
+/// are re-parsed via `json(...)` so they nest as objects rather than escaped
+/// strings; a malformed blob falls back to SQL NULL. The caller parses each
+/// string into a value and assembles the array, so this stays serde-free.
+pub fn list_model_records(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT json_object(
+            'slug', slug,
+            'run_id', run_id,
+            'is_current', is_current,
+            'onnx_path', onnx_path,
+            'onnx_sha256', onnx_sha256,
+            'pt_sha256', pt_sha256,
+            'onnx_bytes', onnx_bytes,
+            'git_commit', git_commit,
+            'trainer_image', trainer_image,
+            'steps', steps,
+            'model_type', model_type,
+            'model_size', model_size,
+            'personal', personal,
+            'positive_boost', positive_boost,
+            'n_samples', n_samples,
+            'n_samples_val', n_samples_val,
+            'positive_per_batch', positive_per_batch,
+            'target_fp_per_hour', target_fp_per_hour,
+            'token_type', token_type,
+            'context_fix', context_fix,
+            'real_positive', real_positive,
+            'real_negative', real_negative,
+            'real_background', real_background,
+            'started_at', started_at,
+            'finished_at', finished_at,
+            'created_at_ms', created_at_ms,
+            'metrics', json(metrics),
+            'eval', json(eval),
+            'params', json(params_json)
+         )
+         FROM models
+         ORDER BY created_at_ms DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
 }
 
 /// Average milliseconds per training step from past *successful* runs, preferring

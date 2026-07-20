@@ -518,6 +518,7 @@ async fn main() {
         )
         .route("/score/:slug/:recording_id", get(score_recording))
         .route("/models", get(list_models))
+        .route("/models/runs", get(list_model_runs))
         .route("/train/:slug", post(start_training))
         .route("/train/:slug/status", get(training_status))
         .route("/train/:slug/log", get(training_log))
@@ -1194,25 +1195,52 @@ fn read_model_manifest(
         return None;
     }
     let run_dir = models_root.join(slug).join("runs").join(run_id);
-    let manifest: Value =
-        serde_json::from_str(&fs::read_to_string(run_dir.join("manifest.json")).ok()?).ok()?;
+    let manifest_raw = fs::read_to_string(run_dir.join("manifest.json")).ok()?;
+    let manifest: Value = serde_json::from_str(&manifest_raw).ok()?;
     let metrics = fs::read_to_string(run_dir.join(format!("{slug}_metrics.json"))).ok();
     let mstr = |k: &str| manifest.get(k).and_then(Value::as_str).map(str::to_string);
+    let mi64 = |k: &str| manifest.get(k).and_then(Value::as_i64);
     let sstr = |k: &str| status.get(k).and_then(Value::as_str).map(str::to_string);
+    // The manifest carries the full eval object; the metrics sidecar is stored
+    // raw. Prefer manifest-recorded knobs (the effective, resolved values) and
+    // fall back to the terminal status body for the few older fields.
+    let eval = manifest
+        .get("eval")
+        .filter(|v| !v.is_null())
+        .map(|v| v.to_string());
     Some(db::ModelRecord {
         slug: slug.to_string(),
-        phrase: sstr("phrase").unwrap_or_default(),
+        phrase: mstr("phrase").or_else(|| sstr("phrase")).unwrap_or_default(),
         run_id: run_id.to_string(),
         onnx_path: mstr("onnx_path").unwrap_or_else(|| format!("runs/{run_id}/{slug}.onnx")),
         onnx_sha256: mstr("onnx_sha256"),
         pt_sha256: mstr("pt_sha256"),
-        steps: status.get("steps").and_then(Value::as_i64),
-        model_size: sstr("model_size"),
-        personal: status.get("personal").and_then(Value::as_bool).unwrap_or(false),
+        steps: mi64("steps").or_else(|| status.get("steps").and_then(Value::as_i64)),
+        model_size: mstr("model_size").or_else(|| sstr("model_size")),
+        personal: manifest
+            .get("personal")
+            .and_then(Value::as_bool)
+            .or_else(|| status.get("personal").and_then(Value::as_bool))
+            .unwrap_or(false),
         git_commit: mstr("git_commit"),
         metrics,
-        started_at: sstr("started_at"),
+        started_at: mstr("started_at").or_else(|| sstr("started_at")),
         finished_at: mstr("finished_at").or_else(|| sstr("updated_at")),
+        model_type: mstr("model_type"),
+        token_type: mstr("token_type"),
+        positive_boost: mi64("positive_boost"),
+        n_samples: mi64("n_samples"),
+        n_samples_val: mi64("n_samples_val"),
+        positive_per_batch: mi64("positive_per_batch"),
+        target_fp_per_hour: manifest.get("target_fp_per_hour").and_then(Value::as_f64),
+        context_fix: manifest.get("context_fix").and_then(Value::as_bool),
+        real_positive: mi64("real_positive"),
+        real_negative: mi64("real_negative"),
+        real_background: mi64("real_background"),
+        trainer_image: mstr("trainer_image"),
+        onnx_bytes: mi64("onnx_bytes"),
+        eval,
+        params_json: Some(manifest_raw),
     })
 }
 
@@ -3372,6 +3400,8 @@ async fn launch_train_container(
     }
     push_env(&mut args, "REAL_SAMPLES_DIR", vt.real_samples_dir.clone());
     push_env(&mut args, "TOKEN_TYPE", vt.token_type.clone());
+    // The job stamps its own image tag into the model manifest for provenance.
+    push_env(&mut args, "TRAINER_IMAGE", (*state.trainer_image).clone());
     args.push((*state.trainer_image).clone());
     args.push("bash".into());
     args.push("-lc".into());
@@ -3981,6 +4011,22 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, AppEr
         }
     }
     Ok(Json(json!({ "status": "ok", "models": models })))
+}
+
+/// Full per-run training provenance from the `models` table: every knob, the
+/// real vs synthetic data counts, the code revision, checksums, scores, and the
+/// complete manifest, one entry per trained model, newest first. This is the
+/// accounting ledger for comparing models and knowing exactly what produced each.
+async fn list_model_runs(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let rows = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::list_model_records(&conn).map_err(db_error)?
+    };
+    let runs: Vec<Value> = rows
+        .iter()
+        .filter_map(|s| serde_json::from_str(s).ok())
+        .collect();
+    Ok(Json(json!({ "status": "ok", "runs": runs })))
 }
 
 #[derive(Debug)]

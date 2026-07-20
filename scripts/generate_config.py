@@ -110,6 +110,16 @@ def main() -> int:
         ),
     )
     parser.set_defaults(context_fix=True)
+    parser.add_argument(
+        "--params-json",
+        type=Path,
+        default=None,
+        help=(
+            "Also write the fully-resolved training knobs (after preset defaults "
+            "are applied) to this JSON file, so the pipeline can record the exact "
+            "hyperparameters that went into the model."
+        ),
+    )
     args = parser.parse_args()
 
     config = config_from_args(args)
@@ -117,6 +127,30 @@ def main() -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_yaml(config), encoding="utf-8")
     print(f"Wrote {out}")
+    if args.params_json is not None:
+        # A flat, machine-readable snapshot of the resolved knobs for provenance.
+        params = {
+            "model_name": config["model_name"],
+            "model_type": config["model"]["model_type"],
+            "model_size": config["model"]["model_size"],
+            "n_samples": config["n_samples"],
+            "n_samples_val": config["n_samples_val"],
+            "steps": config["steps"],
+            "target_fp_per_hour": config["target_fp_per_hour"],
+            "token_type": config.get("token_type"),
+            "positive_per_batch": (
+                config["batch_n_per_class"]["positive"]
+                if config.get("batch_n_per_class")
+                else None
+            ),
+            "context_fix": bool(config.get("background_paths")),
+            "background_paths": config.get("background_paths") or [],
+            "custom_negative_count": len(config["custom_negative_phrases"]),
+            "target_phrases": config["target_phrases"],
+            "real_samples_dir": config.get("real_samples_dir"),
+        }
+        args.params_json.parent.mkdir(parents=True, exist_ok=True)
+        args.params_json.write_text(json.dumps(params, indent=2))
     return 0
 
 
