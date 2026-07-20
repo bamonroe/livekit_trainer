@@ -132,6 +132,9 @@ pub struct ProjectRow {
     pub positive_count: i64,
     pub negative_count: i64,
     pub background_count: i64,
+    /// Own negatives that are eligible to be pooled into other projects — plain
+    /// negatives only, excluding project-scoped hard negatives.
+    pub poolable_negative_count: i64,
 }
 
 /// Everything a reprocess pass needs about a stored recording to re-run
@@ -744,7 +747,7 @@ pub fn recording_details(
                 (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
                     AND s.status = 'active' AND s.category = 'positive'),
                 (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
-                    AND s.status = 'active' AND s.category = 'negative'),
+                    AND s.status = 'active' AND s.category IN ('negative', 'hard_negative')),
                 (SELECT COUNT(*) FROM slices s WHERE s.recording_id = b.id
                     AND s.status = 'active' AND s.category = 'background'),
                 b.capture_device_manufacturer, b.capture_device_model,
@@ -1350,8 +1353,9 @@ pub fn project_summaries(conn: &Connection) -> Result<Vec<ProjectRow>, rusqlite:
         "SELECT p.slug, p.phrase, COALESCE(p.external_id, p.slug), p.created_at_ms,
                 (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active'),
                 (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'positive'),
-                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'negative'),
-                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'background')
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category IN ('negative', 'hard_negative')),
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'background'),
+                (SELECT COUNT(*) FROM slices s WHERE s.project_slug = p.slug AND s.status = 'active' AND s.category = 'negative')
          FROM projects p
          ORDER BY p.slug ASC",
     )?;
@@ -1365,6 +1369,7 @@ pub fn project_summaries(conn: &Connection) -> Result<Vec<ProjectRow>, rusqlite:
             positive_count: row.get(5)?,
             negative_count: row.get(6)?,
             background_count: row.get(7)?,
+            poolable_negative_count: row.get(8)?,
         })
     })?;
     rows.collect()

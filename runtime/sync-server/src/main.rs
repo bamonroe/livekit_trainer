@@ -604,14 +604,15 @@ async fn projects(State(state): State<AppState>) -> Result<Json<ProjectsResponse
         let conn = state.db.lock().expect("db lock poisoned");
         db::project_summaries(&conn).map_err(db_error)?
     };
-    // Cross-wake-word reuse: every other project's negatives, plus their
-    // positives (reused as hard negatives), are available to this project.
-    let total_negatives: i64 = rows.iter().map(|r| r.negative_count).sum();
+    // Cross-wake-word reuse: every other project's plain negatives, plus their
+    // positives (reused as hard negatives), are available to this project. Hard
+    // negatives are project-scoped, so they never enter the shared pool.
+    let total_poolable_negatives: i64 = rows.iter().map(|r| r.poolable_negative_count).sum();
     let total_positives: i64 = rows.iter().map(|r| r.positive_count).sum();
     let projects = rows
         .into_iter()
         .map(|row| {
-            let pooled = (total_negatives - row.negative_count)
+            let pooled = (total_poolable_negatives - row.poolable_negative_count)
                 + (total_positives - row.positive_count);
             ProjectSummary {
                 id: row.external_id,
@@ -1641,11 +1642,8 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), AppError> {
                 "test recording {index} missing file"
             )));
         }
-        if recording.script.trim().is_empty() {
-            return Err(AppError::bad_request(format!(
-                "test recording {index} missing script"
-            )));
-        }
+        // A test take is a free-form spoken take scored against a model; it needs
+        // no script, so an empty one is fine.
     }
     Ok(())
 }
@@ -2418,12 +2416,15 @@ async fn align_one_recording(
                 safe_filename(&clip_id),
                 safe_filename(&phrase_text)
             );
-            let dest = dest_root.join("negative").join(&file_name);
+            // Hard negatives live in their own on-disk category so the pooling
+            // assembler keeps them scoped to this project instead of borrowing
+            // them into every other wake word's negative pool.
+            let dest = dest_root.join("hard_negative").join(&file_name);
             if write_wav_slice(source, &dest, start, end)? {
                 slice_rows.push(build_slice_row(
                     &clip_id,
                     "hard_negative",
-                    "negative",
+                    "hard_negative",
                     &dest,
                     &file_name,
                     start,
@@ -2475,12 +2476,19 @@ async fn align_one_recording(
                     safe_filename(&clip_id),
                     safe_filename(&phrase_text)
                 );
-                let dest = dest_root.join("negative").join(&file_name);
+                // A hard-negative take files its whole read under the hard_negative
+                // category (project-scoped); everything else is a pooled negative.
+                let neg_category = if negative_label == "hard_negative" {
+                    "hard_negative"
+                } else {
+                    "negative"
+                };
+                let dest = dest_root.join(neg_category).join(&file_name);
                 if write_wav_slice(source, &dest, start, end)? {
                     slice_rows.push(build_slice_row(
                         &clip_id,
                         negative_label,
-                        "negative",
+                        neg_category,
                         &dest,
                         &file_name,
                         start,
@@ -3134,7 +3142,7 @@ fn review_clip_path(
             "unsafe wake word slug: {slug}"
         )));
     }
-    if !matches!(category, "positive" | "negative" | "background") {
+    if !matches!(category, "positive" | "negative" | "hard_negative" | "background") {
         return Err(AppError::bad_request(format!(
             "unsafe category: {category}"
         )));
@@ -3213,7 +3221,8 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, AppError> {
 fn category_for_label(label: &str) -> Option<&'static str> {
     match label {
         "positive" | "false_negative" => Some("positive"),
-        "negative" | "hard_negative" | "false_positive" => Some("negative"),
+        "negative" | "false_positive" => Some("negative"),
+        "hard_negative" => Some("hard_negative"),
         "background" => Some("background"),
         _ => None,
     }
@@ -4298,7 +4307,7 @@ mod tests {
     fn maps_labels_to_categories() {
         assert_eq!(category_for_label("positive"), Some("positive"));
         assert_eq!(category_for_label("false_negative"), Some("positive"));
-        assert_eq!(category_for_label("hard_negative"), Some("negative"));
+        assert_eq!(category_for_label("hard_negative"), Some("hard_negative"));
         assert_eq!(category_for_label("false_positive"), Some("negative"));
         assert_eq!(category_for_label("background"), Some("background"));
         assert_eq!(category_for_label("other"), None);

@@ -11,9 +11,15 @@ speech that sounds like a wake phrase but is not the target.
 This script builds a merged tree at ``<out>/<slug>`` for a single target slug:
 
   positive/    the target slug's own positives (never borrowed)
-  negative/    the target's own negatives + every other slug's negatives
+  negative/    the target's own negatives + the target's own hard negatives
+               + every other slug's negatives
                + every other slug's positives (reused as hard negatives)
   background/  the target's own background + every other slug's background
+
+Plain negatives and background are ordinary speech and noise, so they pool
+across every project. Hard negatives are near-miss phrases specific to *this*
+wake word, so the target's own ``hard_negative`` clips train only its own model
+and are never borrowed into another project's pool.
 
 Borrowed clips are linked, not copied, so the pool stays in sync with the
 canonical ``data/real`` tree and costs no extra disk. Nothing under the source
@@ -120,7 +126,8 @@ def main() -> int:
     print(f"  positive:   {summary['positive']} (own{boost_note})")
     print(
         f"  negative:   {summary['negative']} "
-        f"(own {summary['own_negative']}, borrowed negatives {summary['borrowed_negative']}, "
+        f"(own {summary['own_negative']}, own hard negatives {summary['own_hard_negative']}, "
+        f"borrowed negatives {summary['borrowed_negative']}, "
         f"borrowed positives {summary['borrowed_positive']})"
     )
     print(
@@ -170,7 +177,7 @@ def assemble(
         (dest / category).mkdir(parents=True, exist_ok=True)
 
     others = other_slugs(data_root, slug)
-    counts = {k: 0 for k in ("own_negative", "borrowed_negative", "borrowed_positive", "own_background", "borrowed_background")}
+    counts = {k: 0 for k in ("own_negative", "own_hard_negative", "borrowed_negative", "borrowed_positive", "own_background", "borrowed_background")}
     contributing: set[str] = set()
 
     # Positives: own only, optionally replicated `positive_boost` times so the
@@ -180,9 +187,13 @@ def assemble(
         data_root / slug / "positive", dest / "positive", slug, copy, boost=positive_boost
     )
 
-    # Negatives: own negatives, then every other slug's negatives, then
-    # (optionally) every other slug's positives reused as hard negatives.
+    # Negatives: own negatives, own hard negatives (project-scoped, never
+    # borrowed from or lent to another slug), then every other slug's negatives,
+    # then (optionally) every other slug's positives reused as hard negatives.
     counts["own_negative"] = _link_category(data_root / slug / "negative", dest / "negative", slug, copy)
+    counts["own_hard_negative"] = _link_category(
+        data_root / slug / "hard_negative", dest / "negative", f"{slug}_hardneg", copy
+    )
     for other in others:
         got = _link_category(data_root / other / "negative", dest / "negative", other, copy)
         counts["borrowed_negative"] += got
@@ -206,9 +217,10 @@ def assemble(
     return {
         "positive": n_pos,
         "positive_unique": n_pos_unique,
-        "negative": counts["own_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"],
+        "negative": counts["own_negative"] + counts["own_hard_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"],
         "background": counts["own_background"] + counts["borrowed_background"],
         "own_negative": counts["own_negative"],
+        "own_hard_negative": counts["own_hard_negative"],
         "borrowed_negative": counts["borrowed_negative"],
         "borrowed_positive": counts["borrowed_positive"],
         "own_background": counts["own_background"],
