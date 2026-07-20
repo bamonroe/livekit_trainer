@@ -7,6 +7,17 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [x] Start-vs-end token type, end to end. A phrase is a start token (begins an
+  utterance, quiet-room lead) or an end token (ends speech, e.g. "all set",
+  prior-speech lead); they need opposite leading context. Wired through:
+  `generate_config.py --token-type start|end` picks the background pool (start =
+  ambient noise only, end = ambient + ordinary-speech negatives), `train_job.sh`
+  forwards `TOKEN_TYPE`, the sync-server accepts `token_type` on the train
+  request, and the app's Train page has a per-wake-word Start/End selector
+  (stored per slug, end default). Sync-server image rebuilt + restarted; app APK
+  builds. Not yet installed on the phone (live voice remote); tap-test on the
+  emulator when convenient.
+
 - [x] Context-fix recipe baked into the pipeline. Was a manual bind-mount
   (`train_ctxfix.sh`) + hand-written `all_set_ctx.yaml`; now every training run
   the app/sync-server launches gets it. `Dockerfile.trainer` copies
