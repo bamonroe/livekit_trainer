@@ -24,20 +24,23 @@ COPY patches/0001-parallel-augmentation.patch /tmp/0001-parallel-augmentation.pa
 RUN sp=$(python -c "import livekit.wakeword, pathlib; print(pathlib.Path(livekit.wakeword.__file__).resolve().parents[2])") \
     && patch -p2 -d "$sp" < /tmp/0001-parallel-augmentation.patch
 
-# Leading-context augmentation fix, baked into the image so EVERY training run
+# Realistic-positive compositing, baked into the image so EVERY training run
 # (including the app/sync-server pipeline, which just `docker run`s this image)
-# gets it without a bind-mount. augment_ctxfix.py is a full drop-in replacement
-# for livekit.wakeword.data.augment: it already includes the parallel change
-# above, and additionally re-mixes background across the whole 2s window after
-# align_clip_to_end, so the ~1s in front of every positive carries real sound
-# instead of the zero-fill that caused the streaming-recall gap (99% padded
-# eval, ~1% mid-sentence). Pair with augmentation.background_paths in the config
-# (generate_config.py emits these by default). See streaming-recall-gap /
-# context-fix-augmentation notes. trainer/scripts/train_ctxfix.sh (bind-mount)
-# is now redundant but still works for iterating on the patch without a rebuild.
-COPY patches/augment_ctxfix.py /tmp/augment_ctxfix.py
+# gets it without a bind-mount. augment_realistic.py is a full drop-in
+# replacement for livekit.wakeword.data.augment: it includes the parallel change
+# above, and composites each positive as ONE clear voice on a background bed
+# (optional sequential filler -> gap -> wake word -> room-tone margin) at a wide
+# 0-18 dB SNR, instead of the zero-filled lead that caused the streaming-recall
+# gap (99% padded eval, ~1% mid-sentence) or ctxfix's two-voices-at-once overlap.
+# Recipe knobs come from a per-run sidecar YAML that train_job.sh writes and
+# points AUG_REALISTIC_CONFIG at; absent that env var the module degrades to
+# "bare phrase on a background bed" (still never zeros). generate_config.py
+# --realistic emits the matching ambience-only background_paths + rir_paths.
+# Proven on all_set: 31/33 (93.9%) continuous-mode recall vs 0/33 for the old
+# silence-pad model. See streaming-recall-gap / context-fix-augmentation notes.
+COPY patches/augment_realistic.py /tmp/augment_realistic.py
 RUN augment=$(python -c "import livekit.wakeword.data.augment as m; print(m.__file__)") \
-    && cp /tmp/augment_ctxfix.py "$augment"
+    && cp /tmp/augment_realistic.py "$augment"
 
 WORKDIR /work
 # configs/, data/ (downloaded corpora), and output/ (trained .onnx) are

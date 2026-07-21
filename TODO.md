@@ -7,7 +7,27 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [~] Realistic-positive compositing (successor to the context-fix re-mix).
+- [x] Realistic-positive compositing (successor to the context-fix re-mix).
+  **RESULT (2026-07-21): fixes the streaming gap.** Full `all_set` train
+  (50k samples / 120k steps) via
+  `train_realistic.sh trainer/configs/all_set_realistic.yaml`;
+  `compare_models.py --mode full` (the real continuous test) over 5 `test_`
+  takes: new `all_set` **31/33 (93.9%) recall @ thr 0.5**, mean peak 0.879, vs
+  `all_set_prev_silencepad` **0/33 (0%)**, peak 0.026. False fires are the cost:
+  20 @ 0.5, 11 @ 0.7 (84.8% recall), 11 @ 0.85 (75.8%) — tune threshold +
+  detection-window for the deployment tradeoff.
+  **BAKED IN (2026-07-21):** every app/sync-server training run now composites
+  realistically with no bind-mount. `Dockerfile.trainer` copies
+  `augment_realistic.py` over `livekit.wakeword.data.augment` (keeps the 0001
+  patch for the `workers` config field); `generate_config.py --realistic` emits
+  ambience-only `background_paths` + `rir_paths: [./data/rirs]`; `train_job.sh`
+  already writes the per-run sidecar and sets `AUG_REALISTIC_CONFIG`, and the
+  sync-server forwards the app's knobs. Image `livekit-wakeword-trainer:latest`
+  rebuilt + verified (module carries `RealisticCfg`/`AUG_REALISTIC_CONFIG`).
+  Retired `augment_ctxfix.py`, `train_ctxfix.sh`, `all_set_ctx.yaml`,
+  `smoke_ctx.yaml`. **Next: (b) drive down false fires (threshold/width, or
+  ordinary-word TTS filler — synthetic filler currently draws from the near-miss
+  negative pool, not ordinary words).**
   `patches/augment_ctxfix.py` only re-mixed background across the window and
   *overlapped* real speech ON TOP of the synthetic phrase at similar level — two
   voices at once, not how a trigger actually hits a mic. New
@@ -25,13 +45,7 @@ discovered. Prefer small, actionable items with clear status.
   `patches/augment_realistic.py`, `configs/all_set_realistic.yaml`,
   `configs/all_set.realistic.yaml`, `configs/hey_buddy.realistic.yaml`,
   `scripts/train_realistic.sh`. Geometry unit-tested (end/start placement,
-  filler+gap, 0 dB no-clip, overlong-voice tail preserved); in-container smoke on
-  real files in progress. **Next: full `all_set` train via `train_realistic.sh`,
-  then verify continuous/full-mode recall with `/score` (the real test — see
-  [streaming-recall-gap]). Known gap: synthetic filler currently draws from the
-  near-miss negative pool, not ordinary-word TTS; real-speech filler covers
-  ordinary words. If this beats ctxfix, bake into `Dockerfile.trainer` +
-  `generate_config.py` and retire `augment_ctxfix.py`.**
+  filler+gap, 0 dB no-clip, overlong-voice tail preserved).
 
 - [x] Training queue + cancel + no-recording training. Three fixes shipped
   together: (1) the sync-server now backs training with a `train_queue` DB table

@@ -91,7 +91,7 @@ def main() -> int:
             "leaves. That zero lead is a cue that never occurs on a live mic and "
             "is the cause of the streaming-recall gap (99%% padded eval, ~1%% "
             "mid-sentence). The recipe only bites if the trainer image carries "
-            "trainer/patches/augment_ctxfix.py over livekit.wakeword.data.augment."
+            "trainer/patches/augment_realistic.py over livekit.wakeword.data.augment."
         ),
     )
     parser.add_argument(
@@ -232,6 +232,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     # clip.
     realistic = getattr(args, "realistic", False)
     background_paths = None
+    rir_paths = None
     if args.context_fix:
         background_paths = ["./data/backgrounds"]
         if realistic:
@@ -241,6 +242,9 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
             background_paths.append(f"./data/real/{slug}/background")
             if real_samples_dir:
                 background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/background")
+            # Room impulse responses so the background bed (and composited clip)
+            # get realistic reverb — augment_realistic.apply_rir reads these.
+            rir_paths = ["./data/rirs"]
         else:
             if args.token_type == "end" and real_samples_dir:
                 background_paths.append(f"{real_samples_dir.rstrip('/')}/{slug}/negative")
@@ -254,6 +258,7 @@ def config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "output_dir": "./output",
         "real_samples_dir": real_samples_dir,
         "background_paths": background_paths,
+        "rir_paths": rir_paths,
         "token_type": args.token_type,
         "batch_n_per_class": batch_n_per_class,
         "header_comment": header_comment,
@@ -307,10 +312,15 @@ def render_yaml(config: dict[str, Any]) -> str:
         lines.append("augmentation:")
         lines.append(f"  # Leading-context fix ({token_type} token: {lead}): re-mix these into")
         lines.append("  # the full 2s window after placement so the pre-phrase region carries")
-        lines.append("  # real sound, not zeros. Needs the augment_ctxfix patch in the image.")
+        lines.append("  # real sound, not zeros. Needs the augment_realistic patch in the image.")
         lines.append("  background_paths:")
         for path in config["background_paths"]:
             lines.append(f"    - {yaml_string(path)}")
+        if config.get("rir_paths"):
+            lines.append("  # Room impulse responses: reverb for the background bed / composited clip.")
+            lines.append("  rir_paths:")
+            for path in config["rir_paths"]:
+                lines.append(f"    - {yaml_string(path)}")
     lines.extend(
         [
             "",
