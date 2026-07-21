@@ -7,6 +7,15 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [ ] Non-lexical wake words (sounds, not words, e.g. fast "beep beep").
+  Whisper returns no words, so word-timestamp slicing of positive takes yields
+  nothing. Add a **per-take energy/VAD fallback for positive takes only**: when
+  a positive take transcribes empty, segment it by sound-burst-vs-silence energy
+  and slice each burst into a positive clip (positives are already recorded as
+  repeated bursts with gaps). Whisper stays the default for real-word positives
+  and all negatives. Needs a project flag (or empty-transcript auto-detect) to
+  select the energy path. See `docs/BULK_SCRIPTED_COLLECTION.md`.
+
 - [x] Realistic-positive compositing (successor to the context-fix re-mix).
   **RESULT (2026-07-21): fixes the streaming gap.** Full `all_set` train
   (50k samples / 120k steps) via
@@ -209,6 +218,21 @@ discovered. Prefer small, actionable items with clear status.
     re-scores. `nocache=1` forces a fresh run; deleting a recording clears its
     cached curves. Verified: cold 9.2s → warm ~0.00s (identical curve, same
     TP/FN), survives a container restart (cache is in the SQLite DB).
+  - [x] Persisted per-model grades + Model test statistics + expandable cards.
+    The server now stores a graded result per test take per model in a new
+    `score_grades` table (schema v8): representative `peak_score`, threshold, and
+    the Whisper-located TP/FN/FP, keyed by `(recording_id, model_fp, mode)` so
+    each take's score on each model survives without re-running the scorer.
+    `compute_score` (factored out of `score_recording`) writes it on every score;
+    a new `POST /score-all/:slug` grades every test take against the selected
+    model in one request, and `GET /score-grades/:slug` returns the stored grades
+    plus model totals (hits/misses/false alarms). App: model-version rows are now
+    tap-to-expand, showing size (small/medium/large), type, steps, eval, and
+    real-clip counts; each test take is an expandable card showing its stored
+    peak score as a color chip (green caught / red missed / orange false alarm)
+    with a visible Delete button; the Model test card has a "Score all takes"
+    button and a hits/misses/false-alarms statistics tile row. Deleting a take
+    clears its grades too.
   - [ ] Host-runnable unit test for the scorer (currently validated only via
     the container smoke test).
   First model under test: `output/all_set/all_set.onnx` — see

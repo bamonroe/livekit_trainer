@@ -179,37 +179,53 @@ tools can rebalance or inspect the dataset.
 
 Build the Android app as a real collection tool, not a demo.
 
-The app is **bulk-import only** for speech. Data is collected by recording a
-single long scripted bulk WAV per take, then letting the sync server transcribe
-and slice it into positive and negative clips using Whisper word timestamps.
-There is no one-at-a-time short-prompt recording flow, no per-clip label picker,
-and no manual Export/Sync of individual clips; that orphaned path was removed. Do
-not reintroduce it without an explicit decision to change direction.
+The app is **bulk-import only** for speech. Data is collected by recording long
+takes and letting the sync server slice them into clips; there is no
+one-at-a-time short-prompt recording flow, no per-clip label picker, and no
+manual Export/Sync of individual clips. That orphaned path was removed. Do not
+reintroduce it without an explicit decision to change direction.
 
-There is one additional recording mode: **background noise capture**. A separate
-"Record background" control records a long ambient/non-speech take (room tone,
-silence, appliances, typing). It is *not* transcribed; the sync server chops it
-into fixed-length background clips. This is an intentional second long-take mode,
-not the removed per-clip flow — keep it.
+The Record page is now **four straight recorders, one per take kind** — it is no
+longer a single mixed randomized script read in one take. Each recorder captures
+a plain record-and-stop take of exactly one kind:
+
+- **Positives** — say the wake phrase over and over with a short gap between each
+  repetition. The server slices every clean repetition into its own positive
+  clip.
+- **Negatives** — say ordinary, unrelated sentences. The server chops the take
+  into negative clips.
+- **Hard negatives** — the only prompted recorder: it lists near-miss phrases to
+  read aloud a few times each, and files the whole take as hard negatives. The
+  prompt list is guidance for the reader; the server slices by take kind, not by
+  matching those words.
+- **Background noise** — a long ambient/non-speech take (room tone, near-silence,
+  appliances, typing). It is *not* transcribed; the server chops it into
+  fixed-length background clips.
+
+Speech takes (positive/negative/hard_negative) are transcribed and sliced with
+Whisper word timestamps. Background takes are chopped by fixed length. Keep both
+long-take modes; do not fold them back into a single scripted read.
+
+**Non-lexical wake words (sounds, not words).** Some wake words are fast or
+non-lexical — e.g. "beep beep" said quickly — and Whisper returns no words for
+them, so word-timestamp slicing produces nothing. The plan for these is a
+**per-take energy/VAD fallback for positive takes only**: when Whisper finds no
+usable words in a positive take, fall back to segmenting the take by
+sound-burst-versus-gap energy and slicing each burst into a positive clip. This
+works because positives are already recorded as repeated bursts with gaps.
+Whisper stays the default everywhere it works — real-word positives, and all
+negatives — and the energy path is only a fallback, never a replacement.
 
 Core workflows:
 
 - Create and edit wake-word projects.
-- Generate a randomized bulk collection script for a project.
-- Record a bulk WAV of the whole script in one take.
-- Sync the bulk recording to the server, which aligns and slices it.
-- Review the generated slices per bulk recording: see each slice's transcript,
+- Record a straight per-kind take (positive, negative, hard negative, or
+  background) in one take.
+- Sync recordings to the server, which slices each take by its kind.
+- Review the generated slices per recording: see each slice's transcript,
   confidence, and source timing; replay it; and delete bad slices.
 - Inspect the source alignment (word timings and cut boundaries) for a recording.
-- Show per-wake-word bulk recording and slice counts.
-
-Bulk script workflow:
-
-- Generate a randomized bulk script per wake-word project.
-- Mix wake-phrase placements, near-miss hard negatives, and ordinary sentences
-  so the take yields positives and negatives from one recording.
-- Avoid predictable ordering so the speaker does not fall into a fixed cadence.
-- Let the number of wake placements per script be configurable.
+- Show per-wake-word recording and slice counts.
 - Support correction batches created from model evaluation mistakes.
 
 Design expectations:

@@ -1,8 +1,29 @@
 # Bulk Scripted Collection
 
-Goal: collect many wake-word examples quickly by recording one long scripted
-reading, aligning the recording to words, and slicing it into focused training
-clips.
+> **Current state (superseded flow below).** The app no longer records one long
+> *mixed* scripted reading that interleaves positives, negatives, and hard
+> negatives in a single take. The Record page is now **four straight recorders,
+> one per take kind**: positives (say the wake phrase repeatedly with gaps),
+> negatives (ordinary sentences), hard negatives (prompted near-miss phrases),
+> and background noise. The server still transcribes speech takes with Whisper
+> and slices by kind; background is chopped by fixed length. The "Idea" and
+> "First Implementation" sections below describe the original single-script
+> design and are kept for history. The still-live parts are: Whisper word-time
+> slicing, padding/validation, provenance, and slice review.
+
+## Non-Lexical Wake Words (planned)
+
+Some wake words are sounds, not words — e.g. a fast "beep beep" — and Whisper
+returns no words for them, so word-timestamp slicing yields nothing.
+
+Plan: add a **per-take energy/VAD fallback for positive takes only**. When
+Whisper finds no usable words in a positive take, segment the take by
+sound-burst-versus-silence energy and slice each burst into a positive clip.
+Positives are already recorded as repeated bursts with short gaps, so the burst
+structure is exactly what the energy detector keys on. Whisper remains the
+default for every take where it works (real-word positives and all negatives);
+the energy path is a fallback, never a replacement. A project should carry a
+flag (or auto-detection on empty transcript) that selects the energy path.
 
 ## Idea
 
