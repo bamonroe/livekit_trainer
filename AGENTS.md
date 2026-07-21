@@ -294,6 +294,12 @@ optional for the Android collection app.
 - Add or update Dockerfiles when new system dependencies are needed.
 - Prefer copying generic trainer/runtime pieces into this repo before modifying
   them.
+- After changing the sync-server (or any server) code, rebuild its Docker image
+  so the built image matches the source (`docker compose build sync-server`).
+  Rebuild the image, but do not restart or recreate the running container as
+  part of this rule; leave the live container running until a restart is
+  actually wanted. Otherwise the container keeps running stale code that matches
+  the last built image even though the source has moved on.
 - Do not edit sibling repos unless the user explicitly asks.
 - Do not commit large generated corpora or model outputs unless the repo policy
   is changed.
