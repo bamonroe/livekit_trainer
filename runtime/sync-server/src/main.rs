@@ -50,6 +50,25 @@ const BACKGROUND_MIN_CHUNK_SECONDS: f64 = 1.0;
 // background sources are re-chunked deterministically instead of Whisper-aligned.
 const BACKGROUND_SCRIPT_MARKER: &str = "__background_noise__";
 
+// Energy/VAD fallback for non-lexical positive takes (sounds, not words — e.g. a
+// fast "beep beep") where Whisper returns no words, so word-timestamp slicing
+// finds nothing. Positives are recorded as repeated sound bursts with ~1s gaps,
+// so we segment the take by sound-burst-vs-silence energy and cut each burst.
+// Frames are short RMS windows; a burst opens above `OPEN` and closes below
+// `CLOSE` (hysteresis) of the way from the noise floor to the loudest frame.
+const ENERGY_FRAME_SECONDS: f64 = 0.02;
+const ENERGY_OPEN_FRACTION: f64 = 0.22;
+const ENERGY_CLOSE_FRACTION: f64 = 0.12;
+// Bursts separated by a gap this short are merged into one clip, so the two
+// quick sounds inside one "beep beep" stay together while the ~1s gap between
+// repetitions still splits them into separate positives.
+const ENERGY_MERGE_GAP_SECONDS: f64 = 0.35;
+// A voiced run shorter than this is treated as noise, not a real sound burst.
+const ENERGY_MIN_BURST_SECONDS: f64 = 0.08;
+// Padding cut around each detected burst so the onset/tail is not clipped.
+const ENERGY_LEAD_PADDING_SECONDS: f64 = 0.10;
+const ENERGY_TAIL_PADDING_SECONDS: f64 = 0.18;
+
 #[derive(Clone)]
 struct AppState {
     data_root: Arc<PathBuf>,
@@ -301,6 +320,70 @@ struct ScoreTarget {
     detected: bool,
 }
 
+/// One test take's stored grade against a model, as returned to the app. Mirrors
+/// `db::ScoreGrade` with the recording id kept so the app can match it to a card.
+#[derive(Debug, Serialize)]
+struct ScoreGradeItem {
+    recording_id: String,
+    run: Option<String>,
+    threshold: f64,
+    peak_score: f64,
+    max_score: f64,
+    has_target: bool,
+    target_count: i64,
+    true_positives: i64,
+    false_negatives: i64,
+    false_positives: i64,
+    detected: bool,
+    scored_at_ms: i64,
+}
+
+impl From<db::ScoreGrade> for ScoreGradeItem {
+    fn from(g: db::ScoreGrade) -> Self {
+        Self {
+            recording_id: g.recording_id,
+            run: g.run_id,
+            threshold: g.threshold,
+            peak_score: g.peak_score,
+            max_score: g.max_score,
+            has_target: g.has_target,
+            target_count: g.target_count,
+            true_positives: g.true_positives,
+            false_negatives: g.false_negatives,
+            false_positives: g.false_positives,
+            detected: g.detected,
+            scored_at_ms: g.created_at_ms,
+        }
+    }
+}
+
+/// Model-wide totals across all graded test takes: how many takes exist, how
+/// many are graded against this model, and the summed target/miss/false-positive
+/// counts that headline the Model test view.
+#[derive(Debug, Serialize)]
+struct GradeTotals {
+    test_takes: usize,
+    graded: usize,
+    targets: i64,
+    true_positives: i64,
+    false_negatives: i64,
+    false_positives: i64,
+    detections: usize,
+}
+
+/// The Model test view's grade payload: per-take grades plus the model totals,
+/// for one model (`run` null = current) in one detection mode.
+#[derive(Debug, Serialize)]
+struct ModelGradesResponse {
+    status: &'static str,
+    wake_word_slug: String,
+    run: Option<String>,
+    model_fp: String,
+    mode: String,
+    totals: GradeTotals,
+    grades: Vec<ScoreGradeItem>,
+}
+
 /// The scorer service's `/score` reply: parallel time/score arrays. The scorer
 /// emits fractional milliseconds, so times are floats.
 #[derive(Debug, Deserialize)]
@@ -539,6 +622,8 @@ async fn main() {
             get(bulk_source_audio),
         )
         .route("/score/:slug/:recording_id", get(score_recording))
+        .route("/score-all/:slug", post(score_all_test_takes))
+        .route("/score-grades/:slug", get(model_test_grades))
         .route("/models", get(list_models))
         .route("/models/runs", get(list_model_runs))
         .route("/train/:slug", post(start_training))
@@ -1126,33 +1211,67 @@ async fn score_recording(
     let scorer_url = resolve_scorer_url(&state, &headers).ok_or_else(|| {
         AppError::bad_request("scorer not configured; set SCORER_SERVER_URL or x-scorer-server-url")
     })?;
+    let force = params.get("nocache").map(String::as_str) == Some("1");
 
+    let response = compute_score(
+        &state,
+        &scorer_url,
+        &slug,
+        &recording_id,
+        mode,
+        step_ms,
+        keep_ms,
+        threshold,
+        run.as_deref(),
+        force,
+    )
+    .await?;
+    Ok(Json(response))
+}
+
+/// Score one stored recording against a model, cache its curve, persist the
+/// derived grade (so the take's score on this model survives without re-running
+/// the scorer), and return the full response. Shared by the single-recording
+/// endpoint and the bulk "score all test takes" endpoint. `force` bypasses the
+/// cached curve (the `nocache=1` path).
+#[allow(clippy::too_many_arguments)]
+async fn compute_score(
+    state: &AppState,
+    scorer_url: &str,
+    slug: &str,
+    recording_id: &str,
+    mode: &str,
+    step_ms: u64,
+    keep_ms: u64,
+    threshold: f64,
+    run: Option<&str>,
+    force: bool,
+) -> Result<ScoreResponse, AppError> {
     let (phrase, words) = {
         let conn = state.db.lock().expect("db lock poisoned");
-        let phrase = db::project_phrase(&conn, &slug)
+        let phrase = db::project_phrase(&conn, slug)
             .map_err(db_error)?
             .map(|(phrase, _external_id)| phrase)
             .unwrap_or_else(|| slug.replace('_', " "));
-        let words = db::current_transcript_words(&conn, &recording_id).map_err(db_error)?;
+        let words = db::current_transcript_words(&conn, recording_id).map_err(db_error)?;
         (phrase, words)
     };
 
     // Fingerprint the trained model so a cached curve is reused only while the
     // model that produced it is unchanged; retraining flips the fingerprint and
-    // the next request re-scores. `nocache=1` forces a fresh run. An archived run
-    // is immutable, so its id alone is a stable fingerprint and keeps each run's
-    // cached curves distinct from the current model's and from each other.
-    let model_fp = match &run {
+    // the next request re-scores. An archived run is immutable, so its id alone
+    // is a stable fingerprint and keeps each run's cached curves distinct from
+    // the current model's and from each other.
+    let model_fp = match run {
         Some(r) => format!("run-{r}"),
-        None => model_fingerprint(&state.models_root, &slug),
+        None => model_fingerprint(&state.models_root, slug),
     };
-    let force = params.get("nocache").map(String::as_str) == Some("1");
 
     let cached = if force {
         None
     } else {
         let conn = state.db.lock().expect("db lock poisoned");
-        db::cached_score_curve(&conn, &recording_id, mode, step_ms, keep_ms, &model_fp)
+        db::cached_score_curve(&conn, recording_id, mode, step_ms, keep_ms, &model_fp)
             .map_err(db_error)?
     };
 
@@ -1161,17 +1280,17 @@ async fn score_recording(
     } else {
         let wav_path = state
             .data_root
-            .join(&slug)
+            .join(slug)
             .join("bulk_source")
-            .join(format!("{}.wav", safe_filename(&recording_id)));
+            .join(format!("{}.wav", safe_filename(recording_id)));
         let wav = fs::read(&wav_path)
             .map_err(|_| AppError::bad_request(format!("no source audio for {recording_id}")))?;
 
-        let curve = run_scorer(&scorer_url, wav, &slug, run.as_deref(), mode, step_ms, keep_ms).await?;
+        let curve = run_scorer(scorer_url, wav, slug, run, mode, step_ms, keep_ms).await?;
         let conn = state.db.lock().expect("db lock poisoned");
         db::store_score_curve(
             &conn,
-            &recording_id,
+            recording_id,
             mode,
             step_ms,
             keep_ms,
@@ -1190,12 +1309,43 @@ async fn score_recording(
     let false_negatives = targets.len() - true_positives;
     let false_positives = count_false_positives(&curve, &targets, threshold);
 
-    Ok(Json(ScoreResponse {
+    // A representative single score for the take: the peak over located target
+    // phrases, or the whole-curve maximum when the take has no target phrase (so
+    // a negative take still shows how hot the model got). Persist the grade.
+    let max_score = curve.scores.iter().cloned().fold(0.0_f64, f64::max);
+    let has_target = !targets.is_empty();
+    let target_peak = targets.iter().map(|t| t.peak_score).fold(0.0_f64, f64::max);
+    let peak_score = if has_target { target_peak } else { max_score };
+    {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::store_score_grade(
+            &conn,
+            &model_fp,
+            mode,
+            &db::ScoreGrade {
+                recording_id: recording_id.to_string(),
+                run_id: run.map(str::to_string),
+                threshold,
+                peak_score,
+                max_score,
+                has_target,
+                target_count: targets.len() as i64,
+                true_positives: true_positives as i64,
+                false_negatives: false_negatives as i64,
+                false_positives: false_positives as i64,
+                detected: peak_score >= threshold,
+                created_at_ms: now_ms(),
+            },
+        )
+        .map_err(db_error)?;
+    }
+
+    Ok(ScoreResponse {
         status: "ok",
-        wake_word_slug: slug,
-        source_recording: recording_id,
+        wake_word_slug: slug.to_string(),
+        source_recording: recording_id.to_string(),
         phrase,
-        run,
+        run: run.map(str::to_string),
         mode: mode.to_string(),
         window_ms: 2000,
         step_ms,
@@ -1208,6 +1358,143 @@ async fn score_recording(
         true_positives,
         false_negatives,
         false_positives,
+    })
+}
+
+/// Query params shared by the score endpoints: detection mode and its scan
+/// params plus the threshold and optional archived run id. Parsed once so the
+/// single and bulk endpoints agree on defaults.
+struct ScoreParams {
+    mode: &'static str,
+    step_ms: u64,
+    keep_ms: u64,
+    threshold: f64,
+    run: Option<String>,
+}
+
+fn parse_score_params(query: Option<&str>) -> Result<ScoreParams, AppError> {
+    let params = parse_query(query);
+    let mode = match params.get("mode").map(String::as_str) {
+        Some("full") | None => "full",
+        Some("reset") => "reset",
+        Some(other) => return Err(AppError::bad_request(format!("unknown mode: {other}"))),
+    };
+    let step_ms = params
+        .get("step_ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(if mode == "reset" { 40 } else { 10 });
+    let keep_ms = params
+        .get("keep_ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(700);
+    let threshold = params
+        .get("threshold")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.5);
+    let run = match params.get("run").map(String::as_str) {
+        Some(r) if is_safe_run_id(r) => Some(r.to_string()),
+        Some(_) => return Err(AppError::bad_request("unsafe run id")),
+        None => None,
+    };
+    Ok(ScoreParams { mode, step_ms, keep_ms, threshold, run })
+}
+
+/// Score every test take for a wake word against one model in a single request,
+/// so the Model test view can grade the whole set without the app firing a
+/// score per take. Runs the takes one at a time (the scorer is a single-GPU
+/// service) and returns the resulting grades plus the model totals.
+async fn score_all_test_takes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ModelGradesResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request("unsafe score path"));
+    }
+    let sp = parse_score_params(query.as_deref())?;
+    let scorer_url = resolve_scorer_url(&state, &headers).ok_or_else(|| {
+        AppError::bad_request("scorer not configured; set SCORER_SERVER_URL or x-scorer-server-url")
+    })?;
+    let ids = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::test_take_ids(&conn, &slug).map_err(db_error)?
+    };
+    for id in &ids {
+        // A take with no source audio or transcript would fail; skip it so one
+        // bad take can't sink the whole batch.
+        if let Err(error) = compute_score(
+            &state,
+            &scorer_url,
+            &slug,
+            id,
+            sp.mode,
+            sp.step_ms,
+            sp.keep_ms,
+            sp.threshold,
+            sp.run.as_deref(),
+            false,
+        )
+        .await
+        {
+            eprintln!("score_all: skipping {id}: {}", error.message);
+        }
+    }
+    grades_response(&state, &slug, sp.mode, sp.run.as_deref())
+}
+
+/// The stored grades for a model's test takes plus the model totals, read back
+/// without re-running the scorer. Backs the Model test view's per-take cards and
+/// its misses / false-positive statistics.
+async fn model_test_grades(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<ModelGradesResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request("unsafe score path"));
+    }
+    let sp = parse_score_params(query.as_deref())?;
+    grades_response(&state, &slug, sp.mode, sp.run.as_deref())
+}
+
+/// Assemble the grades response: every stored grade for this model plus totals.
+fn grades_response(
+    state: &AppState,
+    slug: &str,
+    mode: &str,
+    run: Option<&str>,
+) -> Result<Json<ModelGradesResponse>, AppError> {
+    let model_fp = match run {
+        Some(r) => format!("run-{r}"),
+        None => model_fingerprint(&state.models_root, slug),
+    };
+    let (test_takes, grades) = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        let ids = db::test_take_ids(&conn, slug).map_err(db_error)?;
+        let grades = db::grades_for_model(&conn, slug, &model_fp, mode).map_err(db_error)?;
+        (ids.len(), grades)
+    };
+    let grades: Vec<ScoreGradeItem> = grades.into_iter().map(ScoreGradeItem::from).collect();
+    let totals = GradeTotals {
+        test_takes,
+        graded: grades.len(),
+        targets: grades.iter().map(|g| g.target_count).sum(),
+        true_positives: grades.iter().map(|g| g.true_positives).sum(),
+        false_negatives: grades.iter().map(|g| g.false_negatives).sum(),
+        false_positives: grades.iter().map(|g| g.false_positives).sum(),
+        detections: grades.iter().filter(|g| g.detected).count(),
+    };
+    Ok(Json(ModelGradesResponse {
+        status: "ok",
+        wake_word_slug: slug.to_string(),
+        run: run.map(str::to_string),
+        model_fp,
+        mode: mode.to_string(),
+        totals,
+        grades,
     }))
 }
 
@@ -2237,6 +2524,28 @@ async fn align_one_recording(
     };
     let words = whisper_words(&whisper);
     if words.is_empty() {
+        // Non-lexical positive take (e.g. a fast "beep beep") — Whisper heard no
+        // words, so fall back to energy/VAD burst slicing for positives only.
+        // Negatives and hard negatives with no words carry no useful training
+        // data, so they keep the plain warning-and-skip behavior.
+        if kind.trim() == "positive" {
+            return slice_positive_by_energy(
+                recording_id,
+                script,
+                recorded_at,
+                duration_ms,
+                source,
+                slug,
+                phrase,
+                external_id,
+                dest_root,
+                db,
+                whisper.text.trim(),
+                whisper_url,
+                capture,
+                summary,
+            );
+        }
         summary.warnings.push(format!(
             "{}: Whisper returned no word timestamps",
             recording_id
@@ -2669,6 +2978,213 @@ fn slice_background_recording(
         db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
     }
 
+    Ok(())
+}
+
+/// Segment a mono PCM take into sound-burst windows by short-frame RMS energy.
+/// Pure (no audio IO) so the burst detection is unit-testable. Returns padded,
+/// clamped `(start, end)` spans in seconds, in order. Used as the positive-take
+/// fallback when Whisper finds no words: each repeated sound burst (e.g. one
+/// fast "beep beep") becomes one positive clip.
+fn energy_burst_bounds(samples: &[i16], sample_rate: f64) -> Vec<(f64, f64)> {
+    if sample_rate <= 0.0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let frame_len = ((ENERGY_FRAME_SECONDS * sample_rate).round() as usize).max(1);
+    // Short-frame RMS envelope. Frame `i` covers `[i*frame_len, ..)` samples.
+    let mut rms: Vec<f64> = Vec::new();
+    let mut i = 0;
+    while i < samples.len() {
+        let end = (i + frame_len).min(samples.len());
+        let mut sum = 0.0f64;
+        for &s in &samples[i..end] {
+            let v = s as f64;
+            sum += v * v;
+        }
+        rms.push((sum / (end - i) as f64).sqrt());
+        i += frame_len;
+    }
+    if rms.is_empty() {
+        return Vec::new();
+    }
+    // Noise floor as a low percentile of frame energy; peak as the loudest frame.
+    let mut sorted = rms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = sorted[(sorted.len() as f64 * 0.10) as usize];
+    let peak = *sorted.last().unwrap();
+    // A flat take (no burst rises meaningfully above its own floor) yields nothing.
+    if peak - floor < 1.0 {
+        return Vec::new();
+    }
+    let open = floor + ENERGY_OPEN_FRACTION * (peak - floor);
+    let close = floor + ENERGY_CLOSE_FRACTION * (peak - floor);
+    let frame_secs = frame_len as f64 / sample_rate;
+
+    // Hysteresis walk: open a burst above `open`, close it below `close`.
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut voiced = false;
+    let mut run_start = 0usize;
+    for (idx, &energy) in rms.iter().enumerate() {
+        if voiced {
+            if energy < close {
+                runs.push((run_start, idx));
+                voiced = false;
+            }
+        } else if energy >= open {
+            voiced = true;
+            run_start = idx;
+        }
+    }
+    if voiced {
+        runs.push((run_start, rms.len()));
+    }
+
+    // Merge runs whose silent gap is short enough to be inside one utterance,
+    // then drop anything too short to be a real burst.
+    let total = samples.len() as f64 / sample_rate;
+    let mut bursts: Vec<(f64, f64)> = Vec::new();
+    for (start_frame, end_frame) in runs {
+        let start = start_frame as f64 * frame_secs;
+        let end = (end_frame as f64 * frame_secs).min(total);
+        match bursts.last_mut() {
+            Some(last) if start - last.1 < ENERGY_MERGE_GAP_SECONDS => last.1 = end,
+            _ => bursts.push((start, end)),
+        }
+    }
+    bursts
+        .into_iter()
+        .filter(|(start, end)| end - start >= ENERGY_MIN_BURST_SECONDS)
+        .map(|(start, end)| {
+            (
+                (start - ENERGY_LEAD_PADDING_SECONDS).max(0.0),
+                (end + ENERGY_TAIL_PADDING_SECONDS).min(total),
+            )
+        })
+        .collect()
+}
+
+/// Slice a non-lexical positive take into positive clips by energy bursts, used
+/// when Whisper returned no words. Mirrors `slice_background_recording`: stores
+/// the source WAV, clears stale slices, writes one positive per detected burst,
+/// and persists the alignment (with the resolved `positive` kind so reprocess
+/// re-enters here). No per-slice Whisper verification — there are no words to
+/// confirm against, which is the whole reason this path exists.
+#[allow(clippy::too_many_arguments)]
+fn slice_positive_by_energy(
+    recording_id: &str,
+    script: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    slug: &str,
+    phrase: &str,
+    external_id: Option<&str>,
+    dest_root: &Path,
+    db: &Mutex<Connection>,
+    transcript_text: &str,
+    whisper_url: &str,
+    capture: &db::CaptureMeta,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    let (source_wav, source_sha256) = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(stored) => stored,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
+        }
+    };
+    let old_paths = {
+        let conn = db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
+    };
+    for old in old_paths {
+        let old = PathBuf::from(old);
+        if old.is_file() {
+            let _ = fs::remove_file(old);
+        }
+    }
+
+    // Read the whole take as mono 16-bit PCM to compute the energy envelope.
+    let mut reader = WavReader::open(source)
+        .map_err(|error| AppError::bad_request(format!("cannot read WAV for slicing: {error}")))?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_format != SampleFormat::Int || spec.bits_per_sample != 16 {
+        return Err(AppError::bad_request(
+            "energy slicing requires mono 16-bit PCM WAV",
+        ));
+    }
+    let samples: Vec<i16> = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::bad_request(format!("bad WAV sample while slicing: {error}")))?;
+    let bursts = energy_burst_bounds(&samples, spec.sample_rate as f64);
+    if bursts.is_empty() {
+        summary.warnings.push(format!(
+            "{}: no sound bursts found for energy-sliced positive take",
+            recording_id
+        ));
+    }
+
+    let mut slice_rows = Vec::new();
+    for (start, end) in bursts {
+        let (start, end) = clamp_slice_span(start, end, true);
+        let clip_id = bulk_clip_hash_id(
+            recording_id,
+            recorded_at,
+            duration_ms,
+            "positive",
+            start,
+            end,
+            &[],
+        );
+        let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(phrase));
+        let dest = dest_root.join("positive").join(&file_name);
+        if write_wav_slice(source, &dest, start, end)? {
+            slice_rows.push(build_slice_row(
+                &clip_id,
+                "positive",
+                "positive",
+                &dest,
+                &file_name,
+                start,
+                end,
+                &[],
+            ));
+            summary.positives += 1;
+        }
+    }
+
+    let prompts = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let alignment = db::RecordingAlignment {
+        recording_id: recording_id.to_string(),
+        project_slug: slug.to_string(),
+        phrase: phrase.to_string(),
+        external_id: external_id.map(ToString::to_string),
+        script: script.to_string(),
+        kind: "positive".to_string(),
+        recorded_at: recorded_at.to_string(),
+        duration_ms: duration_ms as i64,
+        source_wav: source_wav.to_string_lossy().to_string(),
+        source_sha256: Some(source_sha256),
+        bundle: None,
+        transcript_text: transcript_text.to_string(),
+        whisper_url: Some(whisper_url.to_string()),
+        words: Vec::new(),
+        prompts,
+        slices: slice_rows,
+        capture: capture.clone(),
+    };
+    {
+        let mut conn = db.lock().expect("db lock poisoned");
+        db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -4459,6 +4975,50 @@ mod tests {
         let (start, end) = clamp_slice_span(0.0, 1.8, false);
         assert!((start - 0.0).abs() < 1e-9);
         assert!((end - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn energy_burst_bounds_splits_repeated_bursts() {
+        let sr = 16000.0;
+        let mut samples: Vec<i16> = Vec::new();
+        let silence = |secs: f64, v: &mut Vec<i16>| {
+            for _ in 0..(secs * sr) as usize {
+                v.push(0);
+            }
+        };
+        let tone = |secs: f64, v: &mut Vec<i16>| {
+            for i in 0..(secs * sr) as usize {
+                v.push(if i % 2 == 0 { 8000 } else { -8000 });
+            }
+        };
+        // Lead silence, then a "beep beep" (two 0.10s tones with a 0.10s internal
+        // gap — shorter than the merge gap, so they fuse into one clip), a ~1s
+        // gap between repetitions, then a second "beep beep".
+        silence(0.30, &mut samples);
+        tone(0.10, &mut samples);
+        silence(0.10, &mut samples);
+        tone(0.10, &mut samples);
+        silence(1.00, &mut samples);
+        tone(0.10, &mut samples);
+        silence(0.10, &mut samples);
+        tone(0.10, &mut samples);
+        silence(0.30, &mut samples);
+
+        let bursts = energy_burst_bounds(&samples, sr);
+        assert_eq!(bursts.len(), 2, "expected two merged beep-beep bursts, got {bursts:?}");
+        // First burst: the two beeps are merged into a single span near 0.30s.
+        assert!(bursts[0].0 > 0.15 && bursts[0].0 < 0.31);
+        assert!(bursts[0].1 - bursts[0].0 > 0.25);
+        // Second burst lands well after the ~1s inter-repetition gap.
+        assert!(bursts[1].0 > 1.4);
+    }
+
+    #[test]
+    fn energy_burst_bounds_ignores_flat_take() {
+        // Pure silence and a low steady hiss both lack a burst rising above the
+        // floor, so nothing is sliced.
+        assert!(energy_burst_bounds(&vec![0i16; 32000], 16000.0).is_empty());
+        assert!(energy_burst_bounds(&vec![25i16; 32000], 16000.0).is_empty());
     }
 
     #[test]

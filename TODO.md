@@ -7,14 +7,21 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] Non-lexical wake words (sounds, not words, e.g. fast "beep beep").
+- [~] Non-lexical wake words (sounds, not words, e.g. fast "beep beep").
   Whisper returns no words, so word-timestamp slicing of positive takes yields
-  nothing. Add a **per-take energy/VAD fallback for positive takes only**: when
-  a positive take transcribes empty, segment it by sound-burst-vs-silence energy
-  and slice each burst into a positive clip (positives are already recorded as
-  repeated bursts with gaps). Whisper stays the default for real-word positives
-  and all negatives. Needs a project flag (or empty-transcript auto-detect) to
-  select the energy path. See `docs/BULK_SCRIPTED_COLLECTION.md`.
+  nothing.
+  - [x] Server energy/VAD fallback for positive takes only. When a positive
+    take transcribes empty, `slice_positive_by_energy` segments it by
+    sound-burst-vs-silence RMS energy (`energy_burst_bounds`, hysteresis + gap
+    merge so each fast "beep beep" is one clip) and cuts each burst into a
+    positive clip. Auto-detect on empty transcript; no project flag needed.
+    Whisper stays the default for real-word positives and all negatives.
+    Unit-tested; see `docs/BULK_SCRIPTED_COLLECTION.md`.
+  - [ ] Verify end-to-end with a real recorded "beep beep" take on the phone /
+    emulator: sync, confirm the server emits positive slices and the Review page
+    shows them.
+  - [ ] Consider tuning constants (open/close fractions, merge gap, padding)
+    against real captures once we have some.
 
 - [x] Realistic-positive compositing (successor to the context-fix re-mix).
   **RESULT (2026-07-21): fixes the streaming gap.** Full `all_set` train
