@@ -7,6 +7,24 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [~] F5-TTS voice-cloned synthetic positives (sound like the user, replace most
+  Kokoro synthetic speech).
+  - [x] `speech_services` runs `speech-f5tts` (:7860); generator scripts
+    `trainer/scripts/f5_gen_positives.{sh,py}` (resident model, 16k resample,
+    per-reference `.txt` ref_text, enrollment-first with positive-clip fallback).
+  - [x] App: fifth **Voice enrollment** recorder (fixed passage, filed whole as
+    `kind=enrollment`). Server stores enrollment takes whole (no Whisper, no
+    slices) and mirrors them into `<slug>/enrollment/` with a sidecar transcript.
+  - [x] Review page **synthetic samples** card + server `GET /synth/:slug/sample`
+    and `/synth/:slug/audio/:file` to spot-check F5 clips by ear.
+  - [ ] Record an enrollment take on the emulator, sync, confirm it stores whole
+    (zero slices) and lands in `<slug>/enrollment/` with its `.txt`.
+  - [ ] Run a trial batch through `f5_gen_positives.sh`, load the synthetic
+    samples card, and listen. Tune count/speed jitter.
+  - [ ] Wire the synth bucket into a training run (shrink the Kokoro pool; keep
+    real clips as the boosted anchor) and evaluate recall vs. the current model.
+
+
 - [~] Non-lexical wake words (sounds, not words, e.g. fast "beep beep").
   Whisper returns no words, so word-timestamp slicing of positive takes yields
   nothing.

@@ -10,7 +10,9 @@ data class BulkRecording(
      * How this take should be sliced by the server: [KIND_POSITIVE] (wake word
      * repeated → many positives), [KIND_NEGATIVE] (ordinary speech → negatives),
      * or [KIND_HARD_NEGATIVE] (near-miss phrases → hard negatives). Test takes
-     * carry [KIND_TEST]. Only hard-negative takes have a non-empty [script].
+     * carry [KIND_TEST]. An [KIND_ENROLLMENT] take is a read of a fixed passage
+     * stored whole as the F5 voice-cloning reference — the server never slices it.
+     * Hard-negative and enrollment takes have a non-empty [script].
      */
     val kind: String = KIND_POSITIVE,
     val recordedAtMillis: Long,
@@ -26,6 +28,7 @@ data class BulkRecording(
         const val KIND_NEGATIVE = "negative"
         const val KIND_HARD_NEGATIVE = "hard_negative"
         const val KIND_TEST = "test"
+        const val KIND_ENROLLMENT = "enrollment"
 
         /**
          * Sentinel stored in a positive take's [script] when the project marks its

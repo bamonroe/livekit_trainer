@@ -2645,6 +2645,32 @@ fn store_enrollment_whole(
         let mut conn = db.lock().expect("db lock poisoned");
         db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
     }
+
+    // Also drop the take into a stable `enrollment/` bucket with a sidecar
+    // transcript, so the F5 generator can find the reference audio + its exact
+    // text without querying the DB. The passage is known, so the .txt is precise.
+    if let Err(error) = write_enrollment_reference(dest_root, recording_id, &source_wav, script) {
+        summary
+            .warnings
+            .push(format!("{}: {}", recording_id, error.message));
+    }
+    Ok(())
+}
+
+/// Copy an enrollment take into `<dest_root>/enrollment/<id>.wav` and write its
+/// transcript to `<id>.txt` beside it, giving the F5 generator a self-describing
+/// reference (audio + exact ref_text) with no DB lookup.
+fn write_enrollment_reference(
+    dest_root: &Path,
+    recording_id: &str,
+    source_wav: &Path,
+    script: &str,
+) -> Result<(), AppError> {
+    let dir = dest_root.join("enrollment");
+    fs::create_dir_all(&dir)?;
+    let safe = safe_filename(recording_id);
+    fs::copy(source_wav, dir.join(format!("{safe}.wav")))?;
+    fs::write(dir.join(format!("{safe}.txt")), script.trim())?;
     Ok(())
 }
 

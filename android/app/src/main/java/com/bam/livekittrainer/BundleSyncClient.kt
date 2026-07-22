@@ -213,6 +213,9 @@ class BundleSyncClient(
     private fun JSONObject.optDoubleOrNull(key: String): Double? =
         if (has(key) && !isNull(key)) optDouble(key).takeIf { !it.isNaN() } else null
 
+    private fun JSONObject.optIntOrNull(key: String): Int? =
+        if (has(key) && !isNull(key)) optInt(key) else null
+
     private fun parseIsoMillis(value: String): Long =
         if (value.isBlank()) {
             0L
@@ -251,6 +254,35 @@ class BundleSyncClient(
                         category = category,
                         fileName = fileName,
                         audioUrl = reviewClipUrl(wakeWordSlug, category, fileName),
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * Fetch a representative sample of the F5 synthetic positives for review. The
+     * server enumerates the synth bucket and returns an evenly-spaced spread; each
+     * sample's [SyntheticSample.audioUrl] streams the clip bytes from the server.
+     */
+    fun loadSyntheticSamples(wakeWordSlug: String): List<SyntheticSample> {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/sample")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val response = readResponse(connection, "Load synthetic samples failed")
+        val samples = JSONObject(response).getJSONArray("samples")
+        return buildList {
+            for (index in 0 until samples.length()) {
+                val item = samples.getJSONObject(index)
+                val fileName = item.getString("file_name")
+                add(
+                    SyntheticSample(
+                        id = item.getString("id"),
+                        fileName = fileName,
+                        text = item.optString("text"),
+                        audioUrl = syntheticAudioUrl(wakeWordSlug, fileName),
                     ),
                 )
             }
@@ -398,10 +430,100 @@ class BundleSyncClient(
                         contextFix = if (item.isNull("context_fix")) null else item.optBoolean("context_fix"),
                         recall = eval?.optDoubleOrNull("recall"),
                         fpph = eval?.optDoubleOrNull("fpph"),
+                        modelSize = item.optStringOrNull("model_size"),
+                        modelType = item.optStringOrNull("model_type"),
+                        positiveBoost = item.optIntOrNull("positive_boost"),
+                        realPositive = item.optIntOrNull("real_positive"),
+                        realNegative = item.optIntOrNull("real_negative"),
+                        realBackground = item.optIntOrNull("real_background"),
                     ),
                 )
             }
         }
+    }
+
+    /**
+     * The stored grades for a model's test takes plus the model totals (misses,
+     * false positives), read back without re-running the scorer. `run` null =
+     * the current deployed model. Backs the Model test view's per-take scores and
+     * statistics.
+     */
+    fun loadModelGrades(wakeWordSlug: String, mode: String = "full", run: String? = null): ModelGrades {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') +
+                "/score-grades/${urlPart(wakeWordSlug)}?mode=${urlPart(mode)}" +
+                (if (run != null) "&run=${urlPart(run)}" else ""),
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        return parseModelGrades(readResponse(connection, "Model grades failed"), wakeWordSlug, mode)
+    }
+
+    /**
+     * Score every test take for a wake word against one model in a single
+     * request and return the resulting grades and totals. The server runs the
+     * takes one at a time through the scorer, so this can take a while for a
+     * large test set — hence the long read timeout.
+     */
+    fun scoreAllTestTakes(
+        wakeWordSlug: String,
+        mode: String = "full",
+        threshold: Double = 0.5,
+        run: String? = null,
+    ): ModelGrades {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') +
+                "/score-all/${urlPart(wakeWordSlug)}?mode=${urlPart(mode)}&threshold=$threshold" +
+                (if (run != null) "&run=${urlPart(run)}" else ""),
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 600_000
+        connection.doOutput = true
+        connection.setFixedLengthStreamingMode(0)
+        return parseModelGrades(readResponse(connection, "Score all failed"), wakeWordSlug, mode)
+    }
+
+    private fun parseModelGrades(response: String, fallbackSlug: String, fallbackMode: String): ModelGrades {
+        val root = JSONObject(response)
+        val totals = root.optJSONObject("totals")
+        val gradesArr = root.optJSONArray("grades")
+        return ModelGrades(
+            slug = root.optString("wake_word_slug", fallbackSlug),
+            run = root.optStringOrNull("run"),
+            mode = root.optString("mode", fallbackMode),
+            testTakes = totals?.optInt("test_takes", 0) ?: 0,
+            graded = totals?.optInt("graded", 0) ?: 0,
+            targets = totals?.optInt("targets", 0) ?: 0,
+            truePositives = totals?.optInt("true_positives", 0) ?: 0,
+            falseNegatives = totals?.optInt("false_negatives", 0) ?: 0,
+            falsePositives = totals?.optInt("false_positives", 0) ?: 0,
+            detections = totals?.optInt("detections", 0) ?: 0,
+            grades = buildList {
+                for (index in 0 until (gradesArr?.length() ?: 0)) {
+                    val item = gradesArr!!.getJSONObject(index)
+                    add(
+                        ScoreGrade(
+                            recordingId = item.optString("recording_id"),
+                            run = item.optStringOrNull("run"),
+                            threshold = item.optDouble("threshold", 0.5),
+                            peakScore = item.optDouble("peak_score", 0.0),
+                            maxScore = item.optDouble("max_score", 0.0),
+                            hasTarget = item.optBoolean("has_target", false),
+                            targetCount = item.optInt("target_count", 0),
+                            truePositives = item.optInt("true_positives", 0),
+                            falseNegatives = item.optInt("false_negatives", 0),
+                            falsePositives = item.optInt("false_positives", 0),
+                            detected = item.optBoolean("detected", false),
+                            scoredAtMs = item.optLong("scored_at_ms", 0L),
+                        ),
+                    )
+                }
+            },
+        )
     }
 
     /** Streaming URL for a stored bulk take's full source audio. */
@@ -573,6 +695,11 @@ class BundleSyncClient(
     private fun reviewClipUrl(wakeWordSlug: String, category: String, fileName: String): String {
         return serverUrl.trimEnd('/') +
             "/review/${urlPart(wakeWordSlug)}/${urlPart(category)}/${urlPart(fileName)}"
+    }
+
+    private fun syntheticAudioUrl(wakeWordSlug: String, fileName: String): String {
+        return serverUrl.trimEnd('/') +
+            "/synth/${urlPart(wakeWordSlug)}/audio/${urlPart(fileName)}"
     }
 
     private fun bulkSourceAudioUrl(wakeWordSlug: String, sourceRecording: String): String {

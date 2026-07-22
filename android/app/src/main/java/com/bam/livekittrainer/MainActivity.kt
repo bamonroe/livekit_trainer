@@ -81,6 +81,9 @@ class MainActivity : Activity() {
     private var uploadingTestTakes: Boolean = false
     private var bulkReviewProjectSlug: String? = null
     private var bulkReviewClips: List<BulkReviewClip> = emptyList()
+    private var syntheticSlug: String? = null
+    private var syntheticSamples: List<SyntheticSample> = emptyList()
+    private var loadingSynthetic: Boolean = false
     // Live status/log views on the Train page, updated in place by the poller so
     // a running-status refresh never rebuilds the form and clobbers typed input.
     private var trainStatusView: TextView? = null
@@ -424,12 +427,15 @@ class MainActivity : Activity() {
         }
         val bulkRecordings = store.loadBulkRecordings(project.id)
         val backgroundRecordings = store.loadBackgroundRecordings(project.id)
-        // Four straight recorders, each a plain record-and-stop take of one kind.
-        // Only hard negatives carry a prompt (the near-miss phrases to read).
+        // Five straight recorders, each a plain record-and-stop take of one kind.
+        // Hard negatives and enrollment carry a prompt (near-miss phrases / the
+        // passage to read); enrollment is stored whole as the voice-cloning
+        // reference and never sliced.
         workspace.addView(tokenRecordCard(project, bulkRecordings))
         workspace.addView(negativeRecordCard(project, bulkRecordings).withTop(dp(12)))
         workspace.addView(hardNegativeRecordCard(project, bulkRecordings).withTop(dp(12)))
         workspace.addView(backgroundNoiseCard(project, backgroundRecordings).withTop(dp(12)))
+        workspace.addView(enrollmentRecordCard(project, bulkRecordings).withTop(dp(12)))
         maybeStatus()
     }
 
@@ -455,6 +461,7 @@ class MainActivity : Activity() {
             BulkRecording.KIND_POSITIVE to "Wake word takes",
             BulkRecording.KIND_NEGATIVE to "Negative takes",
             BulkRecording.KIND_HARD_NEGATIVE to "Hard negative takes",
+            BulkRecording.KIND_ENROLLMENT to "Enrollment takes",
             "other" to "Other takes",
         )
         var anySpeech = false
@@ -478,6 +485,7 @@ class MainActivity : Activity() {
                 backgroundRecordingsCard(backgroundRecordings, serverBackground).withTop(dp(12)),
             )
         }
+        workspace.addView(syntheticSamplesCard(project).withTop(dp(12)))
         maybeStatus()
     }
 
@@ -1036,8 +1044,17 @@ class MainActivity : Activity() {
                     )
                     if (recording.isTest) addView(scoreChip(grade).withLeft(dp(8)))
                     val busy = loadingScore && selected
+                    // A stored grade means this take is already scored against the
+                    // current model, so the tap just fetches the cached curve.
+                    // Label it "View score" to make that cache hit obvious; only
+                    // an unscored take (no grade) shows "Score".
+                    val scoreLabel = when {
+                        busy -> "Scoring…"
+                        grade != null -> "View score"
+                        else -> "Score"
+                    }
                     addView(
-                        actionButton(if (busy) "Scoring…" else "Score", ButtonStyle.Primary) {
+                        actionButton(scoreLabel, ButtonStyle.Primary) {
                             loadScore(project, recording.id)
                         }.apply { isEnabled = !loadingScore }.withLeft(dp(8)),
                     )
@@ -2563,6 +2580,7 @@ class MainActivity : Activity() {
         BulkRecording.KIND_POSITIVE -> BulkRecording.KIND_POSITIVE
         BulkRecording.KIND_NEGATIVE -> BulkRecording.KIND_NEGATIVE
         BulkRecording.KIND_HARD_NEGATIVE -> BulkRecording.KIND_HARD_NEGATIVE
+        BulkRecording.KIND_ENROLLMENT -> BulkRecording.KIND_ENROLLMENT
         else -> "other"
     }
 
@@ -2595,6 +2613,74 @@ class MainActivity : Activity() {
                     addView(bulkRecordingRow(recording).withTop(dp(8)))
                 }
             }
+        }
+    }
+
+    /**
+     * Spot-check card for the F5 synthetic positives. There can be thousands, so
+     * the server returns a spread-out sample; this lets the user judge how the
+     * voice-cloned clips actually sound before training on them.
+     */
+    private fun syntheticSamplesCard(project: WakeWordProject): View {
+        val mine = if (syntheticSlug == project.slug) syntheticSamples else emptyList()
+        return card().apply {
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        text("Synthetic samples  ${mine.size}", 18f, textColor(), Typeface.BOLD).apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        },
+                    )
+                    addView(actionButton(if (loadingSynthetic) "Loading…" else "Load sample", ButtonStyle.Secondary) {
+                        if (!loadingSynthetic) loadSyntheticSamples(project)
+                    })
+                },
+            )
+            addView(
+                text(
+                    "Voice-cloned positives generated by F5-TTS from your enrollment read. A spread-out " +
+                        "sample of the full batch — tap one to hear how it sounds.",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+            if (mine.isEmpty()) {
+                val message = if (loadingSynthetic) {
+                    "Loading synthetic samples…"
+                } else {
+                    "No synthetic clips loaded. Tap Load sample."
+                }
+                addView(text(message, 14f, mutedColor()).withTop(dp(10)))
+            } else {
+                mine.forEach { sample ->
+                    addView(syntheticSampleRow(sample).withTop(dp(8)))
+                }
+            }
+        }
+    }
+
+    /** One synthetic-sample row: id, cloned phrase, and a play/pause toggle. */
+    private fun syntheticSampleRow(sample: SyntheticSample): View {
+        val playbackKey = "synthetic:${sample.id}"
+        val playing = activePlaybackKey == playbackKey && player?.isPlaying == true
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    addView(text(sample.id, 15f, textColor(), Typeface.BOLD))
+                    if (sample.text.isNotBlank()) {
+                        addView(text("“${sample.text}”", 13f, mutedColor()).withTop(dp(2)))
+                    }
+                },
+            )
+            addView(actionButton(if (playing) "❚❚ Pause" else "▶ Play", ButtonStyle.Secondary) {
+                playSyntheticSample(sample)
+            })
         }
     }
 
@@ -2646,6 +2732,8 @@ class MainActivity : Activity() {
         BulkRecording.KIND_NEGATIVE -> "${recording.negativeCount} negative"
         // Hard negatives are filed under the negative category server-side.
         BulkRecording.KIND_HARD_NEGATIVE -> "${recording.negativeCount} hard negative"
+        // Enrollment reads are stored whole as the F5 reference, not sliced.
+        BulkRecording.KIND_ENROLLMENT -> "voice reference (not sliced)"
         else -> "${recording.positiveCount} positive · ${recording.negativeCount} negative"
     }
 
@@ -2880,6 +2968,35 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * The voice-enrollment recorder. Reuses the shared speech card but files the
+     * take as [BulkRecording.KIND_ENROLLMENT] with the fixed passage as its script
+     * so the server stores it whole (never sliced) as the F5 voice-cloning
+     * reference. The passage is the same every enrollment, so the reference text
+     * the generator feeds F5 is always exact.
+     */
+    private fun enrollmentRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View =
+        speechRecordCard(
+            project,
+            BulkRecording.KIND_ENROLLMENT,
+            title = "Voice enrollment",
+            description = "Read the passage below aloud once, clearly and at a natural pace, in a quiet " +
+                "room. This take is stored whole as your voice-cloning reference — it is never sliced — " +
+                "and lets the trainer generate synthetic positives that sound like you.",
+            buttonIdle = "●  Record enrollment",
+            buttonStyle = ButtonStyle.Secondary,
+            takes = takes,
+            script = ENROLLMENT_PASSAGE,
+            accessory = enrollmentPassageView(),
+        )
+
+    /** The fixed enrollment passage, rendered for the reader. */
+    private fun enrollmentPassageView(): TextView =
+        text("", 17f, textColor()).apply {
+            text = ENROLLMENT_PASSAGE
+            setLineSpacing(dp(4).toFloat(), 1.0f)
+        }
+
     /** The near-miss phrases rendered one per line in the hard-negative red. */
     private fun hardNegativePromptView(hardNegatives: List<String>): TextView {
         val body = if (hardNegatives.isEmpty()) {
@@ -2951,6 +3068,7 @@ class MainActivity : Activity() {
         BulkRecording.KIND_POSITIVE -> "wake word"
         BulkRecording.KIND_NEGATIVE -> "negatives"
         BulkRecording.KIND_HARD_NEGATIVE -> "hard negatives"
+        BulkRecording.KIND_ENROLLMENT -> "enrollment"
         else -> "take"
     }
 
@@ -3634,6 +3752,80 @@ class MainActivity : Activity() {
             activePlaybackKey = null
             player = null
             statusMessage = error.message ?: "Could not play generated slice"
+        }
+        render()
+    }
+
+    /** Fetch a representative sample of the F5 synthetic positives for review. */
+    private fun loadSyntheticSamples(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Server URL required"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        loadingSynthetic = true
+        statusMessage = "Loading synthetic samples for ${project.slug}"
+        render()
+        Thread {
+            try {
+                val samples = BundleSyncClient(serverUrl).loadSyntheticSamples(project.slug)
+                runOnUiThread {
+                    syntheticSlug = project.slug
+                    syntheticSamples = samples
+                    loadingSynthetic = false
+                    statusMessage = if (samples.isEmpty()) {
+                        "No synthetic clips yet. Generate them with the F5 script."
+                    } else {
+                        "Loaded ${samples.size} synthetic samples"
+                    }
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    loadingSynthetic = false
+                    statusMessage = error.message ?: "Load synthetic samples failed"
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    /** Stream one synthetic sample, mirroring the review-clip player. */
+    private fun playSyntheticSample(sample: SyntheticSample) {
+        val playbackKey = "synthetic:${sample.id}"
+        player?.let { current ->
+            if (activePlaybackKey == playbackKey) {
+                if (current.isPlaying) current.pause() else current.start()
+                render()
+                return
+            }
+        }
+        stopAlignmentTicker()
+        player?.release()
+        player = null
+        activePlaybackKey = playbackKey
+        try {
+            player = MediaPlayer().apply {
+                setDataSource(sample.audioUrl)
+                setOnPreparedListener {
+                    it.start()
+                    render()
+                }
+                setOnCompletionListener {
+                    it.release()
+                    if (player === it) player = null
+                    activePlaybackKey = null
+                    render()
+                }
+                prepareAsync()
+            }
+            statusMessage = "Loading synthetic ${sample.id}"
+        } catch (error: Exception) {
+            activePlaybackKey = null
+            player = null
+            statusMessage = error.message ?: "Could not play synthetic clip"
         }
         render()
     }
@@ -4602,6 +4794,16 @@ class MainActivity : Activity() {
     private companion object {
         const val REQUEST_RECORD_AUDIO = 100
         const val TAKE_PAGE_SIZE = 5
+
+        /**
+         * Fixed passage read for a voice-enrollment take. Kept constant so the
+         * reference text fed to F5-TTS is always exact; phonetically varied and
+         * ~15 seconds at a natural pace, which is the sweet spot for cloning.
+         */
+        const val ENROLLMENT_PASSAGE =
+            "The quick morning light spread across the harbor as the ferry pulled away from the " +
+                "dock. Gulls circled overhead while a few early travelers sipped their coffee and " +
+                "watched the calm water slowly turn from gray to a bright, warm gold."
         const val SYNC_PREFS = "sync"
         const val KEY_SYNC_SERVER_URL = "server_url"
         const val KEY_BULK_WAKE_PLACEMENTS = "bulk_wake_placements"

@@ -33,7 +33,9 @@ def main():
     ap.add_argument("--refs-dir", required=True,
                     help="Dir of clean reference positive clips (the user saying the phrase).")
     ap.add_argument("--ref-text", required=True,
-                    help="Transcript of the reference clips, e.g. 'all set'.")
+                    help="Default transcript of the reference clips, e.g. 'all set'. "
+                         "Overridden per clip by a sibling <name>.txt if one exists "
+                         "(enrollment references carry their exact passage this way).")
     ap.add_argument("--gen-text", required=True,
                     help="Phrase to synthesize, usually the same as --ref-text.")
     ap.add_argument("--out-dir", required=True)
@@ -57,6 +59,17 @@ def main():
     rng = random.Random(args.seed_base)
     gen_text = " ".join([args.gen_text.strip()] * args.repeat)
 
+    def ref_text_for(ref_path):
+        # An enrollment reference ships its exact passage in a sibling .txt; fall
+        # back to the phrase for plain positive-clip references.
+        sidecar = os.path.splitext(ref_path)[0] + ".txt"
+        if os.path.isfile(sidecar):
+            with open(sidecar, encoding="utf-8") as fh:
+                text = fh.read().strip()
+            if text:
+                return text
+        return args.ref_text
+
     for i in range(args.count):
         ref = refs[i % len(refs)]                 # rotate timbre across refs
         speed = rng.uniform(args.speed_min, args.speed_max)
@@ -64,7 +77,7 @@ def main():
         out = os.path.join(args.out_dir, f"f5_{i:05d}.wav")
         tts.infer(
             ref_file=ref,
-            ref_text=args.ref_text,
+            ref_text=ref_text_for(ref),
             gen_text=gen_text,
             speed=speed,
             seed=seed,
