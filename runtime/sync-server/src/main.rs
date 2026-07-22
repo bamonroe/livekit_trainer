@@ -643,6 +643,8 @@ async fn main() {
             "/review/:slug/:category/:file_name",
             get(review_audio).delete(delete_review_clip),
         )
+        .route("/synth/:slug/sample", get(synthetic_samples))
+        .route("/synth/:slug/audio/:file_name", get(synthetic_audio))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state.clone());
 
@@ -1803,6 +1805,116 @@ async fn delete_review_clip(
     }))
 }
 
+/// Directory holding the F5 voice-cloned positives for a slug. The trainer
+/// writes these to `<repo>/data/synth_f5/<slug>/positive`; the container mounts
+/// the repo `data/` at the parent of `data_root` (DATA_ROOT=/data/real →
+/// /data), so the synth bucket is a sibling of `data_root`.
+fn synth_positive_dir(data_root: &Path, slug: &str) -> PathBuf {
+    data_root
+        .parent()
+        .unwrap_or(data_root)
+        .join("synth_f5")
+        .join(slug)
+        .join("positive")
+}
+
+#[derive(Serialize)]
+struct SyntheticSample {
+    id: String,
+    file_name: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct SyntheticSamplesResponse {
+    slug: String,
+    phrase: String,
+    total: usize,
+    sampled: usize,
+    samples: Vec<SyntheticSample>,
+}
+
+/// Return a representative sample of the F5 synthetic positives so the Review
+/// page can spot-check them by ear. With potentially thousands of clips we take
+/// an evenly-spaced stride across the sorted batch (start, middle, end), not the
+/// first N — deterministic, no RNG. The clips are all the wake phrase, so each
+/// sample carries the project phrase as its label text.
+async fn synthetic_samples(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<SyntheticSamplesResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
+    }
+    let dir = synth_positive_dir(&state.data_root, &slug);
+    let mut files: Vec<String> = Vec::new();
+    if dir.is_dir() {
+        for entry in fs::read_dir(&dir)? {
+            let name = entry?.file_name().to_string_lossy().to_string();
+            if name.ends_with(".wav") {
+                files.push(name);
+            }
+        }
+    }
+    files.sort();
+    let total = files.len();
+
+    const MAX_SAMPLES: usize = 24;
+    let sampled: Vec<String> = if total <= MAX_SAMPLES {
+        files
+    } else {
+        let stride = total as f64 / MAX_SAMPLES as f64;
+        (0..MAX_SAMPLES)
+            .map(|i| files[((i as f64) * stride) as usize].clone())
+            .collect()
+    };
+
+    let phrase = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::project_phrase(&conn, &slug)
+            .map_err(db_error)?
+            .map(|(phrase, _)| phrase)
+            .unwrap_or_default()
+    };
+
+    let samples = sampled
+        .iter()
+        .map(|name| SyntheticSample {
+            id: name.trim_end_matches(".wav").to_string(),
+            file_name: name.clone(),
+            text: phrase.clone(),
+        })
+        .collect();
+
+    Ok(Json(SyntheticSamplesResponse {
+        slug,
+        phrase,
+        total,
+        sampled: sampled.len(),
+        samples,
+    }))
+}
+
+/// Serve one F5 synthetic positive WAV by file name. Mirrors `review_audio`.
+async fn synthetic_audio(
+    State(state): State<AppState>,
+    AxumPath((slug, file_name)): AxumPath<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
+    }
+    if file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.contains("..")
+        || !file_name.ends_with(".wav")
+    {
+        return Err(AppError::bad_request(format!("unsafe file name: {file_name}")));
+    }
+    let path = synth_positive_dir(&state.data_root, &slug).join(&file_name);
+    let bytes = fs::read(path)?;
+    Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
+}
+
 fn load_settings(path: &Path) -> ServerSettings {
     fs::read_to_string(path)
         .ok()
@@ -2460,6 +2572,82 @@ async fn align_test_one(
     Ok(())
 }
 
+/// Store an enrollment take whole. Enrollment reads are the voice-cloning
+/// reference for F5-TTS — one clean take of the user reading a fixed passage —
+/// so they must never be sliced into training clips and never touch Whisper: the
+/// passage text is already known (it is the recording's `script`), so there is
+/// nothing to align. This mirrors `align_test_one` (persist the raw source, drop
+/// any stale slices, write an alignment with an empty slice list) but skips
+/// transcription entirely. Reprocess re-enters here off the persisted `kind`.
+fn store_enrollment_whole(
+    recording_id: &str,
+    script: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    slug: &str,
+    phrase: &str,
+    external_id: Option<&str>,
+    dest_root: &Path,
+    db: &Mutex<Connection>,
+    capture: &db::CaptureMeta,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    let (source_wav, source_sha256) = match store_bulk_source(dest_root, recording_id, source) {
+        Ok(stored) => stored,
+        Err(error) => {
+            summary
+                .warnings
+                .push(format!("{}: {}", recording_id, error.message));
+            return Ok(());
+        }
+    };
+    let old_paths = {
+        let conn = db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
+    };
+    for old in old_paths {
+        let old = PathBuf::from(old);
+        if old.is_file() {
+            let _ = fs::remove_file(old);
+        }
+    }
+
+    let prompts = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    let alignment = db::RecordingAlignment {
+        recording_id: recording_id.to_string(),
+        project_slug: slug.to_string(),
+        phrase: phrase.to_string(),
+        external_id: external_id.map(ToString::to_string),
+        script: script.to_string(),
+        kind: "enrollment".to_string(),
+        recorded_at: recorded_at.to_string(),
+        duration_ms: duration_ms as i64,
+        source_wav: source_wav.to_string_lossy().to_string(),
+        source_sha256: Some(source_sha256),
+        bundle: None,
+        // The passage text is known; store it as the transcript without Whisper.
+        transcript_text: script.trim().to_string(),
+        whisper_url: None,
+        words: Vec::new(),
+        prompts,
+        // Intentionally empty: enrollment reads are the F5 reference, not training data.
+        slices: Vec::new(),
+        capture: capture.clone(),
+    };
+    {
+        let mut conn = db.lock().expect("db lock poisoned");
+        db::store_recording_alignment(&mut conn, &alignment, now_ms()).map_err(db_error)?;
+    }
+    Ok(())
+}
+
 /// Align and slice one already-materialized source WAV. Shared by the upload
 /// path (source from the bundle) and the reprocess path (source is the stored
 /// bulk_source WAV), so both cut slices identically.
@@ -2501,6 +2689,25 @@ async fn align_one_recording(
             summary,
         )
         .await;
+    }
+    if kind.trim() == "enrollment" {
+        // Enrollment reads are the F5 voice-cloning reference: store the whole
+        // take, cut zero slices, skip Whisper. Keyed off the persisted kind so
+        // reprocess re-enters here too.
+        return store_enrollment_whole(
+            recording_id,
+            script,
+            recorded_at,
+            duration_ms,
+            source,
+            slug,
+            phrase,
+            external_id,
+            dest_root,
+            db,
+            capture,
+            summary,
+        );
     }
     if script == BACKGROUND_SCRIPT_MARKER {
         // Background takes carry no speech to align; chop into fixed windows and
