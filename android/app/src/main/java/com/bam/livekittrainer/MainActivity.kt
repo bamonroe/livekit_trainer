@@ -32,6 +32,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 import java.io.File
 import java.security.MessageDigest
@@ -131,6 +132,21 @@ class MainActivity : Activity() {
     private var modelRuns: List<ModelRun> = emptyList()
     private var modelRunsSlug: String? = null
     private var loadingModelRuns: Boolean = false
+    // Stored per-take grades for the selected model version, so each test take's
+    // card shows its score on that model and the Model test view can total misses
+    // and false positives. Keyed by (slug, run, mode); reloaded when any changes
+    // or after a fresh score. `scoringAllTakes` guards the bulk "score all" run.
+    private var modelGrades: ModelGrades? = null
+    private var modelGradesSlug: String? = null
+    private var modelGradesRun: String? = null
+    private var modelGradesMode: String? = null
+    private var loadingModelGrades: Boolean = false
+    private var scoringAllTakes: Boolean = false
+    // Which model rows and test-take cards are expanded to show their details.
+    // Model rows key on the run id ("current" for the deployed model); test-take
+    // cards key on the recording id.
+    private val expandedModelRuns = mutableSetOf<String>()
+    private val expandedTestTakes = mutableSetOf<String>()
     private var scoreCurveView: ScoreCurveView? = null
     private var scoreCountsText: TextView? = null
     // Test-page take-list collapse state. Test takes are the ones you usually
@@ -501,6 +517,7 @@ class MainActivity : Activity() {
         }
         ensureServerRecordings(project)
         ensureModelRuns(project)
+        ensureModelGrades(project)
         workspace.addView(testRecorderCard(project))
         // The score card sits directly under the recorder, above the take list,
         // so tapping Score on a take doesn't leave the result buried far below a
@@ -716,6 +733,7 @@ class MainActivity : Activity() {
                 ).withTop(dp(4)),
             )
             addModelPicker(project)
+            addModelTestStats(project)
             when {
                 loadingServerRecordings && recordings.isEmpty() ->
                     addView(text("Loading recordings…", 14f, mutedColor()).withTop(dp(12)))
@@ -782,15 +800,26 @@ class MainActivity : Activity() {
         }
     }
 
-    /** One selectable model-version row: null [run] is the current model. */
+    /**
+     * One selectable model-version row: null [run] is the current model. Tapping
+     * the body selects it for scoring; the ▾ toggle expands its provenance
+     * (size, type, eval, real-data counts) inline. The current-model row borrows
+     * the deployed run's details so its size shows too.
+     */
     private fun modelRunRow(project: WakeWordProject, run: ModelRun?, selected: Boolean): View {
+        val key = run?.runId ?: "current"
+        val expanded = expandedModelRuns.contains(key)
+        val currentRun = (if (modelRunsSlug == project.slug) modelRuns else emptyList())
+            .firstOrNull { it.isCurrent }
         val title: String
         val subtitle: String
         if (run == null) {
             title = "Current model"
-            subtitle = "The model the server currently has deployed"
+            subtitle = currentRun?.modelSize?.let { "Deployed model · $it" }
+                ?: "The model the server currently has deployed"
         } else {
             val tags = buildList {
+                run.modelSize?.let { add(it) }
                 if (run.isCurrent) add("current")
                 if (run.personal) add("personal")
                 if (run.contextFix == true) add("ctx-fix")
@@ -798,23 +827,87 @@ class MainActivity : Activity() {
             title = formatRunId(run.runId) + if (tags.isEmpty()) "" else "  · ${tags.joinToString(" · ")}"
             subtitle = modelRunLabel(run)
         }
+        val detailRun = run ?: currentRun
+        val details = detailRun?.let { modelRunDetails(it) } ?: emptyList()
         return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = rounded(if (selected) navActiveColor() else promptColor(), dp(12), strokeColor())
-            setOnClickListener { selectScoreRun(project, run?.runId) }
             addView(
                 LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                    addView(text(title, 15f, if (selected) ACCENT else textColor(), Typeface.BOLD))
-                    addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setOnClickListener { selectScoreRun(project, run?.runId) }
+                    addView(
+                        LinearLayout(this@MainActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                            addView(text(title, 15f, if (selected) ACCENT else textColor(), Typeface.BOLD))
+                            addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
+                        },
+                    )
+                    if (selected) addView(text("✓", 18f, ACCENT, Typeface.BOLD).withLeft(dp(8)))
+                    if (details.isNotEmpty()) {
+                        addView(
+                            text(if (expanded) "▾" else "▸", 16f, mutedColor(), Typeface.BOLD).apply {
+                                setPadding(dp(14), dp(6), dp(4), dp(6))
+                                setOnClickListener {
+                                    if (expanded) expandedModelRuns.remove(key) else expandedModelRuns.add(key)
+                                    render()
+                                }
+                            },
+                        )
+                    }
                 },
             )
-            if (selected) addView(text("✓", 18f, ACCENT, Typeface.BOLD))
+            if (expanded && details.isNotEmpty()) {
+                addView(detailBlock(details).withTop(dp(10)))
+            }
         }
     }
+
+    /** Human-readable provenance rows for a model version's expanded details. */
+    private fun modelRunDetails(run: ModelRun): List<Pair<String, String>> = buildList {
+        run.modelSize?.let { add("Size" to it) }
+        run.modelType?.let { add("Type" to it) }
+        run.steps?.let { add("Steps" to "%,d".format(it)) }
+        run.recall?.let { add("Eval recall" to "%.1f%%".format(it * 100)) }
+        run.fpph?.let { add("Eval FP/hour" to "%.2f".format(it)) }
+        val real = listOfNotNull(
+            run.realPositive?.let { "$it pos" },
+            run.realNegative?.let { "$it neg" },
+            run.realBackground?.let { "$it bg" },
+        )
+        if (real.isNotEmpty()) add("Real clips" to real.joinToString(" · "))
+        run.positiveBoost?.let { add("Positive boost" to it.toString()) }
+        if (run.personal) add("Personal" to "yes")
+        if (run.contextFix == true) add("Context-fix" to "yes")
+        run.finishedAt?.takeIf { it.isNotBlank() }?.let {
+            add("Finished" to it.take(16).replace('T', ' '))
+        }
+    }
+
+    /** A label/value list, used for model and test-take expanded details. */
+    private fun detailBlock(rows: List<Pair<String, String>>): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            rows.forEachIndexed { index, (label, value) ->
+                val row = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        text(label, 12f, mutedColor()).apply {
+                            layoutParams = LinearLayout.LayoutParams(dp(118), LinearLayout.LayoutParams.WRAP_CONTENT)
+                        },
+                    )
+                    addView(
+                        text(value, 12f, textColor(), Typeface.BOLD).apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        },
+                    )
+                }
+                addView(if (index == 0) row else row.withTop(dp(4)))
+            }
+        }
 
     /** Pick a model version and re-score the selected take against it immediately. */
     private fun selectScoreRun(project: WakeWordProject, runId: String?) {
@@ -892,17 +985,18 @@ class MainActivity : Activity() {
 
     private fun testRecordingRow(project: WakeWordProject, recording: ServerRecording): View {
         val selected = scoreRecordingId == recording.id
+        val expanded = expandedTestTakes.contains(recording.id)
+        val grade = if (recording.isTest) currentGrades(project)?.gradeFor(recording.id) else null
         val subtitle = buildString {
             append("${recording.durationMs / 1000}s · ${formatRecordedAt(recording.recordedAtMillis)}")
             recording.deviceLabel?.let { append(" · $it") }
         }
         return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = rounded(if (selected) navActiveColor() else promptColor(), dp(12), strokeColor())
-            // Long-press a test take to delete it from the server (and this
-            // device). Training takes are managed on the Review page instead.
+            // Long-press still deletes a test take (kept for muscle memory); a
+            // visible Delete button lives in the expanded body below.
             if (recording.isTest) {
                 setOnLongClickListener {
                     confirmDeleteTestTake(project, recording)
@@ -911,27 +1005,195 @@ class MainActivity : Activity() {
             }
             addView(
                 LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    // Tap the row to expand this take's details; the Score button
+                    // keeps its own click, so it scores without toggling.
+                    setOnClickListener {
+                        if (expanded) expandedTestTakes.remove(recording.id)
+                        else expandedTestTakes.add(recording.id)
+                        render()
+                    }
                     addView(
-                        text(
-                            if (recording.isTest) "${recording.id.takeLast(8)}  · TEST" else recording.id.takeLast(8),
-                            15f,
-                            if (recording.isTest) ACCENT else textColor(),
-                            Typeface.BOLD,
-                        ),
+                        text(if (expanded) "▾" else "▸", 15f, mutedColor(), Typeface.BOLD).apply {
+                            setPadding(0, 0, dp(8), 0)
+                        },
                     )
-                    addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
+                    addView(
+                        LinearLayout(this@MainActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                            addView(
+                                text(
+                                    if (recording.isTest) "${recording.id.takeLast(8)}  · TEST" else recording.id.takeLast(8),
+                                    15f,
+                                    if (recording.isTest) ACCENT else textColor(),
+                                    Typeface.BOLD,
+                                ),
+                            )
+                            addView(text(subtitle, 12f, mutedColor()).withTop(dp(2)))
+                        },
+                    )
+                    if (recording.isTest) addView(scoreChip(grade).withLeft(dp(8)))
+                    val busy = loadingScore && selected
+                    addView(
+                        actionButton(if (busy) "Scoring…" else "Score", ButtonStyle.Primary) {
+                            loadScore(project, recording.id)
+                        }.apply { isEnabled = !loadingScore }.withLeft(dp(8)),
+                    )
                 },
             )
-            val busy = loadingScore && selected
+            if (expanded) {
+                addView(testTakeDetails(project, recording, grade).withTop(dp(10)))
+            }
+        }
+    }
+
+    /**
+     * A compact chip showing a test take's stored peak score on the selected
+     * model, colored by outcome: green caught the wake word, red missed it,
+     * orange fired with no wake word (false alarm). "—" means not scored yet.
+     */
+    private fun scoreChip(grade: ScoreGrade?): View {
+        if (grade == null) {
+            return text("—", 13f, mutedColor(), Typeface.BOLD).apply {
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+            }
+        }
+        val color = when {
+            grade.hasTarget && grade.detected -> Color.rgb(30, 132, 73)
+            grade.hasTarget -> Color.rgb(190, 45, 45)
+            grade.detected -> Color.parseColor("#C2410C")
+            else -> mutedColor()
+        }
+        return text("%.2f".format(grade.peakScore), 14f, Color.WHITE, Typeface.BOLD).apply {
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = rounded(color, dp(10), 0)
+        }
+    }
+
+    /** Expanded body for a test take: its grade on the selected model + Delete. */
+    private fun testTakeDetails(
+        project: WakeWordProject,
+        recording: ServerRecording,
+        grade: ScoreGrade?,
+    ): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        if (grade == null) {
             addView(
-                actionButton(if (busy) "Scoring…" else "Score", ButtonStyle.Primary) {
-                    loadScore(project, recording.id)
-                }.apply { isEnabled = !loadingScore },
+                text(
+                    "Not scored yet on this model. Tap Score, or use “Score all takes”.",
+                    13f, mutedColor(),
+                ),
+            )
+        } else {
+            val status = when {
+                grade.hasTarget && grade.detected -> "caught the wake word"
+                grade.hasTarget -> "missed the wake word"
+                grade.detected -> "fired with no wake word (false alarm)"
+                else -> "stayed silent (no wake word)"
+            }
+            addView(
+                detailBlock(
+                    listOf(
+                        "Peak score" to "%.2f".format(grade.peakScore),
+                        "Threshold" to "%.2f".format(grade.threshold),
+                        "Result" to status,
+                        "Wake phrases" to grade.targetCount.toString(),
+                        "Hits" to grade.truePositives.toString(),
+                        "Misses" to grade.falseNegatives.toString(),
+                        "False alarms" to grade.falsePositives.toString(),
+                    ),
+                ),
+            )
+        }
+        if (recording.isTest) {
+            addView(
+                actionButton("Delete take", ButtonStyle.Danger) {
+                    confirmDeleteTestTake(project, recording)
+                }.withTop(dp(10)),
             )
         }
     }
+
+    /** The stored grades matching the currently selected model version and mode. */
+    private fun currentGrades(project: WakeWordProject): ModelGrades? =
+        modelGrades?.takeIf {
+            modelGradesSlug == project.slug &&
+                modelGradesRun == scoreRun &&
+                modelGradesMode == scoreMode
+        }
+
+    /**
+     * The Model test statistics block: a "Score all takes" button and, once
+     * graded, the model's totals — hits, misses, and false alarms located from
+     * the Whisper transcript across every test take.
+     */
+    private fun LinearLayout.addModelTestStats(project: WakeWordProject) {
+        val grades = currentGrades(project)
+        addView(
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(14), dp(4), dp(4))
+                addView(
+                    text("Statistics", 15f, textColor(), Typeface.BOLD).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    },
+                )
+                addView(
+                    actionButton(if (scoringAllTakes) "Scoring…" else "Score all takes", ButtonStyle.Primary) {
+                        scoreAllTestTakes(project)
+                    }.apply { isEnabled = !scoringAllTakes && !loadingScore },
+                )
+            },
+        )
+        if (grades == null || grades.graded == 0) {
+            addView(
+                text(
+                    if (loadingModelGrades || scoringAllTakes) {
+                        "Loading scores…"
+                    } else {
+                        "No scores yet for this model. Tap “Score all takes”."
+                    },
+                    13f, mutedColor(),
+                ).withTop(dp(6)),
+            )
+            return
+        }
+        addView(
+            text(
+                "Graded ${grades.graded}/${grades.testTakes} test takes · ${grades.targets} wake phrases (per Whisper)",
+                13f, mutedColor(),
+            ).withTop(dp(6)),
+        )
+        addView(
+            LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(statTile(grades.truePositives.toString(), "hits", Color.rgb(30, 132, 73)))
+                addView(statTile(grades.falseNegatives.toString(), "misses", Color.rgb(190, 45, 45)).withLeft(dp(8)))
+                addView(statTile(grades.falsePositives.toString(), "false alarms", Color.parseColor("#C2410C")).withLeft(dp(8)))
+            }.withTop(dp(8)),
+        )
+        if (grades.graded < grades.testTakes) {
+            addView(
+                text("${grades.testTakes - grades.graded} not yet scored on this model.", 12f, mutedColor())
+                    .withTop(dp(6)),
+            )
+        }
+    }
+
+    /** One big-number statistic tile, equal width in a horizontal row. */
+    private fun statTile(value: String, label: String, color: Int): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(12), dp(8), dp(12))
+            background = rounded(promptColor(), dp(12), strokeColor())
+            addView(text(value, 22f, color, Typeface.BOLD).apply { gravity = Gravity.CENTER })
+            addView(text(label, 11f, mutedColor()).apply { gravity = Gravity.CENTER }.withTop(dp(2)))
+        }
 
     private fun confirmDeleteTestTake(project: WakeWordProject, recording: ServerRecording) {
         AlertDialog.Builder(this)
@@ -976,6 +1238,9 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     serverRecordingsSlug = project.slug
                     serverRecordings = recordings
+                    expandedTestTakes.remove(recording.id)
+                    // That take's grade is gone server-side; refresh the totals.
+                    modelGradesSlug = null
                     statusMessage = "Deleted test take"
                     render()
                 }
@@ -1199,6 +1464,9 @@ class MainActivity : Activity() {
                     scoreProjectSlug = project.slug
                     scoreResult = result
                     loadingScore = false
+                    // The server just re-stored this take's grade against the
+                    // selected model; invalidate so the cards and totals reload.
+                    modelGradesSlug = null
                     val events = ScoreEvents.events(result.timesMs, result.scores, scoreThreshold, scoreWindowMs)
                     val detected = ScoreEvents.detectedFlags(result.targets, events).count { it }
                     statusMessage =
@@ -2459,6 +2727,7 @@ class MainActivity : Activity() {
         buttonStyle: ButtonStyle,
         takes: List<BulkRecording>,
         script: String,
+        accessory: View? = null,
     ): View {
         val mine = takes.filter { it.kind == kind }
         val totalSeconds = mine.sumOf { it.durationMs } / 1000
@@ -2467,6 +2736,9 @@ class MainActivity : Activity() {
         return card().apply {
             addView(text(title, 20f, textColor(), Typeface.BOLD))
             addView(text(description, 13f, mutedColor()).withTop(dp(4)))
+            if (accessory != null) {
+                addView(accessory.withTop(dp(12)))
+            }
             addView(
                 text(
                     "${mine.size} saved takes · ${totalSeconds}s captured",
@@ -2485,18 +2757,59 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun tokenRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View =
-        speechRecordCard(
+    private fun tokenRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View {
+        val energy = project.energyPositives
+        val description = if (energy) {
+            "Make the sound “${project.phrase}” over and over with a short gap between each one. " +
+                "The server slices each sound burst into its own positive clip by energy, " +
+                "not Whisper — use this for non-word wake sounds."
+        } else {
+            "Say “${project.phrase}” over and over with a short gap between each one. " +
+                "The server slices every clean repetition into its own positive clip."
+        }
+        // Positive takes carry the energy marker as their script when this project
+        // is a non-lexical sound, so the server energy-slices them deterministically.
+        val script = if (energy) BulkRecording.ENERGY_POSITIVE_MARKER else ""
+        return speechRecordCard(
             project,
             BulkRecording.KIND_POSITIVE,
             title = "Record the wake word",
-            description = "Say “${project.phrase}” over and over with a short gap between each one. " +
-                "The server slices every clean repetition into its own positive clip.",
+            description = description,
             buttonIdle = "●  Record wake word",
             buttonStyle = ButtonStyle.Primary,
             takes = takes,
-            script = "",
+            script = script,
+            accessory = energyPositivesToggle(project),
         )
+    }
+
+    /**
+     * Record-page switch marking this wake word as a non-lexical sound. When on,
+     * positive takes are sliced by sound-burst energy instead of Whisper words —
+     * the fix for fast/non-word wake sounds (e.g. "beep beep") Whisper cannot
+     * transcribe. Persisted per project; disabled while a positive take records.
+     */
+    private fun energyPositivesToggle(project: WakeWordProject): View {
+        val recordingPositive = recorder.isRecording &&
+            activeTakeKind == BulkRecording.KIND_POSITIVE && activeProject?.id == project.id
+        return Switch(this).apply {
+            text = "Wake word is a sound (energy slicing)"
+            textSize = 13f
+            setTextColor(mutedColor())
+            isChecked = project.energyPositives
+            isEnabled = !recordingPositive
+            setOnCheckedChangeListener { _, checked ->
+                if (checked == project.energyPositives) return@setOnCheckedChangeListener
+                store.addProject(project.copy(energyPositives = checked))
+                statusMessage = if (checked) {
+                    "Positives will be energy-sliced for this wake word"
+                } else {
+                    "Positives will be Whisper-sliced for this wake word"
+                }
+                render()
+            }
+        }
+    }
 
     private fun negativeRecordCard(project: WakeWordProject, takes: List<BulkRecording>): View =
         speechRecordCard(
@@ -3140,6 +3453,92 @@ class MainActivity : Activity() {
             } catch (_: Exception) {
                 runOnUiThread {
                     loadingServerRecordings = false
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Load the stored test-take grades for the currently selected model version
+     * and mode once, lazily. Reloads whenever the project, model version, or
+     * detection mode changes so cards and totals always match the picker.
+     */
+    private fun ensureModelGrades(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank() || loadingModelGrades || scoringAllTakes) return
+        val fresh = modelGradesSlug == project.slug &&
+            modelGradesRun == scoreRun &&
+            modelGradesMode == scoreMode
+        if (fresh) return
+        reloadModelGrades(project)
+    }
+
+    private fun reloadModelGrades(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank() || loadingModelGrades) return
+        loadingModelGrades = true
+        val run = scoreRun
+        val mode = scoreMode
+        Thread {
+            try {
+                val grades = BundleSyncClient(serverUrl).loadModelGrades(project.slug, mode, run)
+                runOnUiThread {
+                    modelGrades = grades
+                    modelGradesSlug = project.slug
+                    modelGradesRun = run
+                    modelGradesMode = mode
+                    loadingModelGrades = false
+                    render()
+                }
+            } catch (_: Exception) {
+                runOnUiThread {
+                    loadingModelGrades = false
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * Score every test take against the selected model in one server request, so
+     * the whole set is graded without tapping Score on each. Stores the grades so
+     * the per-take cards and the model totals refresh together when it finishes.
+     */
+    private fun scoreAllTestTakes(project: WakeWordProject) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        if (scoringAllTakes) return
+        scoringAllTakes = true
+        val run = scoreRun
+        val mode = scoreMode
+        val threshold = scoreThreshold
+        statusMessage = "Scoring all test takes in ${if (mode == "reset") "padded" else "continuous"} mode…"
+        render()
+        Thread {
+            try {
+                val grades = BundleSyncClient(serverUrl)
+                    .scoreAllTestTakes(project.slug, mode, threshold, run)
+                runOnUiThread {
+                    modelGrades = grades
+                    modelGradesSlug = project.slug
+                    modelGradesRun = run
+                    modelGradesMode = mode
+                    scoringAllTakes = false
+                    statusMessage =
+                        "Scored ${grades.graded}/${grades.testTakes} test takes · " +
+                        "misses ${grades.falseNegatives} · false alarms ${grades.falsePositives}"
+                    render()
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    scoringAllTakes = false
+                    statusMessage = error.message ?: "Score all failed"
                     render()
                 }
             }

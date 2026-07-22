@@ -394,7 +394,8 @@ class ProjectStore(context: Context) {
                     id TEXT PRIMARY KEY,
                     phrase TEXT NOT NULL,
                     slug TEXT NOT NULL,
-                    created_at_millis INTEGER NOT NULL
+                    created_at_millis INTEGER NOT NULL,
+                    energy_positives INTEGER NOT NULL DEFAULT 0
                 )
                 """.trimIndent(),
             )
@@ -460,6 +461,12 @@ class ProjectStore(context: Context) {
                 // upgraded DB matches a fresh CREATE.
                 addColumnIfMissing(db, TABLE_BULK_RECORDINGS, "kind", "TEXT NOT NULL DEFAULT 'mixed'")
                 addColumnIfMissing(db, TABLE_TEST_RECORDINGS, "kind", "TEXT NOT NULL DEFAULT 'test'")
+            }
+            if (oldVersion < 9) {
+                // Per-project non-lexical flag: positive takes are energy-sliced
+                // rather than Whisper-sliced. Guarded ALTER so an upgraded DB
+                // matches a fresh CREATE. Existing projects default to lexical.
+                addColumnIfMissing(db, TABLE_PROJECTS, "energy_positives", "INTEGER NOT NULL DEFAULT 0")
             }
         }
 
@@ -571,7 +578,7 @@ class ProjectStore(context: Context) {
 
     private companion object {
         const val DATABASE_NAME = "wake_word_collection.db"
-        const val DATABASE_VERSION = 8
+        const val DATABASE_VERSION = 9
         const val LEGACY_PREFS = "wake_word_projects"
 
         // Per-take provenance columns shared by the bulk and background tables.
@@ -610,6 +617,7 @@ private fun WakeWordProject.toContentValues(): ContentValues =
         put("phrase", phrase)
         put("slug", slug)
         put("created_at_millis", createdAtMillis)
+        put("energy_positives", if (energyPositives) 1 else 0)
     }
 
 private fun ClipRecord.toContentValues(): ContentValues =
@@ -689,6 +697,7 @@ private fun Cursor.toProject(): WakeWordProject =
         phrase = getStringValue("phrase"),
         slug = getStringValue("slug"),
         createdAtMillis = getLongValue("created_at_millis"),
+        energyPositives = getOptionalIntValue("energy_positives") == 1,
     )
 
 private fun Cursor.toClip(): ClipRecord =

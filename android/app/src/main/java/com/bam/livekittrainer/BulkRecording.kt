@@ -26,5 +26,14 @@ data class BulkRecording(
         const val KIND_NEGATIVE = "negative"
         const val KIND_HARD_NEGATIVE = "hard_negative"
         const val KIND_TEST = "test"
+
+        /**
+         * Sentinel stored in a positive take's [script] when the project marks its
+         * wake word as a non-lexical sound. The sync server slices positive takes
+         * carrying this marker by sound-burst energy instead of Whisper word
+         * timestamps, regardless of what Whisper transcribes. Must match
+         * `ENERGY_POSITIVE_SCRIPT_MARKER` in the sync server.
+         */
+        const val ENERGY_POSITIVE_MARKER = "__energy_positive__"
     }
 }

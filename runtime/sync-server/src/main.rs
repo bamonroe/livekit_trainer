@@ -49,6 +49,13 @@ const BACKGROUND_MIN_CHUNK_SECONDS: f64 = 1.0;
 // noise take rather than a scripted bulk read. Reprocess branches on this so
 // background sources are re-chunked deterministically instead of Whisper-aligned.
 const BACKGROUND_SCRIPT_MARKER: &str = "__background_noise__";
+// Sentinel stored in a positive take's `script` column when its wake word is a
+// non-lexical sound. The app stamps it (from the project's energy-positives
+// toggle) so this take is *always* energy-sliced, regardless of what Whisper
+// transcribes — this is stronger than the empty-transcript auto-fallback, which
+// misses a take where Whisper happens to catch one of many bursts. Must match
+// `BulkRecording.ENERGY_POSITIVE_MARKER` in the Android app.
+const ENERGY_POSITIVE_SCRIPT_MARKER: &str = "__energy_positive__";
 
 // Energy/VAD fallback for non-lexical positive takes (sounds, not words — e.g. a
 // fast "beep beep") where Whisper returns no words, so word-timestamp slicing
@@ -2513,6 +2520,28 @@ async fn align_one_recording(
             summary,
         );
     }
+    if kind.trim() == "positive" && script == ENERGY_POSITIVE_SCRIPT_MARKER {
+        // The project marked this wake word as a non-lexical sound, so slice this
+        // positive take by burst energy and skip Whisper entirely — a single
+        // burst Whisper happened to catch must not collapse the whole take to one
+        // positive. Reprocess re-enters here because the marker is persisted.
+        return slice_positive_by_energy(
+            recording_id,
+            script,
+            recorded_at,
+            duration_ms,
+            source,
+            slug,
+            phrase,
+            external_id,
+            dest_root,
+            db,
+            "",
+            whisper_url,
+            capture,
+            summary,
+        );
+    }
     let whisper = match transcribe_with_words(whisper_url, source, None).await {
         Ok(whisper) => whisper,
         Err(error) => {
@@ -3156,10 +3185,13 @@ fn slice_positive_by_energy(
         }
     }
 
+    // The energy marker is an internal routing sentinel, not a read-aloud prompt,
+    // so keep it out of the displayed prompt list — but leave it in the persisted
+    // `script` below so reprocess re-enters the energy path.
     let prompts = script
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && *line != ENERGY_POSITIVE_SCRIPT_MARKER)
         .map(ToString::to_string)
         .collect();
     let alignment = db::RecordingAlignment {
