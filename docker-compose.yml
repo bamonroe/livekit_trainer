@@ -36,6 +36,11 @@ services:
       # Read/serve trained models and per-run training status/logs. Read-only:
       # the trainer container writes here through its own /work bind mount.
       - ./output:/output:ro
+      # Trainer scripts, read-only. The synthetic-positive generator needs to
+      # `docker cp` f5_gen_positives.py into the F5 container; docker cp resolves
+      # its local source inside THIS container, so the script must be mounted
+      # here (a host path is not visible from in here).
+      - ./trainer:/trainer:ro
       # Host docker socket: the training endpoints launch the trainer image as a
       # sibling container. Requires group_add above for access.
       - /var/run/docker.sock:/var/run/docker.sock

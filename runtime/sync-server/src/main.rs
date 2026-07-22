@@ -1977,14 +1977,6 @@ async fn generate_synth(
     if !is_safe_slug(&slug) {
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
     }
-    let host_repo_root = match state.host_repo_root.as_ref() {
-        Some(root) => root.clone(),
-        None => {
-            return Err(AppError::internal(
-                "synthetic generation disabled: HOST_REPO_ROOT not set on the sync-server",
-            ))
-        }
-    };
     let params = parse_query(query.as_deref());
     let count: usize = params
         .get("count")
@@ -1997,10 +1989,10 @@ async fn generate_synth(
     // is nothing to clone from.
     let enroll_dir = state.data_root.join(&slug).join("enrollment");
     let positive_dir = state.data_root.join(&slug).join("positive");
-    let (refs_subdir, refs_server_dir) = if dir_has_wav(&enroll_dir) {
-        ("enrollment", enroll_dir)
+    let refs_server_dir = if dir_has_wav(&enroll_dir) {
+        enroll_dir
     } else if dir_has_wav(&positive_dir) {
-        ("positive", positive_dir)
+        positive_dir
     } else {
         return Err(AppError::bad_request(
             "no enrollment or positive clips to clone from; record a voice enrollment take first",
@@ -2038,10 +2030,13 @@ async fn generate_synth(
         );
     }
 
-    let host_refs = format!("{host_repo_root}/data/real/{slug}/{refs_subdir}");
-    let host_gen_py = format!("{host_repo_root}/trainer/scripts/f5_gen_positives.py");
-    let host_out = format!("{host_repo_root}/data/synth_f5/{slug}/positive");
+    // These paths feed `docker cp`, whose local side is resolved inside THIS
+    // container, so they must be container paths (the repo `data/` is mounted at
+    // /data, trainer scripts at /trainer), not host paths.
     let synth_server_dir = synth_positive_dir(&state.data_root, &slug);
+    let cp_refs = refs_server_dir.to_string_lossy().to_string();
+    let cp_gen_py = "/trainer/scripts/f5_gen_positives.py".to_string();
+    let cp_out = synth_server_dir.to_string_lossy().to_string();
 
     let task_state = state.clone();
     let task_slug = slug.clone();
@@ -2052,9 +2047,9 @@ async fn generate_synth(
             &task_phrase,
             count,
             &refs_server_dir,
-            &host_refs,
-            &host_gen_py,
-            &host_out,
+            &cp_refs,
+            &cp_gen_py,
+            &cp_out,
             &synth_server_dir,
         )
         .await;
@@ -2085,16 +2080,18 @@ async fn generate_synth(
 /// Drive one F5 batch end to end: stage ≤8 references into the F5 container, run
 /// the resident generator (writing 16 kHz clips), copy them into the synth
 /// bucket, and clean up. Returns how many clips this run produced. Every path
-/// handed to `docker cp` is a HOST path, since dockerd resolves it on the host.
+/// handed to `docker cp` is a path INSIDE this sync-server container, since the
+/// docker CLI resolves the local side of a cp against its own filesystem — the
+/// repo `data/` is mounted at /data and trainer scripts at /trainer.
 #[allow(clippy::too_many_arguments)]
 async fn run_synth_generation(
     slug: &str,
     phrase: &str,
     count: usize,
     refs_server_dir: &Path,
-    host_refs: &str,
-    host_gen_py: &str,
-    host_out: &str,
+    cp_refs: &str,
+    cp_gen_py: &str,
+    cp_out: &str,
     synth_server_dir: &Path,
 ) -> Result<usize, AppError> {
     let container = f5_container();
@@ -2127,7 +2124,7 @@ async fn run_synth_generation(
     for name in &names {
         docker_ok(vec![
             "cp".into(),
-            format!("{host_refs}/{name}"),
+            format!("{cp_refs}/{name}"),
             format!("{container}:{crefs}/{name}"),
         ])
         .await?;
@@ -2137,7 +2134,7 @@ async fn run_synth_generation(
         if refs_server_dir.join(&sidecar).is_file() {
             docker_ok(vec![
                 "cp".into(),
-                format!("{host_refs}/{sidecar}"),
+                format!("{cp_refs}/{sidecar}"),
                 format!("{container}:{crefs}/{sidecar}"),
             ])
             .await?;
@@ -2147,7 +2144,7 @@ async fn run_synth_generation(
     // Stage and run the resident-model generator, writing 16 kHz clips directly.
     docker_ok(vec![
         "cp".into(),
-        host_gen_py.to_string(),
+        cp_gen_py.to_string(),
         format!("{container}:{scratch}/gen.py"),
     ])
     .await?;
@@ -2171,12 +2168,12 @@ async fn run_synth_generation(
     ])
     .await?;
 
-    // Copy the finished clips into the synth bucket (host path must exist).
+    // Copy the finished clips into the synth bucket (dir must exist first).
     fs::create_dir_all(synth_server_dir)?;
     docker_ok(vec![
         "cp".into(),
         format!("{container}:{cout}/."),
-        format!("{host_out}/"),
+        format!("{cp_out}/"),
     ])
     .await?;
 
