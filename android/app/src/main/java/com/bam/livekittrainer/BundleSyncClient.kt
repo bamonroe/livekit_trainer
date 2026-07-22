@@ -289,6 +289,44 @@ class BundleSyncClient(
         }
     }
 
+    /**
+     * Kick off an F5 voice-cloned positive batch for [wakeWordSlug], seeded by the
+     * enrollment take. Returns immediately with the requested count; the server
+     * runs the batch in the background and [syntheticGenerationStatus] polls it.
+     */
+    fun startSyntheticGeneration(wakeWordSlug: String, count: Int): Int {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/generate?count=$count",
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "POST"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        connection.doOutput = true
+        connection.setFixedLengthStreamingMode(0)
+        val response = readResponse(connection, "Start synthetic generation failed")
+        return JSONObject(response).optInt("requested", count)
+    }
+
+    /** Poll the state of a slug's F5 generation run. */
+    fun syntheticGenerationStatus(wakeWordSlug: String): SyntheticGenStatus {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/generate/status",
+        )
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val root = JSONObject(readResponse(connection, "Synthetic generation status failed"))
+        return SyntheticGenStatus(
+            running = root.optBoolean("running", false),
+            requested = root.optInt("requested", 0),
+            wrote = root.optInt("wrote", 0),
+            error = root.optStringOrNull("error"),
+            idle = root.optBoolean("idle", true),
+        )
+    }
+
     fun loadBulkAlignment(wakeWordSlug: String, sourceRecording: String): BulkAlignment {
         val endpoint = URL(serverUrl.trimEnd('/') + "/review/${urlPart(wakeWordSlug)}/bulk/${urlPart(sourceRecording)}/alignment")
         val connection = endpoint.openConnection() as HttpURLConnection

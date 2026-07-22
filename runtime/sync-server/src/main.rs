@@ -106,6 +106,19 @@ struct AppState {
     // Serializes training-queue dispatch so the enqueue-triggered kick and the
     // periodic scheduler never launch the same queued job twice.
     dispatch_lock: Arc<tokio::sync::Mutex<()>>,
+    // In-flight F5 synthetic-positive generation jobs, keyed by slug, so the app
+    // can kick one off and poll its progress without a second job being launched
+    // for the same wake word.
+    synth_jobs: Arc<Mutex<std::collections::HashMap<String, SynthJob>>>,
+}
+
+/// State of one F5 synthetic-positive generation run for a wake word.
+#[derive(Debug, Clone, Serialize)]
+struct SynthJob {
+    running: bool,
+    requested: usize,
+    wrote: usize,
+    error: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -604,6 +617,7 @@ async fn main() {
         trainer_gpu: Arc::new(trainer_gpu),
         db: Arc::new(Mutex::new(db)),
         dispatch_lock: Arc::new(tokio::sync::Mutex::new(())),
+        synth_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
@@ -645,6 +659,8 @@ async fn main() {
         )
         .route("/synth/:slug/sample", get(synthetic_samples))
         .route("/synth/:slug/audio/:file_name", get(synthetic_audio))
+        .route("/synth/:slug/generate", post(generate_synth))
+        .route("/synth/:slug/generate/status", get(generate_synth_status))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state.clone());
 
@@ -1913,6 +1929,324 @@ async fn synthetic_audio(
     let path = synth_positive_dir(&state.data_root, &slug).join(&file_name);
     let bytes = fs::read(path)?;
     Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
+}
+
+/// The container running the resident F5-TTS model (speech_services stack).
+fn f5_container() -> String {
+    env::var("F5_CONTAINER").unwrap_or_else(|_| "speech-f5tts".to_string())
+}
+
+/// Does this directory hold at least one `.wav`?
+fn dir_has_wav(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().ends_with(".wav"))
+        })
+        .unwrap_or(false)
+}
+
+/// Run `docker` and fail with its stderr if the command exits non-zero.
+async fn docker_ok(args: Vec<String>) -> Result<std::process::Output, AppError> {
+    let output = run_docker(args).await?;
+    if !output.status.success() {
+        return Err(AppError::internal(format!(
+            "docker command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output)
+}
+
+#[derive(Serialize)]
+struct GenerateSynthResponse {
+    status: &'static str,
+    slug: String,
+    requested: usize,
+}
+
+/// Kick off an F5 voice-cloned positive batch for a wake word, seeded by the
+/// enrollment take. Runs the resident F5 model inside the speech-f5tts container
+/// over the mounted docker socket, then copies the 16 kHz clips into the slug's
+/// synth bucket. Returns immediately; progress is polled via the status endpoint.
+async fn generate_synth(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Json<GenerateSynthResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
+    }
+    let host_repo_root = match state.host_repo_root.as_ref() {
+        Some(root) => root.clone(),
+        None => {
+            return Err(AppError::internal(
+                "synthetic generation disabled: HOST_REPO_ROOT not set on the sync-server",
+            ))
+        }
+    };
+    let params = parse_query(query.as_deref());
+    let count: usize = params
+        .get("count")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60)
+        .clamp(1, 1000);
+
+    // Prefer the enrollment read (long, clean, exact-transcript sidecar) as the
+    // cloning reference; fall back to real positive clips. Refuse early if there
+    // is nothing to clone from.
+    let enroll_dir = state.data_root.join(&slug).join("enrollment");
+    let positive_dir = state.data_root.join(&slug).join("positive");
+    let (refs_subdir, refs_server_dir) = if dir_has_wav(&enroll_dir) {
+        ("enrollment", enroll_dir)
+    } else if dir_has_wav(&positive_dir) {
+        ("positive", positive_dir)
+    } else {
+        return Err(AppError::bad_request(
+            "no enrollment or positive clips to clone from; record a voice enrollment take first",
+        ));
+    };
+
+    let phrase = {
+        let conn = state.db.lock().expect("db lock poisoned");
+        db::project_phrase(&conn, &slug)
+            .map_err(db_error)?
+            .map(|(phrase, _)| phrase)
+            .unwrap_or_default()
+    };
+    if phrase.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "unknown wake phrase for this slug",
+        ));
+    }
+
+    {
+        let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+        if jobs.get(&slug).map(|j| j.running).unwrap_or(false) {
+            return Err(AppError::bad_request(
+                "a generation run is already in progress for this wake word",
+            ));
+        }
+        jobs.insert(
+            slug.clone(),
+            SynthJob {
+                running: true,
+                requested: count,
+                wrote: 0,
+                error: None,
+            },
+        );
+    }
+
+    let host_refs = format!("{host_repo_root}/data/real/{slug}/{refs_subdir}");
+    let host_gen_py = format!("{host_repo_root}/trainer/scripts/f5_gen_positives.py");
+    let host_out = format!("{host_repo_root}/data/synth_f5/{slug}/positive");
+    let synth_server_dir = synth_positive_dir(&state.data_root, &slug);
+
+    let task_state = state.clone();
+    let task_slug = slug.clone();
+    let task_phrase = phrase.clone();
+    tokio::spawn(async move {
+        let result = run_synth_generation(
+            &task_slug,
+            &task_phrase,
+            count,
+            &refs_server_dir,
+            &host_refs,
+            &host_gen_py,
+            &host_out,
+            &synth_server_dir,
+        )
+        .await;
+        let mut jobs = task_state.synth_jobs.lock().expect("synth jobs lock poisoned");
+        let entry = jobs.entry(task_slug).or_insert(SynthJob {
+            running: false,
+            requested: count,
+            wrote: 0,
+            error: None,
+        });
+        entry.running = false;
+        match result {
+            Ok(wrote) => {
+                entry.wrote = wrote;
+                entry.error = None;
+            }
+            Err(e) => entry.error = Some(e.message),
+        }
+    });
+
+    Ok(Json(GenerateSynthResponse {
+        status: "ok",
+        slug,
+        requested: count,
+    }))
+}
+
+/// Drive one F5 batch end to end: stage ≤8 references into the F5 container, run
+/// the resident generator (writing 16 kHz clips), copy them into the synth
+/// bucket, and clean up. Returns how many clips this run produced. Every path
+/// handed to `docker cp` is a HOST path, since dockerd resolves it on the host.
+#[allow(clippy::too_many_arguments)]
+async fn run_synth_generation(
+    slug: &str,
+    phrase: &str,
+    count: usize,
+    refs_server_dir: &Path,
+    host_refs: &str,
+    host_gen_py: &str,
+    host_out: &str,
+    synth_server_dir: &Path,
+) -> Result<usize, AppError> {
+    let container = f5_container();
+    let stamp = now_ms();
+    let scratch = format!("/tmp/f5gen_{slug}_{stamp}");
+    let crefs = format!("{scratch}/refs");
+    let cout = format!("{scratch}/out");
+
+    docker_ok(vec![
+        "exec".into(),
+        container.clone(),
+        "mkdir".into(),
+        "-p".into(),
+        crefs.clone(),
+        cout.clone(),
+    ])
+    .await?;
+
+    // Stage a small, clean subset of references (rotated inside the python).
+    let mut names: Vec<String> = fs::read_dir(refs_server_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".wav"))
+        .collect();
+    names.sort();
+    names.truncate(8);
+    if names.is_empty() {
+        return Err(AppError::internal("no reference wavs to stage"));
+    }
+    for name in &names {
+        docker_ok(vec![
+            "cp".into(),
+            format!("{host_refs}/{name}"),
+            format!("{container}:{crefs}/{name}"),
+        ])
+        .await?;
+        // An enrollment reference ships its exact passage in a sibling .txt; stage
+        // it too so F5 gets the right ref_text.
+        let sidecar = format!("{}.txt", name.trim_end_matches(".wav"));
+        if refs_server_dir.join(&sidecar).is_file() {
+            docker_ok(vec![
+                "cp".into(),
+                format!("{host_refs}/{sidecar}"),
+                format!("{container}:{crefs}/{sidecar}"),
+            ])
+            .await?;
+        }
+    }
+
+    // Stage and run the resident-model generator, writing 16 kHz clips directly.
+    docker_ok(vec![
+        "cp".into(),
+        host_gen_py.to_string(),
+        format!("{container}:{scratch}/gen.py"),
+    ])
+    .await?;
+    docker_ok(vec![
+        "exec".into(),
+        container.clone(),
+        "python3".into(),
+        format!("{scratch}/gen.py"),
+        "--refs-dir".into(),
+        crefs.clone(),
+        "--ref-text".into(),
+        phrase.to_string(),
+        "--gen-text".into(),
+        phrase.to_string(),
+        "--out-dir".into(),
+        cout.clone(),
+        "--count".into(),
+        count.to_string(),
+        "--out-sr".into(),
+        "16000".into(),
+    ])
+    .await?;
+
+    // Copy the finished clips into the synth bucket (host path must exist).
+    fs::create_dir_all(synth_server_dir)?;
+    docker_ok(vec![
+        "cp".into(),
+        format!("{container}:{cout}/."),
+        format!("{host_out}/"),
+    ])
+    .await?;
+
+    // Count what this run produced from the container's output dir.
+    let counted = docker_ok(vec![
+        "exec".into(),
+        container.clone(),
+        "sh".into(),
+        "-c".into(),
+        format!("ls -1 {cout}/*.wav 2>/dev/null | wc -l"),
+    ])
+    .await?;
+    let wrote = String::from_utf8_lossy(&counted.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0);
+
+    // Best-effort scratch cleanup.
+    let _ = run_docker(vec![
+        "exec".into(),
+        container,
+        "rm".into(),
+        "-rf".into(),
+        scratch,
+    ])
+    .await;
+
+    Ok(wrote)
+}
+
+#[derive(Serialize)]
+struct GenerateSynthStatusResponse {
+    slug: String,
+    running: bool,
+    requested: usize,
+    wrote: usize,
+    error: Option<String>,
+    idle: bool,
+}
+
+/// Report the state of a slug's F5 generation run for the app to poll.
+async fn generate_synth_status(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<GenerateSynthStatusResponse>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
+    }
+    let job = {
+        let jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+        jobs.get(&slug).cloned()
+    };
+    Ok(Json(match job {
+        Some(j) => GenerateSynthStatusResponse {
+            slug,
+            running: j.running,
+            requested: j.requested,
+            wrote: j.wrote,
+            error: j.error,
+            idle: false,
+        },
+        None => GenerateSynthStatusResponse {
+            slug,
+            running: false,
+            requested: 0,
+            wrote: 0,
+            error: None,
+            idle: true,
+        },
+    }))
 }
 
 fn load_settings(path: &Path) -> ServerSettings {

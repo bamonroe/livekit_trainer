@@ -46,6 +46,10 @@ def main():
     ap.add_argument("--speed-max", type=float, default=1.15)
     ap.add_argument("--model", default="F5TTS_v1_Base")
     ap.add_argument("--seed-base", type=int, default=1234)
+    ap.add_argument("--out-sr", type=int, default=0,
+                    help="If >0, resample each clip to this rate (mono, 16-bit PCM) "
+                         "in-container, so no host-side ffmpeg pass is needed. The "
+                         "trainer wants 16000; 0 keeps F5's native 24 kHz output.")
     args = ap.parse_args()
 
     refs = sorted(glob.glob(os.path.join(args.refs_dir, "*.wav")))
@@ -58,6 +62,20 @@ def main():
 
     rng = random.Random(args.seed_base)
     gen_text = " ".join([args.gen_text.strip()] * args.repeat)
+
+    def to_out_sr(path):
+        # Downsample F5's 24 kHz render to the trainer's 16 kHz mono 16-bit in
+        # place, so callers that ask for --out-sr get training-ready clips with
+        # no external ffmpeg step.
+        if args.out_sr <= 0:
+            return
+        import torchaudio
+        wav, sr = torchaudio.load(path)
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        if sr != args.out_sr:
+            wav = torchaudio.functional.resample(wav, sr, args.out_sr)
+        torchaudio.save(path, wav, args.out_sr, encoding="PCM_S", bits_per_sample=16)
 
     def ref_text_for(ref_path):
         # An enrollment reference ships its exact passage in a sibling .txt; fall
@@ -84,6 +102,7 @@ def main():
             remove_silence=True,
             file_wave=out,
         )
+        to_out_sr(out)
         print(f"[{i+1}/{args.count}] {os.path.basename(ref)} speed={speed:.2f} -> {out}",
               flush=True)
 

@@ -84,6 +84,12 @@ class MainActivity : Activity() {
     private var syntheticSlug: String? = null
     private var syntheticSamples: List<SyntheticSample> = emptyList()
     private var loadingSynthetic: Boolean = false
+    // F5 synthetic-positive generation, kicked off from the enrollment detail page
+    // and polled while the server runs the batch. Slug scopes the status line to
+    // the project being generated.
+    private var synthGenSlug: String? = null
+    private var synthGenerating: Boolean = false
+    private var synthGenMessage: String? = null
     // Live status/log views on the Train page, updated in place by the poller so
     // a running-status refresh never rebuilds the form and clobbers typed input.
     private var trainStatusView: TextView? = null
@@ -2835,13 +2841,32 @@ class MainActivity : Activity() {
             )
             addView(text("Passage read", 15f, mutedColor()).withTop(dp(14)))
             addView(text(ENROLLMENT_PASSAGE, 15f, textColor()).withTop(dp(4)))
+            val generatingThis = synthGenerating && synthGenSlug == project.slug
+            addView(
+                actionButton(
+                    if (generatingThis) "Generating samples…" else "✨  Generate voice samples",
+                    ButtonStyle.Primary,
+                ) { startSyntheticGeneration(project) }
+                    .apply { isEnabled = !generatingThis }.tall().withTop(dp(14)),
+            )
+            addView(
+                text(
+                    "Clones your voice from this read with F5-TTS to make synthetic " +
+                        "positives. They land on the Review page under Synthetic samples.",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(6)),
+            )
+            if (synthGenSlug == project.slug && synthGenMessage != null) {
+                addView(text(synthGenMessage!!, 13f, textColor()).withTop(dp(8)))
+            }
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     addView(
                         actionButton(
                             if (playing) "❚❚  Pause reference" else "▶  Play reference",
-                            ButtonStyle.Primary,
+                            ButtonStyle.Secondary,
                         ) { playEnrollmentReference(project, recording) }.weight1(),
                     )
                     addView(
@@ -2851,6 +2876,73 @@ class MainActivity : Activity() {
                 }.withTop(dp(14)),
             )
         }
+    }
+
+    /**
+     * Kick off an F5 voice-cloned positive batch on the server and poll it to
+     * completion, updating the status line in place. On success the samples are
+     * reloaded so the Review page's Synthetic samples card shows the fresh batch.
+     */
+    private fun startSyntheticGeneration(project: WakeWordProject, count: Int = 100) {
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) {
+            statusMessage = "Set a sync server URL in Settings first"
+            currentPage = AppPage.Settings
+            render()
+            return
+        }
+        synthGenSlug = project.slug
+        synthGenerating = true
+        synthGenMessage = "Starting generation of $count samples…"
+        render()
+        Thread {
+            try {
+                val client = BundleSyncClient(serverUrl)
+                client.startSyntheticGeneration(project.slug, count)
+                // Poll until the server reports the run finished. F5 batches take
+                // minutes, so a slow poll keeps traffic light.
+                while (true) {
+                    Thread.sleep(4_000)
+                    val status = client.syntheticGenerationStatus(project.slug)
+                    if (status.running) {
+                        runOnUiThread {
+                            if (synthGenSlug == project.slug) {
+                                synthGenMessage = "Generating $count samples in your voice — this runs on the server…"
+                                render()
+                            }
+                        }
+                        continue
+                    }
+                    // Finished (or idle after a server restart). Reload the sample
+                    // spread so Review reflects the new clips.
+                    val samples = try {
+                        client.loadSyntheticSamples(project.slug)
+                    } catch (_: Exception) {
+                        syntheticSamples
+                    }
+                    runOnUiThread {
+                        synthGenerating = false
+                        syntheticSlug = project.slug
+                        syntheticSamples = samples
+                        synthGenMessage = when {
+                            status.error != null -> "Generation failed: ${status.error}"
+                            status.wrote > 0 -> "Generated ${status.wrote} samples. Open Review → Synthetic samples to hear them."
+                            else -> "Generation finished. Open Review → Synthetic samples."
+                        }
+                        statusMessage = synthGenMessage ?: ""
+                        render()
+                    }
+                    break
+                }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    synthGenerating = false
+                    synthGenMessage = error.message ?: "Generation failed"
+                    statusMessage = synthGenMessage ?: ""
+                    render()
+                }
+            }
+        }.start()
     }
 
     /** Stream the whole enrollment take back, mirroring the review-clip player. */

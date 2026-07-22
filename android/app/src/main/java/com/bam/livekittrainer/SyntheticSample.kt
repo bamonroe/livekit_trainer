@@ -11,3 +11,16 @@ data class SyntheticSample(
     val text: String,
     val audioUrl: String,
 )
+
+/**
+ * State of a server-side F5 synthetic-positive generation run for one wake word,
+ * polled while the enrollment detail page is generating a batch. [idle] means the
+ * server has no record of a run for this slug (never started, or since restarted).
+ */
+data class SyntheticGenStatus(
+    val running: Boolean,
+    val requested: Int,
+    val wrote: Int,
+    val error: String?,
+    val idle: Boolean,
+)
