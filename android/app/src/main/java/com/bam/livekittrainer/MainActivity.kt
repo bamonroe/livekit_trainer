@@ -2748,6 +2748,12 @@ class MainActivity : Activity() {
     }
 
     private fun bulkRecordingDetailCard(project: WakeWordProject, recording: BulkRecording): View {
+        // Enrollment reads are stored whole as the F5 voice-cloning reference and
+        // never sliced, so the generic slice/reprocess view is wrong for them —
+        // it reads as "0 slices, still processing". Give them their own view.
+        if (recording.kind == BulkRecording.KIND_ENROLLMENT) {
+            return enrollmentDetailCard(project, recording)
+        }
         val reviewClips = if (bulkReviewProjectSlug == project.slug) {
             bulkReviewClips.filter { it.sourceRecording == recording.id }
         } else {
@@ -2803,6 +2809,87 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    /**
+     * Detail view for a voice-enrollment take. The take is stored whole as the
+     * F5 voice-cloning reference and is intentionally never sliced, so this shows
+     * the passage and lets the user play the reference back to confirm it sounds
+     * clean — instead of the generic slice/reprocess controls, which would say
+     * "0 slices" and prompt a pointless reprocess.
+     */
+    private fun enrollmentDetailCard(project: WakeWordProject, recording: BulkRecording): View {
+        val playbackKey = "enrollment:${recording.id}"
+        val playing = activePlaybackKey == playbackKey && player?.isPlaying == true
+        return card().apply {
+            addView(text("Voice enrollment  ${recording.durationMs / 1000}s", 20f, textColor(), Typeface.BOLD))
+            addView(text(formatRecordedAt(recording.recordedAtMillis), 13f, textColor()).withTop(dp(2)))
+            addView(
+                text(
+                    "Stored whole as your F5-TTS voice-cloning reference. It is intentionally " +
+                        "never sliced — the trainer uses it to generate synthetic positives in your " +
+                        "voice. Nothing more to process here.",
+                    13f,
+                    mutedColor(),
+                ).withTop(dp(10)),
+            )
+            addView(text("Passage read", 15f, mutedColor()).withTop(dp(14)))
+            addView(text(ENROLLMENT_PASSAGE, 15f, textColor()).withTop(dp(4)))
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(
+                        actionButton(
+                            if (playing) "❚❚  Pause reference" else "▶  Play reference",
+                            ButtonStyle.Primary,
+                        ) { playEnrollmentReference(project, recording) }.weight1(),
+                    )
+                    addView(
+                        actionButton("Delete", ButtonStyle.Danger) { confirmDeleteRecording(recording) }
+                            .weight1().withLeft(dp(8)),
+                    )
+                }.withTop(dp(14)),
+            )
+        }
+    }
+
+    /** Stream the whole enrollment take back, mirroring the review-clip player. */
+    private fun playEnrollmentReference(project: WakeWordProject, recording: BulkRecording) {
+        val playbackKey = "enrollment:${recording.id}"
+        player?.let { current ->
+            if (activePlaybackKey == playbackKey) {
+                if (current.isPlaying) current.pause() else current.start()
+                render()
+                return
+            }
+        }
+        stopAlignmentTicker()
+        player?.release()
+        player = null
+        activePlaybackKey = playbackKey
+        try {
+            val url = BundleSyncClient(savedServerUrl()).sourceAudioUrl(project.slug, recording.id)
+            player = MediaPlayer().apply {
+                setDataSource(url)
+                setOnPreparedListener {
+                    it.start()
+                    render()
+                }
+                setOnCompletionListener {
+                    it.release()
+                    if (player === it) player = null
+                    activePlaybackKey = null
+                    render()
+                }
+                prepareAsync()
+            }
+            statusMessage = "Loading enrollment reference"
+        } catch (error: Exception) {
+            activePlaybackKey = null
+            player = null
+            statusMessage = error.message ?: "Could not play enrollment reference"
+        }
+        render()
     }
 
     /** A plain record-and-stop card for one speech-take kind, with no prompt. */
@@ -3189,6 +3276,9 @@ class MainActivity : Activity() {
         store.deleteBulkRecording(recording)
         // Drop any loaded slices for this recording so the UI updates at once.
         bulkReviewClips = bulkReviewClips.filterNot { it.sourceRecording == recording.id }
+        // Also drop it from the cached server list so Review reflects the delete
+        // without waiting for a re-sync (the server delete fires below).
+        serverRecordings = serverRecordings.filterNot { it.id == recording.id }
         val serverUrl = savedServerUrl()
         currentPage = AppPage.Review
         statusMessage = "Deleted bulk recording"
