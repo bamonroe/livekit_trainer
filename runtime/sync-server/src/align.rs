@@ -515,6 +515,219 @@ fn phrase_slice_geometry(
     (start, end, visible_first, visible_last)
 }
 
+/// Cut one positive clip per aligned wake-phrase range. For each range: compute
+/// the tail-aligned cut geometry, write the slice WAV, then re-transcribe the cut
+/// audio and drop it if the wake phrase is not heard (a transient Whisper error
+/// keeps the slice). Every span is marked `occupied` so the generic negative pass
+/// will not re-cut the same words. Extracted verbatim from `align_one_recording`.
+#[allow(clippy::too_many_arguments)]
+async fn cut_positive_slices(
+    words: &[WhisperWord],
+    positive_ranges: &[(usize, usize)],
+    recording_id: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    dest_root: &Path,
+    phrase: &str,
+    phrase_words: &[String],
+    whisper_url: &str,
+    source_end: f64,
+    occupied: &mut Vec<(f64, f64)>,
+    slice_rows: &mut Vec<db::SliceRow>,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    for (first, last) in positive_ranges.iter() {
+        let (start, end, visible_first, visible_last) =
+            phrase_slice_geometry(words, *first, *last, source_end);
+        let slice_words = &words[visible_first..=visible_last];
+        let clip_id = bulk_clip_hash_id(
+            recording_id,
+            recorded_at,
+            duration_ms,
+            "positive",
+            start,
+            end,
+            slice_words,
+        );
+        let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(phrase));
+        let dest = dest_root.join("positive").join(&file_name);
+        if write_wav_slice(source, &dest, start, end)? {
+            // Verify the cut audio actually contains the wake phrase, judged
+            // on its own with no script prompt. Whisper word timings are
+            // unstable, so a phrase the alignment placed here may not really
+            // be in the slice; drop it rather than poison training.
+            let heard = transcribe_with_words(whisper_url, &dest, None)
+                .await
+                .ok()
+                .map(|response| transcript_tail_has_phrase(&response.text, phrase_words));
+            match heard {
+                Some(false) => {
+                    let _ = fs::remove_file(&dest);
+                    summary.dropped_positives += 1;
+                    summary.warnings.push(format!(
+                        "{}: dropped positive at {:.2}-{:.2}s; wake phrase not heard in slice",
+                        recording_id, start, end
+                    ));
+                }
+                // Kept when the phrase is heard, or when verification itself
+                // failed (a transient Whisper error should not discard data).
+                _ => {
+                    slice_rows.push(build_slice_row(
+                        &clip_id,
+                        "positive",
+                        "positive",
+                        &dest,
+                        &file_name,
+                        start,
+                        end,
+                        slice_words,
+                    ));
+                    summary.positives += 1;
+                }
+            }
+        }
+        occupied.push((start, end));
+    }
+    Ok(())
+}
+
+/// Cut one hard-negative clip per near-miss wake-phrase range: the wake phrase
+/// captured in a near-miss frame. Uses the same generous bounds as a positive so
+/// the whole phrase is present, but files it under the project-scoped
+/// `hard_negative` category with a distinct label, and marks each span
+/// `occupied` so the generic negative pass does not re-cut the same words.
+/// Extracted verbatim from `align_one_recording`.
+#[allow(clippy::too_many_arguments)]
+fn cut_hard_negative_slices(
+    words: &[WhisperWord],
+    hard_negative_ranges: &[(usize, usize)],
+    recording_id: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    dest_root: &Path,
+    source_end: f64,
+    occupied: &mut Vec<(f64, f64)>,
+    slice_rows: &mut Vec<db::SliceRow>,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    for (first, last) in hard_negative_ranges.iter() {
+        let (start, end, visible_first, visible_last) =
+            phrase_slice_geometry(words, *first, *last, source_end);
+        let slice_words = &words[visible_first..=visible_last];
+        let clip_id = bulk_clip_hash_id(
+            recording_id,
+            recorded_at,
+            duration_ms,
+            "hard_negative",
+            start,
+            end,
+            slice_words,
+        );
+        let phrase_text = join_slice_words(slice_words);
+        let file_name = format!(
+            "{}_{}.wav",
+            safe_filename(&clip_id),
+            safe_filename(&phrase_text)
+        );
+        // Hard negatives live in their own on-disk category so the pooling
+        // assembler keeps them scoped to this project instead of borrowing
+        // them into every other wake word's negative pool.
+        let dest = dest_root.join("hard_negative").join(&file_name);
+        if write_wav_slice(source, &dest, start, end)? {
+            slice_rows.push(build_slice_row(
+                &clip_id,
+                "hard_negative",
+                "hard_negative",
+                &dest,
+                &file_name,
+                start,
+                end,
+                slice_words,
+            ));
+            summary.hard_negatives += 1;
+        }
+        occupied.push((start, end));
+    }
+    Ok(())
+}
+
+/// Generic negative pass: every stretch of speech not already claimed by a
+/// positive or hard-negative cut becomes a clip labelled `negative_label`. For a
+/// `negative`/`hard_negative` take `occupied` is empty, so this chops the whole
+/// read. Hard-negative reads file under the project-scoped `hard_negative`
+/// category; everything else pools into `negative`. Extracted verbatim from
+/// `align_one_recording` (previously the body of its `if run_negatives` block).
+#[allow(clippy::too_many_arguments)]
+fn cut_negative_slices(
+    words: &[WhisperWord],
+    occupied: &[(f64, f64)],
+    negative_label: &str,
+    recording_id: &str,
+    recorded_at: &str,
+    duration_ms: u64,
+    source: &Path,
+    dest_root: &Path,
+    source_end: f64,
+    slice_rows: &mut Vec<db::SliceRow>,
+    summary: &mut AlignmentSummary,
+) -> Result<(), AppError> {
+    let negative_ranges = negative_ranges(words, occupied);
+    for (_, _, word_start, word_end) in negative_ranges.iter() {
+        let (start, end) = padded_bounds(
+            words,
+            *word_start,
+            *word_end,
+            source_end,
+            CUT_LEAD_PADDING_SECONDS,
+            NEGATIVE_TAIL_PADDING_SECONDS,
+            true,
+        );
+        let (start, end) = clamp_slice_span(start, end, false);
+        let (visible_first, visible_last) =
+            visible_range(words, *word_start, *word_end, start, end);
+        let slice_words = &words[visible_first..=visible_last];
+        let clip_id = bulk_clip_hash_id(
+            recording_id,
+            recorded_at,
+            duration_ms,
+            negative_label,
+            start,
+            end,
+            slice_words,
+        );
+        let phrase_text = join_slice_words(slice_words);
+        let file_name = format!(
+            "{}_{}.wav",
+            safe_filename(&clip_id),
+            safe_filename(&phrase_text)
+        );
+        // A hard-negative take files its whole read under the hard_negative
+        // category (project-scoped); everything else is a pooled negative.
+        let neg_category = neg_category_for_label(negative_label);
+        let dest = dest_root.join(neg_category).join(&file_name);
+        if write_wav_slice(source, &dest, start, end)? {
+            slice_rows.push(build_slice_row(
+                &clip_id,
+                negative_label,
+                neg_category,
+                &dest,
+                &file_name,
+                start,
+                end,
+                slice_words,
+            ));
+            if negative_label == "hard_negative" {
+                summary.hard_negatives += 1;
+            } else {
+                summary.negatives += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Delete the slice files a previous alignment pass wrote for this recording, so
 /// a fresh pass never leaves orphaned clips behind. Reads the active slice paths
 /// from the DB and removes each that still exists on disk. Every alignment path
@@ -726,160 +939,55 @@ pub(crate) async fn align_one_recording(
 
         let mut occupied = Vec::new();
         let mut slice_rows = Vec::new();
-        for (first, last) in positive_ranges.iter() {
-            let (start, end, visible_first, visible_last) =
-                phrase_slice_geometry(&words, *first, *last, source_end);
-            let slice_words = &words[visible_first..=visible_last];
-            let clip_id = bulk_clip_hash_id(
-                recording_id,
-                recorded_at,
-                duration_ms,
-                "positive",
-                start,
-                end,
-                slice_words,
-            );
-            let file_name = format!("{}_{}.wav", safe_filename(&clip_id), safe_filename(phrase));
-            let dest = dest_root.join("positive").join(&file_name);
-            if write_wav_slice(source, &dest, start, end)? {
-                // Verify the cut audio actually contains the wake phrase, judged
-                // on its own with no script prompt. Whisper word timings are
-                // unstable, so a phrase the alignment placed here may not really
-                // be in the slice; drop it rather than poison training.
-                let heard = transcribe_with_words(whisper_url, &dest, None)
-                    .await
-                    .ok()
-                    .map(|response| transcript_tail_has_phrase(&response.text, &phrase_words));
-                match heard {
-                    Some(false) => {
-                        let _ = fs::remove_file(&dest);
-                        summary.dropped_positives += 1;
-                        summary.warnings.push(format!(
-                            "{}: dropped positive at {:.2}-{:.2}s; wake phrase not heard in slice",
-                            recording_id, start, end
-                        ));
-                    }
-                    // Kept when the phrase is heard, or when verification itself
-                    // failed (a transient Whisper error should not discard data).
-                    _ => {
-                        slice_rows.push(build_slice_row(
-                            &clip_id,
-                            "positive",
-                            "positive",
-                            &dest,
-                            &file_name,
-                            start,
-                            end,
-                            slice_words,
-                        ));
-                        summary.positives += 1;
-                    }
-                }
-            }
-            occupied.push((start, end));
-        }
-
-        // Hard negatives: the wake phrase captured in a near-miss frame. Cut with
-        // the same generous bounds as a positive so the whole phrase is present,
-        // but file it under the negative category with a distinct label, and mark
-        // it occupied so the generic negative pass does not re-cut the same words.
-        for (first, last) in hard_negative_ranges.iter() {
-            let (start, end, visible_first, visible_last) =
-                phrase_slice_geometry(&words, *first, *last, source_end);
-            let slice_words = &words[visible_first..=visible_last];
-            let clip_id = bulk_clip_hash_id(
-                recording_id,
-                recorded_at,
-                duration_ms,
-                "hard_negative",
-                start,
-                end,
-                slice_words,
-            );
-            let phrase_text = join_slice_words(slice_words);
-            let file_name = format!(
-                "{}_{}.wav",
-                safe_filename(&clip_id),
-                safe_filename(&phrase_text)
-            );
-            // Hard negatives live in their own on-disk category so the pooling
-            // assembler keeps them scoped to this project instead of borrowing
-            // them into every other wake word's negative pool.
-            let dest = dest_root.join("hard_negative").join(&file_name);
-            if write_wav_slice(source, &dest, start, end)? {
-                slice_rows.push(build_slice_row(
-                    &clip_id,
-                    "hard_negative",
-                    "hard_negative",
-                    &dest,
-                    &file_name,
-                    start,
-                    end,
-                    slice_words,
-                ));
-                summary.hard_negatives += 1;
-            }
-            occupied.push((start, end));
-        }
-
+        cut_positive_slices(
+            &words,
+            &positive_ranges,
+            recording_id,
+            recorded_at,
+            duration_ms,
+            source,
+            dest_root,
+            phrase,
+            &phrase_words,
+            whisper_url,
+            source_end,
+            &mut occupied,
+            &mut slice_rows,
+            summary,
+        )
+        .await?;
+        cut_hard_negative_slices(
+            &words,
+            &hard_negative_ranges,
+            recording_id,
+            recorded_at,
+            duration_ms,
+            source,
+            dest_root,
+            source_end,
+            &mut occupied,
+            &mut slice_rows,
+            summary,
+        )?;
         // Generic negative pass: every stretch of speech not already claimed by a
         // positive or hard-negative cut becomes a negative clip. For a `negative`
         // or `hard_negative` take `occupied` is empty, so this chops the whole
         // read; `negative_label` files it under the matching label. Skipped for a
         // token take so its silent gaps never turn into stray clips.
         if run_negatives {
-            let negative_ranges = negative_ranges(&words, &occupied);
-            for (_, _, word_start, word_end) in negative_ranges.iter() {
-                let (start, end) = padded_bounds(
-                    &words,
-                    *word_start,
-                    *word_end,
-                    source_end,
-                    CUT_LEAD_PADDING_SECONDS,
-                    NEGATIVE_TAIL_PADDING_SECONDS,
-                    true,
-                );
-                let (start, end) = clamp_slice_span(start, end, false);
-                let (visible_first, visible_last) =
-                    visible_range(&words, *word_start, *word_end, start, end);
-                let slice_words = &words[visible_first..=visible_last];
-                let clip_id = bulk_clip_hash_id(
-                    recording_id,
-                    recorded_at,
-                    duration_ms,
-                    negative_label,
-                    start,
-                    end,
-                    slice_words,
-                );
-                let phrase_text = join_slice_words(slice_words);
-                let file_name = format!(
-                    "{}_{}.wav",
-                    safe_filename(&clip_id),
-                    safe_filename(&phrase_text)
-                );
-                // A hard-negative take files its whole read under the hard_negative
-                // category (project-scoped); everything else is a pooled negative.
-                let neg_category = neg_category_for_label(negative_label);
-                let dest = dest_root.join(neg_category).join(&file_name);
-                if write_wav_slice(source, &dest, start, end)? {
-                    slice_rows.push(build_slice_row(
-                        &clip_id,
-                        negative_label,
-                        neg_category,
-                        &dest,
-                        &file_name,
-                        start,
-                        end,
-                        slice_words,
-                    ));
-                    if negative_label == "hard_negative" {
-                        summary.hard_negatives += 1;
-                    } else {
-                        summary.negatives += 1;
-                    }
-                }
-            }
+            cut_negative_slices(
+                &words,
+                &occupied,
+                negative_label,
+                recording_id,
+                recorded_at,
+                duration_ms,
+                source,
+                dest_root,
+                source_end,
+                &mut slice_rows,
+                summary,
+            )?;
         }
 
         let word_rows = word_rows_from(&words);
