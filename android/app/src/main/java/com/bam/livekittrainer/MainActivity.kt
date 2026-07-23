@@ -1597,10 +1597,35 @@ class MainActivity : Activity() {
         workspace.addView(trainingStatusCard(project).withTop(dp(12)))
         workspace.addView(trainingQueueCard(project).withTop(dp(12)))
         maybeStatus()
+        // The positive calculator needs this word's real clip count; it is only
+        // cached after a Review visit, so pull it here if it's missing.
+        ensureProjectCountsForTrain(project)
         // Pull the current status and queue once on entry; they self-schedule
         // while anything is running or queued.
         refreshTrainingStatus(project, showErrors = false)
         refreshTrainingQueue()
+    }
+
+    /** Load per-project clip counts for the Train calculator if absent, then
+     *  re-render so the total reflects this word's real positives. No-op once the
+     *  slug is cached, so it never loops. */
+    private fun ensureProjectCountsForTrain(project: WakeWordProject) {
+        if (projectCounts[project.slug] != null) return
+        val serverUrl = savedServerUrl()
+        if (serverUrl.isBlank()) return
+        val token = trainPollToken
+        Thread {
+            val counts = try {
+                BundleSyncClient(serverUrl).loadProjectCounts()
+            } catch (_: Exception) {
+                return@Thread
+            }
+            runOnUiThread {
+                projectCounts = counts
+                // Only redraw if the user is still on this Train view.
+                if (currentPage == AppPage.Train && token == trainPollToken) render()
+            }
+        }.start()
     }
 
     private fun trainingFormCard(project: WakeWordProject): View {
