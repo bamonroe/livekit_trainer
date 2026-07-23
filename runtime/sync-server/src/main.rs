@@ -1618,6 +1618,9 @@ fn read_model_manifest(
         onnx_bytes: mi64("onnx_bytes"),
         eval,
         params_json: Some(manifest_raw),
+        synth_positive: mi64("synth_positive"),
+        kokoro_positive: mi64("kokoro_positive"),
+        total_positive_input: mi64("total_positive_input"),
     })
 }
 
@@ -1944,6 +1947,176 @@ fn dir_has_wav(dir: &Path) -> bool {
                 .any(|e| e.file_name().to_string_lossy().ends_with(".wav"))
         })
         .unwrap_or(false)
+}
+
+/// How many `*.wav` files a directory holds (0 if missing/unreadable).
+fn count_wavs(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".wav"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Resolve the F5 cloning-reference directory for a slug: prefer short real
+/// positive clips (their transcript is exactly the phrase and their length is
+/// F5-friendly), falling back to an enrollment take only if no positives exist.
+fn resolve_synth_refs(data_root: &Path, slug: &str) -> Result<PathBuf, AppError> {
+    let positive_dir = data_root.join(slug).join("positive");
+    let enroll_dir = data_root.join(slug).join("enrollment");
+    if dir_has_wav(&positive_dir) {
+        Ok(positive_dir)
+    } else if dir_has_wav(&enroll_dir) {
+        Ok(enroll_dir)
+    } else {
+        Err(AppError::bad_request(
+            "no positive or enrollment clips to clone from; record positives first",
+        ))
+    }
+}
+
+/// Drive one F5 batch for a slug: resolve its reference clips, run the resident
+/// generator, and land the resampled clips in the synth bucket. Returns how many
+/// clips this run produced. Shared by the manual `/synth/generate` endpoint and
+/// the train-time pre-generation step.
+async fn generate_synth_batch(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    count: usize,
+) -> Result<usize, AppError> {
+    let refs = resolve_synth_refs(&state.data_root, slug)?;
+    let synth_dir = synth_positive_dir(&state.data_root, slug);
+    let cp_refs = refs.to_string_lossy().to_string();
+    let cp_out = synth_dir.to_string_lossy().to_string();
+    let cp_gen_py = "/trainer/scripts/f5_gen_positives.py".to_string();
+    run_synth_generation(
+        slug, phrase, count, &refs, &cp_refs, &cp_gen_py, &cp_out, &synth_dir,
+    )
+    .await
+}
+
+/// Ensure the F5 synth bucket for `slug` holds `vt.f5_count` voice-cloned
+/// positives before the trainer assembles them, generating a fresh batch when it
+/// is short. Reuses an existing batch that is already large enough (so repeated
+/// trains don't re-pay F5's cost); otherwise clears the bucket and regenerates
+/// exactly `f5_count` (the generator names clips `f5_00000..`, so a clean bucket
+/// yields exactly the count the user asked for with no stale leftovers). Writes
+/// an `f5gen` phase into train_status.json so the app's training screen shows it.
+/// Non-fatal: on any failure it logs, records the error, and returns whatever
+/// clips exist so training still proceeds. Returns the final clip count.
+async fn ensure_f5_positives(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+) -> usize {
+    let target = vt.f5_count as usize;
+    let synth_dir = synth_positive_dir(&state.data_root, slug);
+    if target == 0 {
+        return count_wavs(&synth_dir);
+    }
+    let existing = count_wavs(&synth_dir);
+    if existing >= target {
+        return existing;
+    }
+    // Can we clone at all? Resolve references before touching the bucket so a
+    // slug with no positives keeps whatever clips it already has.
+    if let Err(e) = resolve_synth_refs(&state.data_root, slug) {
+        eprintln!("f5 pregen: no reference clips for {slug}: {}", e.message);
+        return existing;
+    }
+    // Don't collide with a manual generation already running for this slug.
+    {
+        let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+        if jobs.get(slug).map(|j| j.running).unwrap_or(false) {
+            eprintln!(
+                "f5 pregen: a manual generation is already running for {slug}; \
+                 training on the {existing} existing clips"
+            );
+            return existing;
+        }
+        jobs.insert(
+            slug.to_string(),
+            SynthJob {
+                running: true,
+                requested: target,
+                wrote: existing,
+                error: None,
+            },
+        );
+    }
+    write_f5_status(
+        state,
+        slug,
+        phrase,
+        vt,
+        target,
+        0,
+        &format!("generating {target} voice-cloned positives (F5)"),
+    );
+    // Fresh batch: clear the bucket so the count is exactly `target` (no stale
+    // clips from a previous, larger run linger).
+    let _ = fs::remove_dir_all(&synth_dir);
+    let result = generate_synth_batch(state, slug, phrase, target).await;
+    let wrote = *result.as_ref().unwrap_or(&0);
+    if let Err(e) = &result {
+        eprintln!("f5 pregen failed for {slug}: {}", e.message);
+    }
+    {
+        let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+        if let Some(j) = jobs.get_mut(slug) {
+            j.running = false;
+            j.wrote = wrote;
+            j.error = result.as_ref().err().map(|e| e.message.clone());
+        }
+    }
+    let msg = match &result {
+        Ok(w) => format!("generated {w} voice-cloned positives (F5)"),
+        Err(e) => format!(
+            "F5 generation failed: {}; training on existing clips",
+            e.message
+        ),
+    };
+    write_f5_status(state, slug, phrase, vt, target, wrote, &msg);
+    count_wavs(&synth_dir)
+}
+
+/// Write the pre-training `f5gen` phase into a slug's train_status.json. The
+/// trainer overwrites this file with its own phases once it launches; until then
+/// the app sees a `running` status stepped `f5gen`, with the F5 clip counts.
+fn write_f5_status(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+    requested: usize,
+    wrote: usize,
+    message: &str,
+) {
+    let dir = state.models_root.join(slug);
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let body = json!({
+        "slug": slug,
+        "phrase": phrase,
+        "state": "running",
+        "step": "f5gen",
+        "exit_code": 0,
+        "message": message,
+        "steps": vt.steps,
+        "model_size": vt.model_size,
+        "personal": vt.personal,
+        "f5_requested": requested,
+        "f5_wrote": wrote,
+        "started_at": now,
+        "updated_at": now,
+    });
+    let _ = fs::write(dir.join("train_status.json"), body.to_string());
 }
 
 /// Run `docker` and fail with its stderr if the command exits non-zero.
@@ -4412,6 +4585,9 @@ struct TrainRequest {
     n_samples_val: Option<u32>,
     personal: Option<bool>,
     positive_boost: Option<u32>,
+    // How many F5 voice-cloned positives to generate (in the sync-server, before
+    // the trainer launches) and fold into training. 0/omitted = no F5 clips.
+    f5_count: Option<u32>,
     positive_per_batch: Option<u32>,
     real_samples_dir: Option<String>,
     // "start" | "end". Selects the leading-context recipe (see
@@ -4494,6 +4670,7 @@ struct ValidatedTrain {
     target_fp_per_hour: f64,
     personal: bool,
     positive_boost: u32,
+    f5_count: u32,
     n_samples: Option<u32>,
     n_samples_val: Option<u32>,
     positive_per_batch: Option<u32>,
@@ -4578,6 +4755,7 @@ fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
         target_fp_per_hour,
         personal: request.personal.unwrap_or(false),
         positive_boost: request.positive_boost.unwrap_or(1).clamp(1, 50),
+        f5_count: request.f5_count.unwrap_or(0).min(2000),
         n_samples: request.n_samples,
         n_samples_val: request.n_samples_val,
         positive_per_batch: request.positive_per_batch,
@@ -4714,6 +4892,7 @@ async fn launch_train_container(
         if vt.personal { "1".into() } else { "0".into() },
     );
     push_env(&mut args, "POSITIVE_BOOST", vt.positive_boost.to_string());
+    push_env(&mut args, "F5_COUNT", vt.f5_count.to_string());
     if let Some(n) = vt.n_samples {
         push_env(&mut args, "N_SAMPLES", n.to_string());
     }
@@ -4757,6 +4936,14 @@ async fn launch_train_container(
     args.push("bash".into());
     args.push("-lc".into());
     args.push("bash /work/trainer/scripts/train_job.sh".into());
+
+    // F5 voice-cloned positives are generated HERE, in the sync-server, before
+    // the trainer launches: only this container can reach the speech-f5tts
+    // service (the trainer container has no docker access). This tops the synth
+    // bucket up to vt.f5_count; the trainer then pools them into positives. The
+    // f5gen phase is written into train_status.json so the app's training screen
+    // shows it. Non-fatal — training proceeds on whatever clips exist.
+    ensure_f5_positives(state, slug, phrase, vt).await;
 
     let output = run_docker(args).await?;
     if !output.status.success() {
@@ -5150,9 +5337,12 @@ async fn training_status(
     let mut body = match file_status {
         Some(mut status) => {
             // A "running" file with no live container means the run died without
-            // writing a terminal status (crash / OOM / killed).
+            // writing a terminal status (crash / OOM / killed) — UNLESS it is the
+            // pre-launch f5gen phase, which the sync-server writes while it clones
+            // voice positives and before any trainer container exists.
             if !running
                 && status.get("state").and_then(Value::as_str) == Some("running")
+                && status.get("step").and_then(Value::as_str) != Some("f5gen")
             {
                 status["state"] = json!("stopped");
                 status["message"] = json!("trainer container exited before completing");
@@ -5177,7 +5367,11 @@ async fn training_status(
     // Templated per-step progress parsed from the trainer log tail.
     {
         let run_state = body.get("state").and_then(Value::as_str).unwrap_or("none");
-        if matches!(run_state, "running" | "starting" | "succeeded") {
+        let step = body.get("step").and_then(Value::as_str).unwrap_or("");
+        // Skip the six-step trainer progress during f5gen: the trainer hasn't run
+        // yet, so any train.log is stale from a prior run. The app renders the
+        // f5gen phase from the status body instead.
+        if matches!(run_state, "running" | "starting" | "succeeded") && step != "f5gen" {
             let log_path = state.models_root.join(&slug).join("train.log");
             if let Some(text) = read_tail_bytes(&log_path, 1_048_576) {
                 body["progress"] = parse_train_progress(&text, run_state);
@@ -5283,7 +5477,10 @@ async fn training_status(
         };
         if let Some(entry) = entry {
             body["queue_id"] = json!(entry.id);
-            if entry.state == "queued" && !running {
+            // The pre-launch f5gen phase is a queued entry with no container yet,
+            // but it is actively generating — don't overwrite it with "queued".
+            let f5gen = body.get("step").and_then(Value::as_str) == Some("f5gen");
+            if entry.state == "queued" && !running && !f5gen {
                 let position = {
                     let conn = state.db.lock().expect("db lock poisoned");
                     db::queue_position(&conn, entry.id).ok().flatten()

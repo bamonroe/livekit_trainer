@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Bumped whenever the schema changes so `migrate` can evolve an existing file.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Per-take capture provenance forwarded by the app: which device and input
 /// route recorded it, the mic's native format before the app's 16 kHz mono
@@ -28,6 +28,33 @@ pub struct CaptureMeta {
     pub source_sample_rate_hz: Option<i64>,
     pub source_channels: Option<i64>,
     pub session_id: Option<String>,
+}
+
+/// A graded scoring result for one test take against one trained model, derived
+/// from the rolling curve overlaid on the Whisper transcript. Persisted so each
+/// take's score on each model survives without re-running the scorer, and so the
+/// Model test view can total misses (false negatives) and false positives across
+/// all test takes for a model. `model_fp` is the model fingerprint the grade was
+/// computed against (an archived run's `run-<id>` or the current model's size+
+/// mtime fingerprint); `run_id` is the archived run scored, or None for current.
+#[derive(Debug, Clone)]
+pub struct ScoreGrade {
+    pub recording_id: String,
+    pub run_id: Option<String>,
+    pub threshold: f64,
+    /// Representative score for the take: the peak over located target phrases,
+    /// or the global curve maximum when the take has no target phrase.
+    pub peak_score: f64,
+    /// Global maximum of the detection curve, regardless of target windows.
+    pub max_score: f64,
+    pub has_target: bool,
+    pub target_count: i64,
+    pub true_positives: i64,
+    pub false_negatives: i64,
+    pub false_positives: i64,
+    /// Whether the representative peak crossed the threshold.
+    pub detected: bool,
+    pub created_at_ms: i64,
 }
 
 /// A word with millisecond timing, as stored under a transcript.
@@ -243,6 +270,30 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (recording_id, mode, step_ms, keep_ms)
         );
 
+        -- One graded scoring result per test take per model, so each take's
+        -- score on each model is remembered and the Model test view can total
+        -- misses and false positives without re-running the scorer. Like
+        -- score_curves this has no FK to bulk_recordings and is cleared
+        -- explicitly on delete. model_fp distinguishes the current model
+        -- (size+mtime) from each archived run (run-<id>).
+        CREATE TABLE IF NOT EXISTS score_grades (
+            recording_id    TEXT NOT NULL,
+            model_fp        TEXT NOT NULL,
+            mode            TEXT NOT NULL,
+            run_id          TEXT,
+            threshold       REAL NOT NULL,
+            peak_score      REAL NOT NULL,
+            max_score       REAL NOT NULL,
+            has_target      INTEGER NOT NULL,
+            target_count    INTEGER NOT NULL,
+            true_positives  INTEGER NOT NULL,
+            false_negatives INTEGER NOT NULL,
+            false_positives INTEGER NOT NULL,
+            detected        INTEGER NOT NULL,
+            created_at_ms   INTEGER NOT NULL,
+            PRIMARY KEY (recording_id, model_fp, mode)
+        );
+
         CREATE TABLE IF NOT EXISTS clips (
             id            TEXT PRIMARY KEY,
             project_slug  TEXT NOT NULL REFERENCES projects(slug) ON DELETE CASCADE,
@@ -306,6 +357,14 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
             onnx_bytes          INTEGER,
             eval                TEXT,
             params_json         TEXT,
+            -- Version 8: the three positive sources broken out so a model's total
+            -- positive input is queryable. kokoro_positive is the built-in TTS
+            -- pool (n_samples), real_positive the user's own boosted recordings,
+            -- synth_positive the F5 voice-cloned clips; total_positive_input sums
+            -- all three.
+            synth_positive        INTEGER,
+            kokoro_positive       INTEGER,
+            total_positive_input  INTEGER,
             UNIQUE(slug, run_id)
         );
 
@@ -384,6 +443,10 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
         ("onnx_bytes", "INTEGER"),
         ("eval", "TEXT"),
         ("params_json", "TEXT"),
+        // Version 8: the three positive-source counts.
+        ("synth_positive", "INTEGER"),
+        ("kokoro_positive", "INTEGER"),
+        ("total_positive_input", "INTEGER"),
     ] {
         if !column_exists(conn, "models", name)? {
             conn.execute(
@@ -1047,6 +1110,11 @@ pub struct ModelRecord {
     pub onnx_bytes: Option<i64>,
     pub eval: Option<String>,
     pub params_json: Option<String>,
+    // Version 8: the three positive sources broken out (built-in TTS pool, own
+    // real recordings, F5 voice-cloned) plus their sum.
+    pub synth_positive: Option<i64>,
+    pub kokoro_positive: Option<i64>,
+    pub total_positive_input: Option<i64>,
 }
 
 /// Record a versioned trained model. Ensures the wake word exists, inserts the
@@ -1067,10 +1135,11 @@ pub fn record_model(
              is_current, model_type, token_type, positive_boost, n_samples,
              n_samples_val, positive_per_batch, target_fp_per_hour, context_fix,
              real_positive, real_negative, real_background, trainer_image,
-             onnx_bytes, eval, params_json)
+             onnx_bytes, eval, params_json,
+             synth_positive, kokoro_positive, total_positive_input)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0,
              ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
-             ?27, ?28)",
+             ?27, ?28, ?29, ?30, ?31)",
         params![
             model.slug,
             model.run_id,
@@ -1100,6 +1169,9 @@ pub fn record_model(
             model.onnx_bytes,
             model.eval,
             model.params_json,
+            model.synth_positive,
+            model.kokoro_positive,
+            model.total_positive_input,
         ],
     )?;
     if make_current {
@@ -1143,6 +1215,9 @@ pub fn list_model_records(conn: &Connection) -> Result<Vec<String>, rusqlite::Er
             'real_positive', real_positive,
             'real_negative', real_negative,
             'real_background', real_background,
+            'synth_positive', synth_positive,
+            'kokoro_positive', kokoro_positive,
+            'total_positive_input', total_positive_input,
             'started_at', started_at,
             'finished_at', finished_at,
             'created_at_ms', created_at_ms,
@@ -1202,10 +1277,15 @@ fn avg_ms_per_step_where(
 /// Delete a recording and everything derived from it (transcripts, words,
 /// prompts, slices cascade). WAV files on disk are removed by the caller.
 pub fn delete_recording(conn: &Connection, recording_id: &str) -> Result<bool, rusqlite::Error> {
-    // score_curves has no FK to bulk_recordings (test takes score too), so clear
-    // any cached curves for this recording explicitly when it goes away.
+    // score_curves and score_grades have no FK to bulk_recordings (test takes
+    // score too), so clear any cached curves and grades for this recording
+    // explicitly when it goes away.
     conn.execute(
         "DELETE FROM score_curves WHERE recording_id = ?1",
+        params![recording_id],
+    )?;
+    conn.execute(
+        "DELETE FROM score_grades WHERE recording_id = ?1",
         params![recording_id],
     )?;
     let changed = conn.execute(
@@ -1287,6 +1367,92 @@ pub fn store_score_curve(
         ],
     )?;
     Ok(())
+}
+
+/// Store (replacing any prior entry) a graded scoring result for one test take
+/// against one model. Keyed by recording + model fingerprint + mode, so a fresh
+/// score overwrites the stale grade for the same model but keeps other models'.
+pub fn store_score_grade(
+    conn: &Connection,
+    model_fp: &str,
+    mode: &str,
+    grade: &ScoreGrade,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO score_grades
+         (recording_id, model_fp, mode, run_id, threshold, peak_score, max_score,
+          has_target, target_count, true_positives, false_negatives,
+          false_positives, detected, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            grade.recording_id,
+            model_fp,
+            mode,
+            grade.run_id,
+            grade.threshold,
+            grade.peak_score,
+            grade.max_score,
+            grade.has_target as i64,
+            grade.target_count,
+            grade.true_positives,
+            grade.false_negatives,
+            grade.false_positives,
+            grade.detected as i64,
+            grade.created_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The stored grades for a model's test takes: every grade row for this project's
+/// test takes (id begins `test_`) computed against `model_fp` in `mode`, newest
+/// first. Used to populate each take's card and total the model's misses and
+/// false positives without re-running the scorer.
+pub fn grades_for_model(
+    conn: &Connection,
+    slug: &str,
+    model_fp: &str,
+    mode: &str,
+) -> Result<Vec<ScoreGrade>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"SELECT g.recording_id, g.run_id, g.threshold, g.peak_score, g.max_score,
+                g.has_target, g.target_count, g.true_positives, g.false_negatives,
+                g.false_positives, g.detected, g.created_at_ms
+         FROM score_grades g
+         JOIN bulk_recordings b ON b.id = g.recording_id
+         WHERE b.project_slug = ?1 AND b.id LIKE 'test\_%' ESCAPE '\'
+           AND g.model_fp = ?2 AND g.mode = ?3
+         ORDER BY g.created_at_ms DESC, g.recording_id ASC"#,
+    )?;
+    let rows = stmt.query_map(params![slug, model_fp, mode], |row| {
+        Ok(ScoreGrade {
+            recording_id: row.get(0)?,
+            run_id: row.get(1)?,
+            threshold: row.get(2)?,
+            peak_score: row.get(3)?,
+            max_score: row.get(4)?,
+            has_target: row.get::<_, i64>(5)? != 0,
+            target_count: row.get(6)?,
+            true_positives: row.get(7)?,
+            false_negatives: row.get(8)?,
+            false_positives: row.get(9)?,
+            detected: row.get::<_, i64>(10)? != 0,
+            created_at_ms: row.get(11)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Ids of a project's test takes (recording ids beginning `test_`), newest
+/// import first. These are the recordings the Model test view scores in bulk.
+pub fn test_take_ids(conn: &Connection, slug: &str) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id FROM bulk_recordings
+         WHERE project_slug = ?1 AND id LIKE 'test\_%' ESCAPE '\'
+         ORDER BY imported_at_ms DESC, id ASC"#,
+    )?;
+    let rows = stmt.query_map(params![slug], |row| row.get::<_, String>(0))?;
+    rows.collect()
 }
 
 /// The script for a recording, if known.
