@@ -233,24 +233,13 @@ pub(crate) fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<St
         })?;
         let spec = reader.spec();
         let duration = reader.duration() as f64 / spec.sample_rate as f64;
-        if spec.channels != 1 {
-            warnings.push(format!(
-                "{}: expected mono, got {} channels",
-                clip.id, spec.channels
-            ));
-        }
-        if spec.bits_per_sample != 16 {
-            warnings.push(format!(
-                "{}: expected 16-bit PCM, got {} bits",
-                clip.id, spec.bits_per_sample
-            ));
-        }
-        if spec.sample_rate != 16_000 {
-            warnings.push(format!(
-                "{}: expected 16000 Hz, got {}",
-                clip.id, spec.sample_rate
-            ));
-        }
+        warnings.extend(spec_warnings(
+            &clip.id,
+            "",
+            spec.channels,
+            spec.bits_per_sample,
+            spec.sample_rate,
+        ));
         if duration <= 0.0 {
             warnings.push(format!("{}: zero duration", clip.id));
         }
@@ -274,12 +263,7 @@ pub(crate) fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<St
         } else {
             0.0
         };
-        if peak >= 32_760 {
-            warnings.push(format!("{}: possible clipping, peak={peak}", clip.id));
-        }
-        if rms < 50.0 && duration > 0.0 {
-            warnings.push(format!("{}: very quiet audio, rms={rms:.1}", clip.id));
-        }
+        warnings.extend(amplitude_warnings(&clip.id, peak, rms, duration));
     }
     for recording in &manifest.bulk_recordings {
         let path = safe_join(bundle, &recording.file)?;
@@ -287,24 +271,13 @@ pub(crate) fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<St
             AppError::bad_request(format!("{}: cannot read bulk WAV: {error}", recording.id))
         })?;
         let spec = reader.spec();
-        if spec.channels != 1 {
-            warnings.push(format!(
-                "{}: expected mono bulk recording, got {} channels",
-                recording.id, spec.channels
-            ));
-        }
-        if spec.bits_per_sample != 16 {
-            warnings.push(format!(
-                "{}: expected 16-bit PCM bulk recording, got {} bits",
-                recording.id, spec.bits_per_sample
-            ));
-        }
-        if spec.sample_rate != 16_000 {
-            warnings.push(format!(
-                "{}: expected 16000 Hz bulk recording, got {}",
-                recording.id, spec.sample_rate
-            ));
-        }
+        warnings.extend(spec_warnings(
+            &recording.id,
+            " bulk recording",
+            spec.channels,
+            spec.bits_per_sample,
+            spec.sample_rate,
+        ));
     }
     for recording in &manifest.background_recordings {
         let path = safe_join(bundle, &recording.file)?;
@@ -315,24 +288,13 @@ pub(crate) fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<St
             ))
         })?;
         let spec = reader.spec();
-        if spec.channels != 1 {
-            warnings.push(format!(
-                "{}: expected mono background recording, got {} channels",
-                recording.id, spec.channels
-            ));
-        }
-        if spec.bits_per_sample != 16 {
-            warnings.push(format!(
-                "{}: expected 16-bit PCM background recording, got {} bits",
-                recording.id, spec.bits_per_sample
-            ));
-        }
-        if spec.sample_rate != 16_000 {
-            warnings.push(format!(
-                "{}: expected 16000 Hz background recording, got {}",
-                recording.id, spec.sample_rate
-            ));
-        }
+        warnings.extend(spec_warnings(
+            &recording.id,
+            " background recording",
+            spec.channels,
+            spec.bits_per_sample,
+            spec.sample_rate,
+        ));
     }
     for recording in &manifest.test_recordings {
         let path = safe_join(bundle, &recording.file)?;
@@ -340,26 +302,55 @@ pub(crate) fn validate_wavs(bundle: &Path, manifest: &Manifest) -> Result<Vec<St
             AppError::bad_request(format!("{}: cannot read test WAV: {error}", recording.id))
         })?;
         let spec = reader.spec();
-        if spec.channels != 1 {
-            warnings.push(format!(
-                "{}: expected mono test recording, got {} channels",
-                recording.id, spec.channels
-            ));
-        }
-        if spec.bits_per_sample != 16 {
-            warnings.push(format!(
-                "{}: expected 16-bit PCM test recording, got {} bits",
-                recording.id, spec.bits_per_sample
-            ));
-        }
-        if spec.sample_rate != 16_000 {
-            warnings.push(format!(
-                "{}: expected 16000 Hz test recording, got {}",
-                recording.id, spec.sample_rate
-            ));
-        }
+        warnings.extend(spec_warnings(
+            &recording.id,
+            " test recording",
+            spec.channels,
+            spec.bits_per_sample,
+            spec.sample_rate,
+        ));
     }
     Ok(warnings)
+}
+
+/// Warn about a WAV whose format is not mono 16-bit 16 kHz PCM. `noun` names the
+/// recording kind in the message (e.g. `" bulk recording"`, or `""` for a clip),
+/// so the four validation loops share one wording. Pure: derives the warnings
+/// from the header fields alone.
+fn spec_warnings(
+    id: &str,
+    noun: &str,
+    channels: u16,
+    bits_per_sample: u16,
+    sample_rate: u32,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if channels != 1 {
+        warnings.push(format!("{id}: expected mono{noun}, got {channels} channels"));
+    }
+    if bits_per_sample != 16 {
+        warnings.push(format!(
+            "{id}: expected 16-bit PCM{noun}, got {bits_per_sample} bits"
+        ));
+    }
+    if sample_rate != 16_000 {
+        warnings.push(format!("{id}: expected 16000 Hz{noun}, got {sample_rate}"));
+    }
+    warnings
+}
+
+/// Warn about a clip's amplitude: near-full-scale peaks (possible clipping) and a
+/// very low RMS on non-empty audio (near silence). Pure: judges the two scalar
+/// measurements the sample scan produced.
+fn amplitude_warnings(id: &str, peak: i32, rms: f64, duration: f64) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if peak >= 32_760 {
+        warnings.push(format!("{id}: possible clipping, peak={peak}"));
+    }
+    if rms < 50.0 && duration > 0.0 {
+        warnings.push(format!("{id}: very quiet audio, rms={rms:.1}"));
+    }
+    warnings
 }
 
 /// Import the pre-cut short clips into `data/real/<slug>/<category>`, upserting
@@ -521,5 +512,131 @@ mod tests {
         assert!(capture.device_model.is_none());
         assert!(capture.source_sample_rate_hz.is_none());
         assert!(capture.session_id.is_none());
+    }
+
+    #[test]
+    fn spec_warnings_flags_each_wrong_field_with_noun() {
+        // A well-formed clip header (mono, 16-bit, 16 kHz) yields no warnings.
+        assert!(spec_warnings("c1", "", 1, 16, 16_000).is_empty());
+        // Each wrong field produces its own message; the noun is spliced in.
+        let w = spec_warnings("c2", "", 2, 8, 44_100);
+        assert_eq!(
+            w,
+            vec![
+                "c2: expected mono, got 2 channels".to_string(),
+                "c2: expected 16-bit PCM, got 8 bits".to_string(),
+                "c2: expected 16000 Hz, got 44100".to_string(),
+            ]
+        );
+        // The noun distinguishes the recording kind in the wording.
+        let w = spec_warnings("b1", " bulk recording", 2, 16, 16_000);
+        assert_eq!(w, vec!["b1: expected mono bulk recording, got 2 channels"]);
+    }
+
+    #[test]
+    fn amplitude_warnings_flags_clipping_and_quiet() {
+        // Healthy audio: mid peak, ample RMS, positive duration -> nothing.
+        assert!(amplitude_warnings("c1", 10_000, 500.0, 1.0).is_empty());
+        // Near-full-scale peak is flagged as possible clipping.
+        assert_eq!(
+            amplitude_warnings("c2", 32_760, 500.0, 1.0),
+            vec!["c2: possible clipping, peak=32760"]
+        );
+        // Low RMS on non-empty audio is flagged as very quiet.
+        assert_eq!(
+            amplitude_warnings("c3", 100, 49.9, 1.0),
+            vec!["c3: very quiet audio, rms=49.9"]
+        );
+        // A quiet reading with zero duration is not flagged (the guard requires
+        // duration > 0.0).
+        assert!(amplitude_warnings("c4", 100, 0.0, 0.0).is_empty());
+    }
+
+    fn manifest_from(value: serde_json::Value) -> Manifest {
+        serde_json::from_value(value).expect("valid manifest json")
+    }
+
+    #[test]
+    fn validate_manifest_accepts_minimal_valid_manifest() {
+        let manifest = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set", "phrase": "all set" },
+            "clips": [],
+        }));
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_bad_schema_and_slug() {
+        let bad_version = manifest_from(serde_json::json!({
+            "schema_version": 2,
+            "wake_word": { "slug": "all_set" },
+            "clips": [],
+        }));
+        assert!(validate_manifest(&bad_version).is_err());
+
+        let bad_slug = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "../escape" },
+            "clips": [],
+        }));
+        assert!(validate_manifest(&bad_slug).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_bad_clip_and_unknown_label() {
+        let missing_file = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set" },
+            "clips": [{ "id": "c1", "file": "", "label": "positive" }],
+        }));
+        assert!(validate_manifest(&missing_file).is_err());
+
+        let bad_label = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set" },
+            "clips": [{ "id": "c1", "file": "a.wav", "label": "nonsense" }],
+        }));
+        assert!(validate_manifest(&bad_label).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_bulk_script_required_only_for_mixed_kinds() {
+        // A mixed/legacy take with no script is rejected.
+        let mixed_no_script = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set" },
+            "clips": [],
+            "bulk_recordings": [{ "id": "b1", "file": "b1.wav", "script": "  ", "kind": "" }],
+        }));
+        assert!(validate_manifest(&mixed_no_script).is_err());
+
+        // A straight positive take needs no script.
+        let positive_no_script = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set" },
+            "clips": [],
+            "bulk_recordings": [{ "id": "b1", "file": "b1.wav", "script": "", "kind": "positive" }],
+        }));
+        assert!(validate_manifest(&positive_no_script).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_test_ids_must_be_prefixed() {
+        let bad_prefix = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set" },
+            "clips": [],
+            "test_recordings": [{ "id": "rec1", "file": "t1.wav", "script": "" }],
+        }));
+        assert!(validate_manifest(&bad_prefix).is_err());
+
+        let good = manifest_from(serde_json::json!({
+            "schema_version": 1,
+            "wake_word": { "slug": "all_set" },
+            "clips": [],
+            "test_recordings": [{ "id": "test_rec1", "file": "t1.wav", "script": "" }],
+        }));
+        assert!(validate_manifest(&good).is_ok());
     }
 }
