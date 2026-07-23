@@ -27,12 +27,17 @@ mod db;
 mod docker;
 mod error;
 mod util;
+mod whisper;
 
 use constants::*;
 use docker::{
     container_running, docker_ok, f5_container, push_env, run_docker, training_container_name,
 };
 use error::{db_error, AppError};
+use whisper::{
+    contains_word_sequence, normalize_token, normalize_word, normalized_words,
+    transcribe_with_words, transcript_tail_has_phrase, whisper_words, WhisperWord,
+};
 use util::{
     category_for_label, is_safe_recording_id, is_safe_run_id, is_safe_slug, parse_query, safe_join,
     safe_filename, validation_summary,
@@ -458,33 +463,6 @@ struct BackgroundRecording {
     duration_ms: u64,
     #[serde(flatten)]
     extra: Value,
-}
-
-#[derive(Debug, Deserialize)]
-struct WhisperResponse {
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    segments: Vec<WhisperSegment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WhisperSegment {
-    #[serde(default)]
-    start: f64,
-    #[serde(default)]
-    end: f64,
-    #[serde(default)]
-    words: Vec<WhisperWord>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct WhisperWord {
-    word: String,
-    start: f64,
-    end: f64,
-    #[serde(default)]
-    probability: f64,
 }
 
 #[derive(Debug, Default)]
@@ -1616,15 +1594,6 @@ async fn run_scorer(
     }
     serde_json::from_str(&body)
         .map_err(|error| AppError::internal(format!("scorer response JSON failed: {error}")))
-}
-
-/// Normalize a spoken token for phrase matching: lowercase, keep only letters
-/// and digits. Whisper emits leading spaces and stray punctuation on words.
-fn normalize_token(word: &str) -> String {
-    word.chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 /// Find every run of transcript words matching the trigger phrase and attach the
@@ -3954,89 +3923,6 @@ fn build_slice_row(
     }
 }
 
-async fn transcribe_with_words(
-    whisper_url: &str,
-    wav_path: &Path,
-    prompt: Option<&str>,
-) -> Result<WhisperResponse, AppError> {
-    let bytes = fs::read(wav_path)?;
-    let file_name = wav_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("audio.wav")
-        .to_string();
-    let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name(file_name)
-        .mime_str("audio/wav")
-        .map_err(|error| AppError::internal(format!("prepare Whisper upload: {error}")))?;
-    // The prompt is deliberately omitted for alignment and verification: on this
-    // clean, scripted audio it does not improve accuracy and it biases Whisper
-    // toward reporting the scripted words even where the audio differs.
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("response_format", "verbose_json")
-        .text("temperature", "0.0")
-        .text("no_context", "true")
-        .text("word_timestamps", "true");
-    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
-        form = form.text("prompt", prompt.to_string());
-    }
-    let endpoint = format!("{}/inference", whisper_url.trim_end_matches('/'));
-    let response = reqwest::Client::new()
-        .post(endpoint)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|error| AppError::internal(format!("Whisper request failed: {error}")))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| AppError::internal(format!("Whisper response read failed: {error}")))?;
-    if !status.is_success() {
-        return Err(AppError::internal(format!(
-            "Whisper returned {status}: {}",
-            body.trim()
-        )));
-    }
-    serde_json::from_str(&body)
-        .map_err(|error| AppError::internal(format!("Whisper response JSON failed: {error}")))
-}
-
-fn whisper_words(response: &WhisperResponse) -> Vec<WhisperWord> {
-    response
-        .segments
-        .iter()
-        .flat_map(|segment| {
-            let offset = word_timestamp_offset(segment);
-            segment.words.iter().cloned().map(move |mut word| {
-                if offset > 0.0 {
-                    word.start += offset;
-                    word.end += offset;
-                }
-                word
-            })
-        })
-        .filter(|word| word.end >= word.start)
-        .collect()
-}
-
-fn word_timestamp_offset(segment: &WhisperSegment) -> f64 {
-    let Some(first_word) = segment.words.first() else {
-        return 0.0;
-    };
-    let Some(last_word) = segment.words.last() else {
-        return 0.0;
-    };
-    let start_delta = segment.start - first_word.start;
-    let end_delta = segment.end - last_word.end;
-    if start_delta > 0.5 && end_delta > 0.5 {
-        start_delta
-    } else {
-        0.0
-    }
-}
-
 fn phrase_ranges(words: &[WhisperWord], phrase_words: &[String]) -> Vec<(usize, usize)> {
     let normalized: Vec<String> = words
         .iter()
@@ -4163,12 +4049,6 @@ fn is_hard_negative_context(words: &[WhisperWord], first: usize, last: usize) ->
         || contains_word_sequence(&context, &["hard", "negative"])
         || contains_word_sequence(&context, &["not", "the", "wake", "phrase"])
         || contains_word_sequence(&context, &["similar", "phrase"])
-}
-
-fn contains_word_sequence(words: &[String], phrase: &[&str]) -> bool {
-    words
-        .windows(phrase.len())
-        .any(|window| window.iter().map(String::as_str).eq(phrase.iter().copied()))
 }
 
 fn negative_ranges(
@@ -4405,48 +4285,6 @@ fn review_clip_path(
         )));
     }
     Ok(data_root.join(slug).join(category).join(file_name))
-}
-
-fn normalized_words(value: &str) -> Vec<String> {
-    value
-        .split_whitespace()
-        .map(normalize_word)
-        .filter(|word| !word.is_empty())
-        .collect()
-}
-
-/// True when the wake phrase appears at (or very near) the END of the normalized
-/// transcript. Positives are tail-aligned, so the wake phrase must be the last
-/// thing spoken; `TAIL_SLACK` words of trailing audio are tolerated for the tail
-/// padding. Requiring the phrase at the tail — not just anywhere — rejects
-/// slices that were cut too early and only contain the lead-in (e.g. "the next
-/// words are ...") even when a flaky Whisper pass imagines the phrase mid-slice.
-fn transcript_tail_has_phrase(text: &str, phrase_words: &[String]) -> bool {
-    const TAIL_SLACK: usize = 2;
-    if phrase_words.is_empty() {
-        return false;
-    }
-    let heard = normalized_words(text);
-    if heard.len() < phrase_words.len() {
-        return false;
-    }
-    let last_start = heard.len() - phrase_words.len();
-    for start in 0..=last_start {
-        if &heard[start..start + phrase_words.len()] == phrase_words {
-            let words_after = heard.len() - (start + phrase_words.len());
-            if words_after <= TAIL_SLACK {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn normalize_word(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
-        .to_ascii_lowercase()
 }
 
 /// Hyperparameters for a full training run. All optional; each falls back to the
@@ -5456,22 +5294,6 @@ mod tests {
         assert!(capture.device_model.is_none());
         assert!(capture.source_sample_rate_hz.is_none());
         assert!(capture.session_id.is_none());
-    }
-
-    #[test]
-    fn transcript_tail_has_phrase_requires_phrase_at_end() {
-        let phrase = normalized_words("all set");
-        // Phrase at the tail (with a little trailing slack) is accepted.
-        assert!(transcript_tail_has_phrase("the next words are all set.", &phrase));
-        assert!(transcript_tail_has_phrase("All Set!", &phrase));
-        assert!(transcript_tail_has_phrase("say all set now", &phrase));
-        // Phrase absent, or buried mid-slice by a flaky pass, is rejected.
-        assert!(!transcript_tail_has_phrase("the next words are over", &phrase));
-        assert!(!transcript_tail_has_phrase(
-            "the next words are all in the same sentence",
-            &phrase
-        ));
-        assert!(!transcript_tail_has_phrase("all is not set", &phrase));
     }
 
     #[test]
