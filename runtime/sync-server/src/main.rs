@@ -657,6 +657,10 @@ async fn main() {
             "/review/:slug/:category/:file_name",
             get(review_audio).delete(delete_review_clip),
         )
+        .route(
+            "/synth/:slug",
+            axum::routing::delete(delete_synth),
+        )
         .route("/synth/:slug/sample", get(synthetic_samples))
         .route("/synth/:slug/audio/:file_name", get(synthetic_audio))
         .route("/synth/:slug/generate", post(generate_synth))
@@ -1858,6 +1862,42 @@ struct SyntheticSamplesResponse {
 /// an evenly-spaced stride across the sorted batch (start, middle, end), not the
 /// first N — deterministic, no RNG. The clips are all the wake phrase, so each
 /// sample carries the project phrase as its label text.
+/// Delete every F5 synthetic positive for a wake word (the whole
+/// data/synth_f5/<slug> tree). Synth clips are filesystem-only with no DB rows,
+/// so this is a plain directory removal. Refuses while a generation run is in
+/// flight so we don't yank the directory out from under it.
+async fn delete_synth(
+    State(state): State<AppState>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Value>, AppError> {
+    if !is_safe_slug(&slug) {
+        return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
+    }
+    {
+        let jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+        if jobs.get(&slug).map(|j| j.running).unwrap_or(false) {
+            return Err(AppError::bad_request(
+                "a generation run is in progress; wait for it to finish before deleting",
+            ));
+        }
+    }
+    // The synth bucket is data/synth_f5/<slug>/positive; remove its <slug> parent
+    // so nothing for this wake word is left behind.
+    let slug_dir = synth_positive_dir(&state.data_root, &slug)
+        .parent()
+        .map(Path::to_path_buf);
+    let removed = match slug_dir {
+        Some(dir) if dir.exists() => {
+            let count = count_wavs(&synth_positive_dir(&state.data_root, &slug));
+            fs::remove_dir_all(&dir)
+                .map_err(|e| AppError::internal(format!("failed to delete synth dir: {e}")))?;
+            count
+        }
+        _ => 0,
+    };
+    Ok(Json(json!({ "status": "ok", "slug": slug, "deleted": removed })))
+}
+
 async fn synthetic_samples(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
@@ -1960,19 +2000,18 @@ fn count_wavs(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Resolve the F5 cloning-reference directory for a slug: prefer short real
-/// positive clips (their transcript is exactly the phrase and their length is
-/// F5-friendly), falling back to an enrollment take only if no positives exist.
+/// Resolve the F5 cloning-reference directory for a slug: the user's real
+/// positive clips, whose transcript is exactly the phrase and whose length is
+/// F5-friendly. Enrollment has been retired as a reference — a long passage
+/// starved and leaked its own tail text into the output ("warm gold"), so F5
+/// now only ever clones from real positives.
 fn resolve_synth_refs(data_root: &Path, slug: &str) -> Result<PathBuf, AppError> {
     let positive_dir = data_root.join(slug).join("positive");
-    let enroll_dir = data_root.join(slug).join("enrollment");
     if dir_has_wav(&positive_dir) {
         Ok(positive_dir)
-    } else if dir_has_wav(&enroll_dir) {
-        Ok(enroll_dir)
     } else {
         Err(AppError::bad_request(
-            "no positive or enrollment clips to clone from; record positives first",
+            "no positive clips to clone from; record positive takes first",
         ))
     }
 }
@@ -2139,9 +2178,10 @@ struct GenerateSynthResponse {
 }
 
 /// Kick off an F5 voice-cloned positive batch for a wake word, seeded by the
-/// enrollment take. Runs the resident F5 model inside the speech-f5tts container
-/// over the mounted docker socket, then copies the 16 kHz clips into the slug's
-/// synth bucket. Returns immediately; progress is polled via the status endpoint.
+/// user's real positive takes. Runs the resident F5 model inside the speech-f5tts
+/// container over the mounted docker socket, then copies the 16 kHz clips into the
+/// slug's synth bucket. Returns immediately; progress is polled via the status
+/// endpoint.
 async fn generate_synth(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
@@ -2157,24 +2197,11 @@ async fn generate_synth(
         .unwrap_or(60)
         .clamp(1, 1000);
 
-    // Prefer SHORT real positive clips as the cloning reference; fall back to the
-    // enrollment read only if none exist. F5 sizes the spoken output from the
-    // reference's rate (ref_audio_len/ref_text_len), so a long enrollment passage
-    // starves the short wake phrase and crushes/drops it — short clips of the user
-    // actually saying the phrase (exact transcript, F5-friendly length) clone the
-    // timbre AND give the right duration. Refuse early if there is nothing to
-    // clone from.
-    let enroll_dir = state.data_root.join(&slug).join("enrollment");
-    let positive_dir = state.data_root.join(&slug).join("positive");
-    let refs_server_dir = if dir_has_wav(&positive_dir) {
-        positive_dir
-    } else if dir_has_wav(&enroll_dir) {
-        enroll_dir
-    } else {
-        return Err(AppError::bad_request(
-            "no positive or enrollment clips to clone from; record positives or a voice enrollment take first",
-        ));
-    };
+    // Clone from the user's SHORT real positive clips: their transcript is exactly
+    // the phrase and their length is F5-friendly. (F5 sizes the spoken output from
+    // the reference's rate, so a long passage starves the short wake phrase and
+    // leaks its own text.) Refuse early if there is nothing to clone from.
+    let refs_server_dir = resolve_synth_refs(&state.data_root, &slug)?;
 
     let phrase = {
         let conn = state.db.lock().expect("db lock poisoned");

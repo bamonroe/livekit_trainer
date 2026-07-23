@@ -308,6 +308,18 @@ class BundleSyncClient(
         return JSONObject(response).optInt("requested", count)
     }
 
+    /** Delete every F5 synthetic positive for a wake word. Returns how many were
+     *  removed. */
+    fun deleteSyntheticSamples(wakeWordSlug: String): Int {
+        val endpoint = URL(serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}")
+        val connection = endpoint.openConnection() as HttpURLConnection
+        connection.requestMethod = "DELETE"
+        connection.connectTimeout = 10_000
+        connection.readTimeout = 30_000
+        val response = readResponse(connection, "Delete synthetic samples failed")
+        return JSONObject(response).optInt("deleted", 0)
+    }
+
     /** Poll the state of a slug's F5 generation run. */
     fun syntheticGenerationStatus(wakeWordSlug: String): SyntheticGenStatus {
         val endpoint = URL(
