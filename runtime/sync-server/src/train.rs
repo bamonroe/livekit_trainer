@@ -259,32 +259,26 @@ pub(crate) async fn start_training(
     })))
 }
 
-/// Launch the trainer container for one validated job and return its container
-/// name. Every hyperparameter travels as a `-e KEY=VALUE` pair (argv, never
-/// shell-interpolated), so nothing here can inject shell.
-async fn launch_train_container(
-    state: &AppState,
+/// Build the full `docker run ...` argv for a trainer container. Pure (no IO):
+/// every hyperparameter is turned into a `-e KEY=VALUE` argv pair — never
+/// shell-interpolated — so this is both injection-safe and unit-testable.
+fn build_train_argv(
+    host_repo_root: &str,
+    name: &str,
+    gpu: bool,
+    trainer_image: &str,
     slug: &str,
     phrase: &str,
     vt: &ValidatedTrain,
-) -> Result<String, AppError> {
-    let Some(host_repo_root) = (*state.host_repo_root).clone() else {
-        return Err(AppError::internal(
-            "training disabled: HOST_REPO_ROOT not set on the sync-server",
-        ));
-    };
-    let name = training_container_name(slug);
-    // Clear any dead container left behind by a crash so the name is free.
-    let _ = run_docker(vec!["rm".into(), "-f".into(), name.clone()]).await;
-
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
         "--rm".into(),
         "--name".into(),
-        name.clone(),
+        name.to_string(),
     ];
-    if *state.trainer_gpu {
+    if gpu {
         args.push("--gpus".into());
         args.push("all".into());
     }
@@ -351,11 +345,41 @@ async fn launch_train_container(
     );
     push_env(&mut args, "VOICE_PEAK", vt.voice_peak.to_string());
     // The job stamps its own image tag into the model manifest for provenance.
-    push_env(&mut args, "TRAINER_IMAGE", (*state.trainer_image).clone());
-    args.push((*state.trainer_image).clone());
+    push_env(&mut args, "TRAINER_IMAGE", trainer_image.to_string());
+    args.push(trainer_image.to_string());
     args.push("bash".into());
     args.push("-lc".into());
     args.push("bash /work/trainer/scripts/train_job.sh".into());
+    args
+}
+
+/// Launch the trainer container for one validated job and return its container
+/// name. Every hyperparameter travels as a `-e KEY=VALUE` pair (argv, never
+/// shell-interpolated), so nothing here can inject shell.
+async fn launch_train_container(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+) -> Result<String, AppError> {
+    let Some(host_repo_root) = (*state.host_repo_root).clone() else {
+        return Err(AppError::internal(
+            "training disabled: HOST_REPO_ROOT not set on the sync-server",
+        ));
+    };
+    let name = training_container_name(slug);
+    // Clear any dead container left behind by a crash so the name is free.
+    let _ = run_docker(vec!["rm".into(), "-f".into(), name.clone()]).await;
+
+    let args = build_train_argv(
+        &host_repo_root,
+        &name,
+        *state.trainer_gpu,
+        &state.trainer_image,
+        slug,
+        phrase,
+        vt,
+    );
 
     // F5 voice-cloned positives are generated HERE, in the sync-server, before
     // the trainer launches: only this container can reach the speech-f5tts
@@ -666,8 +690,11 @@ fn tqdm_desc(line: &str) -> String {
     String::new()
 }
 
-/// Parse the trainer log tail into a templated, per-step progress view.
-fn parse_train_progress(text: &str, run_state: &str) -> Value {
+/// Scan the trainer log tail for the current pipeline position: returns the
+/// 1-based active step (0 = pre-pipeline), its percent, and the active tqdm
+/// label. A later line only advances the step forward; within a step it tracks
+/// the newest percent and non-empty label.
+fn scan_progress_lines(text: &str) -> (usize, u8, String) {
     // Split on both '\r' (tqdm redraws in place) and '\n'.
     let lines: Vec<&str> = text.split(|c| c == '\n' || c == '\r').collect();
 
@@ -691,16 +718,14 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
             }
         }
     }
-    let done = run_state == "succeeded";
-    if done {
-        cur_step = 6;
-        cur_percent = 100;
-    }
-    if active_label.is_empty() && (1..=6).contains(&cur_step) {
-        active_label = TRAIN_STEPS[cur_step - 1].to_string();
-    }
+    (cur_step, cur_percent, active_label)
+}
 
-    let steps: Vec<Value> = TRAIN_STEPS
+/// The per-step template rows (name/state/percent/device). Steps before the
+/// active one are done; the active one carries `cur_percent`; later ones pend.
+/// When `done`, every step reads done at 100%.
+fn progress_step_states(cur_step: usize, cur_percent: u8, done: bool) -> Vec<Value> {
+    TRAIN_STEPS
         .iter()
         .enumerate()
         .map(|(i, name)| {
@@ -714,8 +739,13 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
             };
             json!({ "name": name, "state": st, "percent": percent, "device": TRAIN_STEP_DEVICES[i] })
         })
-        .collect();
+        .collect()
+}
 
+/// Weighted overall percent: each completed stage contributes its full weight,
+/// the active stage a fraction, later stages nothing. Weighted so time tracks
+/// wall-clock (training dominates) rather than raw step count.
+fn progress_overall_percent(cur_step: usize, cur_percent: u8, done: bool) -> u32 {
     let total: u32 = TRAIN_STEP_WEIGHTS.iter().sum();
     let mut acc = 0u32;
     for (i, w) in TRAIN_STEP_WEIGHTS.iter().enumerate() {
@@ -726,7 +756,23 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
             acc += w * cur_percent as u32 / 100;
         }
     }
-    let overall = (acc * 100 / total).min(100);
+    (acc * 100 / total).min(100)
+}
+
+/// Parse the trainer log tail into a templated, per-step progress view.
+fn parse_train_progress(text: &str, run_state: &str) -> Value {
+    let (mut cur_step, mut cur_percent, mut active_label) = scan_progress_lines(text);
+    let done = run_state == "succeeded";
+    if done {
+        cur_step = 6;
+        cur_percent = 100;
+    }
+    if active_label.is_empty() && (1..=6).contains(&cur_step) {
+        active_label = TRAIN_STEPS[cur_step - 1].to_string();
+    }
+
+    let steps = progress_step_states(cur_step, cur_percent, done);
+    let overall = progress_overall_percent(cur_step, cur_percent, done);
 
     json!({
         "steps": steps,
@@ -734,6 +780,35 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
         "active_step": cur_step,
         "active_label": active_label,
     })
+}
+
+/// Build the base training-status body from the persisted train_status.json (if
+/// any) reconciled against whether the trainer container is currently alive. A
+/// file marked "running" with no live container is treated as a crash and
+/// downgraded to "stopped" — UNLESS it is the pre-launch f5gen phase, which the
+/// sync-server writes while it clones voice positives, before any trainer
+/// container exists. With no file at all, the body is "starting" if a container
+/// is up (status not yet written) or "none".
+fn reconcile_status_body(file_status: Option<Value>, running: bool, slug: &str) -> Value {
+    match file_status {
+        Some(mut status) => {
+            if !running
+                && status.get("state").and_then(Value::as_str) == Some("running")
+                && status.get("step").and_then(Value::as_str) != Some("f5gen")
+            {
+                status["state"] = json!("stopped");
+                status["message"] = json!("trainer container exited before completing");
+            }
+            status
+        }
+        None => {
+            if running {
+                json!({ "slug": slug, "state": "starting", "message": "container launching" })
+            } else {
+                json!({ "slug": slug, "state": "none", "message": "no training run found" })
+            }
+        }
+    }
 }
 
 pub(crate) async fn training_status(
@@ -754,29 +829,7 @@ pub(crate) async fn training_status(
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
 
-    let mut body = match file_status {
-        Some(mut status) => {
-            // A "running" file with no live container means the run died without
-            // writing a terminal status (crash / OOM / killed) — UNLESS it is the
-            // pre-launch f5gen phase, which the sync-server writes while it clones
-            // voice positives and before any trainer container exists.
-            if !running
-                && status.get("state").and_then(Value::as_str) == Some("running")
-                && status.get("step").and_then(Value::as_str) != Some("f5gen")
-            {
-                status["state"] = json!("stopped");
-                status["message"] = json!("trainer container exited before completing");
-            }
-            status
-        }
-        None => {
-            if running {
-                json!({ "slug": slug, "state": "starting", "message": "container launching" })
-            } else {
-                json!({ "slug": slug, "state": "none", "message": "no training run found" })
-            }
-        }
-    };
+    let mut body = reconcile_status_body(file_status, running, &slug);
     body["container_running"] = json!(running);
     body["has_model"] = json!(state
         .models_root
@@ -995,4 +1048,263 @@ pub(crate) async fn list_model_runs(State(state): State<AppState>) -> Result<Jso
         .filter_map(|s| serde_json::from_str(s).ok())
         .collect();
     Ok(Json(json!({ "status": "ok", "runs": runs })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fully-resolved ValidatedTrain with distinctive values for argv checks.
+    fn sample_vt() -> ValidatedTrain {
+        ValidatedTrain {
+            steps: 1234,
+            model_size: "medium".to_string(),
+            target_fp_per_hour: 0.2,
+            personal: true,
+            positive_boost: 3,
+            f5_count: 7,
+            n_samples: Some(500),
+            n_samples_val: None,
+            positive_per_batch: None,
+            real_samples_dir: "./data/train".to_string(),
+            token_type: "end".to_string(),
+            realistic: true,
+            lead_probability: 0.75,
+            real_lead_fraction: 0.6,
+            synthetic_lead: true,
+            max_lead_ms: 900,
+            lead_gap_min_ms: 40,
+            lead_gap_max_ms: 300,
+            margin_min_ms: 100,
+            margin_max_ms: 700,
+            snr_min_db: 0.0,
+            snr_max_db: 18.0,
+            background_augment: true,
+            voice_peak: 0.7,
+        }
+    }
+
+    fn env_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+        // Args are ["-e", "KEY=VALUE", ...]; find the pair for `key`.
+        args.iter()
+            .zip(args.iter().skip(1))
+            .find_map(|(a, b)| (a == "-e" && b.starts_with(&format!("{key}="))).then(|| &b[key.len() + 1..]))
+    }
+
+    #[test]
+    fn valid_model_size_allowlist() {
+        for ok in ["tiny", "small", "medium", "large"] {
+            assert!(valid_model_size(ok));
+        }
+        assert!(!valid_model_size("MEDIUM"));
+        assert!(!valid_model_size("huge"));
+        assert!(!valid_model_size(""));
+    }
+
+    #[test]
+    fn valid_real_samples_dir_rejects_traversal_and_bad_chars() {
+        assert!(valid_real_samples_dir("./data/train"));
+        assert!(valid_real_samples_dir("data/train-01_v2"));
+        assert!(!valid_real_samples_dir(""));
+        assert!(!valid_real_samples_dir("../etc"));
+        assert!(!valid_real_samples_dir("data/train;rm"));
+        assert!(!valid_real_samples_dir(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn last_percent_takes_final_token_clamped() {
+        assert_eq!(last_percent("Augmenting: 42%|####  |"), Some(42));
+        // The last percent token on the line wins.
+        assert_eq!(last_percent("a 10% then 87%"), Some(87));
+        assert_eq!(last_percent("over 250% impossible"), Some(100));
+        assert_eq!(last_percent("no percent here"), None);
+        assert_eq!(last_percent("% leading nothing"), None);
+    }
+
+    #[test]
+    fn line_step_from_banner_and_tqdm_desc() {
+        assert_eq!(line_step("=== Step 4/6: Train classifier"), Some(4));
+        assert_eq!(line_step("Step 9/6 bogus"), None); // out of range
+        assert_eq!(line_step("Synthesizing clips 3%"), Some(1));
+        assert_eq!(line_step("VoxCPM clips"), Some(1));
+        assert_eq!(line_step("Augmenting positive r0 5%"), Some(2));
+        assert_eq!(line_step("Features 1/10"), Some(3));
+        assert_eq!(line_step("Phase 2 training"), Some(4));
+        assert_eq!(line_step("nothing relevant"), None);
+    }
+
+    #[test]
+    fn tqdm_desc_strips_bar_and_counts() {
+        assert_eq!(tqdm_desc("Augmenting positive r0: 42%|### | 3/7"), "Augmenting positive r0");
+        assert_eq!(tqdm_desc("Features 12%|"), "Features");
+        assert_eq!(tqdm_desc("no bar here"), "");
+    }
+
+    #[test]
+    fn scan_progress_lines_advances_only_forward() {
+        let log = "Step 1/6\nSynthesizing clips: 50%|## |\nStep 4/6\nPhase 1: 30%|# |\nStep 2/6 late\n";
+        let (step, percent, label) = scan_progress_lines(log);
+        // Reached step 4 and never regresses to the later "Step 2/6" line.
+        assert_eq!(step, 4);
+        assert_eq!(percent, 30);
+        assert_eq!(label, "Phase 1");
+    }
+
+    #[test]
+    fn progress_overall_percent_weights_stages() {
+        // Nothing started.
+        assert_eq!(progress_overall_percent(0, 0, false), 0);
+        // done overrides everything to 100.
+        assert_eq!(progress_overall_percent(3, 40, true), 100);
+        // Steps 1..3 complete (10+12+10=32 weight of 100), step 4 half of 53 -> 26.
+        // acc = 32 + 26 = 58.
+        assert_eq!(progress_overall_percent(4, 50, false), 58);
+    }
+
+    #[test]
+    fn parse_train_progress_marks_done_when_succeeded() {
+        let value = parse_train_progress("", "succeeded");
+        assert_eq!(value["overall_percent"], json!(100));
+        assert_eq!(value["active_step"], json!(6));
+        let steps = value["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 6);
+        assert!(steps.iter().all(|s| s["state"] == json!("done")));
+    }
+
+    #[test]
+    fn reconcile_status_body_downgrades_dead_running() {
+        // Running file, no live container, not f5gen -> stopped.
+        let body = reconcile_status_body(
+            Some(json!({ "state": "running", "step": "train" })),
+            false,
+            "slug",
+        );
+        assert_eq!(body["state"], json!("stopped"));
+
+        // f5gen phase is preserved even without a container.
+        let body = reconcile_status_body(
+            Some(json!({ "state": "running", "step": "f5gen" })),
+            false,
+            "slug",
+        );
+        assert_eq!(body["state"], json!("running"));
+
+        // No file, container up -> starting; container down -> none.
+        assert_eq!(
+            reconcile_status_body(None, true, "w")["state"],
+            json!("starting")
+        );
+        assert_eq!(
+            reconcile_status_body(None, false, "w")["state"],
+            json!("none")
+        );
+    }
+
+    #[test]
+    fn build_train_argv_encodes_knobs_as_env_pairs() {
+        let vt = sample_vt();
+        let args = build_train_argv(
+            "/host/repo",
+            "trainer-slug",
+            true,
+            "trainer:latest",
+            "slug",
+            "hey computer",
+            &vt,
+        );
+        // GPU flag present, work mount present, image is the final positional arg
+        // before the bash command.
+        assert!(args.windows(2).any(|w| w == ["--gpus", "all"]));
+        assert!(args.contains(&"/host/repo:/work".to_string()));
+        assert_eq!(env_value(&args, "SLUG"), Some("slug"));
+        assert_eq!(env_value(&args, "PHRASE"), Some("hey computer"));
+        assert_eq!(env_value(&args, "STEPS"), Some("1234"));
+        assert_eq!(env_value(&args, "PERSONAL"), Some("1"));
+        assert_eq!(env_value(&args, "F5_COUNT"), Some("7"));
+        assert_eq!(env_value(&args, "N_SAMPLES"), Some("500"));
+        // n_samples_val is None -> no env pair emitted.
+        assert_eq!(env_value(&args, "N_SAMPLES_VAL"), None);
+        assert_eq!(args.last().unwrap(), "bash /work/trainer/scripts/train_job.sh");
+    }
+
+    #[test]
+    fn build_train_argv_omits_gpu_and_realistic_mount_when_disabled() {
+        let mut vt = sample_vt();
+        vt.realistic = false;
+        let args = build_train_argv(
+            "/host/repo", "n", false, "img", "slug", "phrase", &vt,
+        );
+        assert!(!args.iter().any(|a| a == "--gpus"));
+        assert!(!args.iter().any(|a| a.contains("augment_realistic.py")));
+        assert_eq!(env_value(&args, "REALISTIC"), Some("0"));
+    }
+
+    #[test]
+    fn queue_entry_json_folds_position_and_params() {
+        let entry = db::QueueEntry {
+            id: 5,
+            slug: "w".to_string(),
+            params_json: "{\"steps\":100}".to_string(),
+            state: "queued".to_string(),
+            container_name: None,
+            enqueued_at_ms: 111,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        let value = queue_entry_json(&entry, Some(2));
+        assert_eq!(value["id"], json!(5));
+        assert_eq!(value["position"], json!(2));
+        assert_eq!(value["params"]["steps"], json!(100));
+
+        // Invalid params JSON falls back to an empty object, never panics.
+        let bad = db::QueueEntry {
+            params_json: "not json".to_string(),
+            ..entry
+        };
+        assert_eq!(queue_entry_json(&bad, None)["params"], json!({}));
+    }
+
+    #[test]
+    fn read_tail_bytes_returns_only_the_tail() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("lkww_tail_{}.txt", now_ms()));
+        fs::write(&path, "0123456789ABCDEF").unwrap();
+        let tail = read_tail_bytes(&path, 4).unwrap();
+        assert_eq!(tail, "CDEF");
+        // Requesting more than the file length returns the whole file.
+        assert_eq!(read_tail_bytes(&path, 999).unwrap(), "0123456789ABCDEF");
+        let _ = fs::remove_file(&path);
+        // A missing file is None, not an error.
+        assert!(read_tail_bytes(&path, 4).is_none());
+    }
+
+    #[test]
+    fn validate_train_defaults_and_clamps() {
+        let vt = validate_train(serde_json::from_value(json!({})).unwrap()).unwrap();
+        assert_eq!(vt.steps, 50_000);
+        assert_eq!(vt.model_size, "medium");
+        assert_eq!(vt.token_type, "end");
+        assert_eq!(vt.positive_boost, 1);
+
+        // Steps clamp to the [100, 500_000] window; boost clamps to [1,50].
+        let vt = validate_train(
+            serde_json::from_value(json!({ "steps": 5, "positive_boost": 999 })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vt.steps, 100);
+        assert_eq!(vt.positive_boost, 50);
+
+        // Inverted snr/gap ranges are swapped, not rejected.
+        let vt = validate_train(
+            serde_json::from_value(json!({ "snr_min_db": 20.0, "snr_max_db": 5.0 })).unwrap(),
+        )
+        .unwrap();
+        assert!(vt.snr_min_db <= vt.snr_max_db);
+
+        // A bad model size is rejected.
+        assert!(validate_train(
+            serde_json::from_value(json!({ "model_size": "gigantic" })).unwrap()
+        )
+        .is_err());
+    }
 }
