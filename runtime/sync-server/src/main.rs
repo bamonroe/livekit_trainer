@@ -26,6 +26,7 @@ mod constants;
 mod db;
 mod docker;
 mod error;
+mod projects;
 mod settings;
 mod slicing;
 mod state;
@@ -39,6 +40,7 @@ use slicing::{
     is_hard_negative_context, negative_ranges, padded_bounds, phrase_ranges, positive_context_first,
     visible_range,
 };
+use projects::{create_project, projects};
 use settings::{get_settings, load_settings, update_settings};
 use state::{now_ms, rfc3339_ms, AppState, SynthJob};
 use docker::{
@@ -66,38 +68,6 @@ struct SyncResponse {
     alignment_output: String,
     warnings: Vec<String>,
     whisper_server_url: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ProjectsResponse {
-    status: &'static str,
-    projects: Vec<ProjectSummary>,
-}
-
-/// A project a device is registering with the server so it propagates to the
-/// user's other devices even before any recording exists for it. The device's
-/// own project id travels as `external_id` so the round-tripped project keeps a
-/// stable identity across devices.
-#[derive(Debug, Deserialize)]
-struct CreateProjectRequest {
-    #[serde(alias = "external_id")]
-    id: Option<String>,
-    slug: String,
-    phrase: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ProjectSummary {
-    id: String,
-    slug: String,
-    phrase: String,
-    created_at_millis: i64,
-    bulk_slice_count: usize,
-    positive_count: usize,
-    negative_count: usize,
-    background_count: usize,
-    /// Negatives available from every *other* project, reusable for this one.
-    pooled_negative_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -562,67 +532,6 @@ async fn main() {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
-}
-
-async fn projects(State(state): State<AppState>) -> Result<Json<ProjectsResponse>, AppError> {
-    let rows = {
-        let conn = state.db.lock().expect("db lock poisoned");
-        db::project_summaries(&conn).map_err(db_error)?
-    };
-    // Cross-wake-word reuse: every other project's plain negatives, plus their
-    // positives (reused as hard negatives), are available to this project. Hard
-    // negatives are project-scoped, so they never enter the shared pool.
-    let total_poolable_negatives: i64 = rows.iter().map(|r| r.poolable_negative_count).sum();
-    let total_positives: i64 = rows.iter().map(|r| r.positive_count).sum();
-    let projects = rows
-        .into_iter()
-        .map(|row| {
-            let pooled = (total_poolable_negatives - row.poolable_negative_count)
-                + (total_positives - row.positive_count);
-            ProjectSummary {
-                id: row.external_id,
-                slug: row.slug,
-                phrase: row.phrase,
-                created_at_millis: row.created_at_ms,
-                bulk_slice_count: row.bulk_slice_count as usize,
-                positive_count: row.positive_count as usize,
-                negative_count: row.negative_count as usize,
-                background_count: row.background_count as usize,
-                pooled_negative_count: pooled.max(0) as usize,
-            }
-        })
-        .collect();
-    Ok(Json(ProjectsResponse {
-        status: "ok",
-        projects,
-    }))
-}
-
-/// Register a project on the server so it shows up on the user's other devices
-/// without waiting for a recording to be synced. Idempotent on slug: creating
-/// the same wake word again just refreshes its phrase and id.
-async fn create_project(
-    State(state): State<AppState>,
-    Json(request): Json<CreateProjectRequest>,
-) -> Result<Json<Value>, AppError> {
-    let slug = request.slug.trim().to_string();
-    let phrase = request.phrase.trim().to_string();
-    if !is_safe_slug(&slug) {
-        return Err(AppError::bad_request(format!("unsafe slug: {slug:?}")));
-    }
-    if phrase.is_empty() {
-        return Err(AppError::bad_request("phrase is required"));
-    }
-    let external_id = request
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    {
-        let conn = state.db.lock().expect("db lock poisoned");
-        db::upsert_project(&conn, &slug, &phrase, external_id, now_ms()).map_err(db_error)?;
-    }
-    Ok(Json(json!({ "status": "ok", "slug": slug })))
 }
 
 async fn sync(
