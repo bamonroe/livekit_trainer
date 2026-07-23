@@ -6,7 +6,7 @@
 //! so cloning is cheap and the inner state is shared. The small epoch-time
 //! helpers live here too since state and timestamps are used together everywhere.
 
-use crate::ServerSettings;
+use crate::settings::ServerSettings;
 use chrono::Utc;
 use rusqlite::Connection;
 use serde::Serialize;

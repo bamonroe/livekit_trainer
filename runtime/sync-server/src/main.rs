@@ -26,6 +26,7 @@ mod constants;
 mod db;
 mod docker;
 mod error;
+mod settings;
 mod slicing;
 mod state;
 mod util;
@@ -38,6 +39,7 @@ use slicing::{
     is_hard_negative_context, negative_ranges, padded_bounds, phrase_ranges, positive_context_first,
     visible_range,
 };
+use settings::{get_settings, load_settings, update_settings};
 use state::{now_ms, rfc3339_ms, AppState, SynthJob};
 use docker::{
     container_running, docker_ok, f5_container, push_env, run_docker, training_container_name,
@@ -51,22 +53,6 @@ use util::{
     category_for_label, is_safe_recording_id, is_safe_run_id, is_safe_slug, parse_query, safe_join,
     safe_filename, validation_summary,
 };
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub(crate) struct ServerSettings {
-    sync_server_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SettingsRequest {
-    sync_server_url: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SettingsResponse {
-    status: &'static str,
-    settings: ServerSettings,
-}
 
 #[derive(Debug, Serialize)]
 struct SyncResponse {
@@ -576,33 +562,6 @@ async fn main() {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
-}
-
-async fn get_settings(State(state): State<AppState>) -> Json<SettingsResponse> {
-    let settings = state
-        .settings
-        .lock()
-        .expect("settings lock poisoned")
-        .clone();
-    Json(SettingsResponse {
-        status: "ok",
-        settings,
-    })
-}
-
-async fn update_settings(
-    State(state): State<AppState>,
-    Json(request): Json<SettingsRequest>,
-) -> Result<Json<SettingsResponse>, AppError> {
-    let settings = ServerSettings {
-        sync_server_url: clean_optional_url(request.sync_server_url),
-    };
-    save_settings(&state.settings_path, &settings)?;
-    *state.settings.lock().expect("settings lock poisoned") = settings.clone();
-    Ok(Json(SettingsResponse {
-        status: "saved",
-        settings,
-    }))
 }
 
 async fn projects(State(state): State<AppState>) -> Result<Json<ProjectsResponse>, AppError> {
@@ -2301,29 +2260,6 @@ async fn generate_synth_status(
             idle: true,
         },
     }))
-}
-
-fn load_settings(path: &Path) -> ServerSettings {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
-}
-
-fn save_settings(path: &Path, settings: &ServerSettings) -> Result<(), AppError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let contents = serde_json::to_string_pretty(settings)
-        .map_err(|error| AppError::internal(format!("serialize settings: {error}")))?;
-    fs::write(path, contents)?;
-    Ok(())
-}
-
-fn clean_optional_url(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), AppError> {
