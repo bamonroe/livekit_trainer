@@ -27,6 +27,7 @@ mod db;
 mod docker;
 mod error;
 mod slicing;
+mod state;
 mod util;
 mod whisper;
 
@@ -37,6 +38,7 @@ use slicing::{
     is_hard_negative_context, negative_ranges, padded_bounds, phrase_ranges, positive_context_first,
     visible_range,
 };
+use state::{now_ms, rfc3339_ms, AppState, SynthJob};
 use docker::{
     container_running, docker_ok, f5_container, push_env, run_docker, training_container_name,
 };
@@ -50,65 +52,8 @@ use util::{
     safe_filename, validation_summary,
 };
 
-#[derive(Clone)]
-struct AppState {
-    data_root: Arc<PathBuf>,
-    incoming_root: Arc<PathBuf>,
-    settings_path: Arc<PathBuf>,
-    settings: Arc<Mutex<ServerSettings>>,
-    // Whisper server URL from the WHISPER_SERVER_URL environment variable. This
-    // is the source of truth for where audio is transcribed; the app no longer
-    // configures it.
-    whisper_url: Arc<Option<String>>,
-    // Wake-word scorer service URL from SCORER_SERVER_URL. Optional: only the
-    // model-test scoring endpoint needs it; the rest of the server works without.
-    scorer_url: Arc<Option<String>>,
-    // Trained-model directory (MODELS_DIR), mounted read-only. Used only to
-    // fingerprint the .onnx so cached score curves invalidate when a model is
-    // retrained. May not exist; then the fingerprint is a sentinel.
-    models_root: Arc<PathBuf>,
-    // Absolute path of the repo on the *host*. Training launches a sibling
-    // trainer container over the mounted docker socket, and its `-v` bind mount
-    // source must be a host path, not a path inside this container. None until
-    // HOST_REPO_ROOT is set; the training endpoints refuse to run without it.
-    host_repo_root: Arc<Option<String>>,
-    // Trainer image tag launched for a full training run (TRAINER_IMAGE).
-    trainer_image: Arc<String>,
-    // Pass `--gpus all` to the trainer container (TRAINER_USE_GPU != "0").
-    trainer_gpu: Arc<bool>,
-    db: Arc<Mutex<Connection>>,
-    // Serializes training-queue dispatch so the enqueue-triggered kick and the
-    // periodic scheduler never launch the same queued job twice.
-    dispatch_lock: Arc<tokio::sync::Mutex<()>>,
-    // In-flight F5 synthetic-positive generation jobs, keyed by slug, so the app
-    // can kick one off and poll its progress without a second job being launched
-    // for the same wake word.
-    synth_jobs: Arc<Mutex<std::collections::HashMap<String, SynthJob>>>,
-}
-
-/// State of one F5 synthetic-positive generation run for a wake word.
-#[derive(Debug, Clone, Serialize)]
-struct SynthJob {
-    running: bool,
-    requested: usize,
-    wrote: usize,
-    error: Option<String>,
-}
-
-fn now_ms() -> i64 {
-    Utc::now().timestamp_millis()
-}
-
-/// Parse an RFC 3339 / ISO 8601 timestamp (as written by train_job.sh) to epoch
-/// milliseconds, or None if it does not parse.
-fn rfc3339_ms(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.timestamp_millis())
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct ServerSettings {
+pub(crate) struct ServerSettings {
     sync_server_url: Option<String>,
 }
 
