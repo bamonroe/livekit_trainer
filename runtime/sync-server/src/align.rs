@@ -25,7 +25,7 @@ use crate::slicing::{
 use crate::state::now_ms;
 use crate::util::{is_safe_slug, safe_filename, safe_join};
 use crate::whisper::{
-    normalized_words, transcribe_with_words, transcript_tail_has_phrase, whisper_words,
+    normalized_words, transcribe_with_words, transcript_tail_has_phrase, whisper_words, WhisperWord,
 };
 use hound::{SampleFormat, WavReader};
 use rusqlite::Connection;
@@ -282,32 +282,10 @@ async fn align_test_one(
             return Ok(());
         }
     };
-    let old_paths = {
-        let conn = db.lock().expect("db lock poisoned");
-        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
-    };
-    for old in old_paths {
-        let old = PathBuf::from(old);
-        if old.is_file() {
-            let _ = fs::remove_file(old);
-        }
-    }
+    remove_stale_slice_files(db, recording_id)?;
 
-    let word_rows = words
-        .iter()
-        .map(|word| db::WordRow {
-            word: word.word.trim().to_string(),
-            start_ms: (word.start * 1000.0).round() as i64,
-            end_ms: (word.end * 1000.0).round() as i64,
-            probability: word.probability,
-        })
-        .collect();
-    let prompts = script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let word_rows = word_rows_from(&words);
+    let prompts = prompts_from_script(script);
 
     let alignment = db::RecordingAlignment {
         recording_id: recording_id.to_string(),
@@ -372,23 +350,9 @@ fn store_enrollment_whole(
             return Ok(());
         }
     };
-    let old_paths = {
-        let conn = db.lock().expect("db lock poisoned");
-        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
-    };
-    for old in old_paths {
-        let old = PathBuf::from(old);
-        if old.is_file() {
-            let _ = fs::remove_file(old);
-        }
-    }
+    remove_stale_slice_files(db, recording_id)?;
 
-    let prompts = script
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let prompts = prompts_from_script(script);
 
     let alignment = db::RecordingAlignment {
         recording_id: recording_id.to_string(),
@@ -441,6 +405,131 @@ fn write_enrollment_reference(
     let safe = safe_filename(recording_id);
     fs::copy(source_wav, dir.join(format!("{safe}.wav")))?;
     fs::write(dir.join(format!("{safe}.txt")), script.trim())?;
+    Ok(())
+}
+
+/// Build DB word rows from a Whisper word stream: trim each token and convert
+/// its seconds to rounded milliseconds. Shared by every alignment path that
+/// persists word timings.
+fn word_rows_from(words: &[WhisperWord]) -> Vec<db::WordRow> {
+    words
+        .iter()
+        .map(|word| db::WordRow {
+            word: word.word.trim().to_string(),
+            start_ms: (word.start * 1000.0).round() as i64,
+            end_ms: (word.end * 1000.0).round() as i64,
+            probability: word.probability,
+        })
+        .collect()
+}
+
+/// Split a take's multi-line script into its non-empty, trimmed prompt lines.
+fn prompts_from_script(script: &str) -> Vec<String> {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// True when a take of this kind is expected to contain the wake phrase, so a
+/// missing alignment is worth warning about. Negatives and hard negatives carry
+/// no true wake phrase; everything else (positive, legacy mixed) does.
+fn expects_positive_for_kind(take_kind: &str) -> bool {
+    !matches!(take_kind, "negative" | "hard_negative")
+}
+
+/// Partition the aligned wake-phrase occurrences into (positive, hard-negative)
+/// index ranges by take kind. A `positive` take has only positives; a `negative`
+/// or `hard_negative` take has neither (its whole read is chopped by the generic
+/// negative pass); legacy `mixed`/empty splits occurrences by near-miss context.
+fn partition_phrase_ranges(
+    words: &[WhisperWord],
+    phrase_words: &[String],
+    take_kind: &str,
+) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    match take_kind {
+        "positive" => (phrase_ranges(words, phrase_words), Vec::new()),
+        "negative" | "hard_negative" => (Vec::new(), Vec::new()),
+        _ => phrase_ranges(words, phrase_words)
+            .into_iter()
+            .partition(|(first, last)| !is_hard_negative_context(words, *first, *last)),
+    }
+}
+
+/// The generic negative pass configuration for a take kind: whether to run it,
+/// and the label its slices carry. A positive take skips it (silent gaps must
+/// not become clips); a hard-negative take files its whole read as hard
+/// negatives; everything else files pooled negatives.
+fn negative_pass_config(take_kind: &str) -> (bool, &'static str) {
+    match take_kind {
+        "positive" => (false, "negative"),
+        "hard_negative" => (true, "hard_negative"),
+        _ => (true, "negative"),
+    }
+}
+
+/// On-disk category for a negative-pass label: hard negatives live in their own
+/// project-scoped bucket; everything else pools into `negative`.
+fn neg_category_for_label(label: &str) -> &'static str {
+    if label == "hard_negative" {
+        "hard_negative"
+    } else {
+        "negative"
+    }
+}
+
+/// Join a slice's words into a display phrase (trimmed tokens, space-separated),
+/// used to name the slice file after its spoken content.
+fn join_slice_words(words: &[WhisperWord]) -> String {
+    words
+        .iter()
+        .map(|word| word.word.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cut geometry for a tail-aligned phrase slice (positive or hard negative):
+/// the lead-in context anchor, padded and hard-max-clamped second bounds, and
+/// the word range still visible after clamping. Positives and hard negatives
+/// use identical geometry, so both go through here.
+fn phrase_slice_geometry(
+    words: &[WhisperWord],
+    first: usize,
+    last: usize,
+    source_end: f64,
+) -> (f64, f64, usize, usize) {
+    let context_first = positive_context_first(words, first, last);
+    let (start, end) = padded_bounds(
+        words,
+        context_first,
+        last,
+        source_end,
+        CUT_LEAD_PADDING_SECONDS,
+        POSITIVE_TAIL_PADDING_SECONDS,
+        false,
+    );
+    let (start, end) = clamp_slice_span(start, end, true);
+    let (visible_first, visible_last) = visible_range(words, context_first, last, start, end);
+    (start, end, visible_first, visible_last)
+}
+
+/// Delete the slice files a previous alignment pass wrote for this recording, so
+/// a fresh pass never leaves orphaned clips behind. Reads the active slice paths
+/// from the DB and removes each that still exists on disk. Every alignment path
+/// calls this after storing the source WAV and before writing its new slices.
+fn remove_stale_slice_files(db: &Mutex<Connection>, recording_id: &str) -> Result<(), AppError> {
+    let old_paths = {
+        let conn = db.lock().expect("db lock poisoned");
+        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
+    };
+    for old in old_paths {
+        let old = PathBuf::from(old);
+        if old.is_file() {
+            let _ = fs::remove_file(old);
+        }
+    }
     Ok(())
 }
 
@@ -605,21 +694,12 @@ pub(crate) async fn align_one_recording(
     //    behavior — split aligned occurrences into positives and the
     //    near-miss-framed hard negatives inferred from surrounding cue words.
     let take_kind = kind.trim();
-    let expects_positive = !matches!(take_kind, "negative" | "hard_negative");
-    let (positive_ranges, hard_negative_ranges): (Vec<_>, Vec<_>) = match take_kind {
-        "positive" => (phrase_ranges(&words, &phrase_words), Vec::new()),
-        "negative" | "hard_negative" => (Vec::new(), Vec::new()),
-        _ => phrase_ranges(&words, &phrase_words)
-            .into_iter()
-            .partition(|(first, last)| !is_hard_negative_context(&words, *first, *last)),
-    };
+    let expects_positive = expects_positive_for_kind(take_kind);
+    let (positive_ranges, hard_negative_ranges) =
+        partition_phrase_ranges(&words, &phrase_words, take_kind);
     // Whether to run the generic negative pass, and the label its slices carry.
     // A token take skips negatives entirely so silent gaps never become clips.
-    let (run_negatives, negative_label): (bool, &str) = match take_kind {
-        "positive" => (false, "negative"),
-        "hard_negative" => (true, "hard_negative"),
-        _ => (true, "negative"),
-    };
+    let (run_negatives, negative_label) = negative_pass_config(take_kind);
     if expects_positive && positive_ranges.is_empty() {
         summary.warnings.push(format!(
             "{}: no aligned wake phrase occurrences found in transcript {:?}",
@@ -639,16 +719,7 @@ pub(crate) async fn align_one_recording(
             return Ok(());
         }
     };
-    let old_paths = {
-        let conn = db.lock().expect("db lock poisoned");
-        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
-    };
-    for old in old_paths {
-        let old = PathBuf::from(old);
-        if old.is_file() {
-            let _ = fs::remove_file(old);
-        }
-    }
+    remove_stale_slice_files(db, recording_id)?;
 
     let source_end = wav_duration_seconds(source)
         .unwrap_or_else(|_| words.last().map(|word| word.end).unwrap_or(0.0));
@@ -656,19 +727,8 @@ pub(crate) async fn align_one_recording(
         let mut occupied = Vec::new();
         let mut slice_rows = Vec::new();
         for (first, last) in positive_ranges.iter() {
-            let context_first = positive_context_first(&words, *first, *last);
-            let (start, end) = padded_bounds(
-                &words,
-                context_first,
-                *last,
-                source_end,
-                CUT_LEAD_PADDING_SECONDS,
-                POSITIVE_TAIL_PADDING_SECONDS,
-                false,
-            );
-            let (start, end) = clamp_slice_span(start, end, true);
-            let (visible_first, visible_last) =
-                visible_range(&words, context_first, *last, start, end);
+            let (start, end, visible_first, visible_last) =
+                phrase_slice_geometry(&words, *first, *last, source_end);
             let slice_words = &words[visible_first..=visible_last];
             let clip_id = bulk_clip_hash_id(
                 recording_id,
@@ -724,19 +784,8 @@ pub(crate) async fn align_one_recording(
         // but file it under the negative category with a distinct label, and mark
         // it occupied so the generic negative pass does not re-cut the same words.
         for (first, last) in hard_negative_ranges.iter() {
-            let context_first = positive_context_first(&words, *first, *last);
-            let (start, end) = padded_bounds(
-                &words,
-                context_first,
-                *last,
-                source_end,
-                CUT_LEAD_PADDING_SECONDS,
-                POSITIVE_TAIL_PADDING_SECONDS,
-                false,
-            );
-            let (start, end) = clamp_slice_span(start, end, true);
-            let (visible_first, visible_last) =
-                visible_range(&words, context_first, *last, start, end);
+            let (start, end, visible_first, visible_last) =
+                phrase_slice_geometry(&words, *first, *last, source_end);
             let slice_words = &words[visible_first..=visible_last];
             let clip_id = bulk_clip_hash_id(
                 recording_id,
@@ -747,11 +796,7 @@ pub(crate) async fn align_one_recording(
                 end,
                 slice_words,
             );
-            let phrase_text = slice_words
-                .iter()
-                .map(|word| word.word.trim())
-                .collect::<Vec<_>>()
-                .join(" ");
+            let phrase_text = join_slice_words(slice_words);
             let file_name = format!(
                 "{}_{}.wav",
                 safe_filename(&clip_id),
@@ -807,11 +852,7 @@ pub(crate) async fn align_one_recording(
                     end,
                     slice_words,
                 );
-                let phrase_text = slice_words
-                    .iter()
-                    .map(|word| word.word.trim())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let phrase_text = join_slice_words(slice_words);
                 let file_name = format!(
                     "{}_{}.wav",
                     safe_filename(&clip_id),
@@ -819,11 +860,7 @@ pub(crate) async fn align_one_recording(
                 );
                 // A hard-negative take files its whole read under the hard_negative
                 // category (project-scoped); everything else is a pooled negative.
-                let neg_category = if negative_label == "hard_negative" {
-                    "hard_negative"
-                } else {
-                    "negative"
-                };
+                let neg_category = neg_category_for_label(negative_label);
                 let dest = dest_root.join(neg_category).join(&file_name);
                 if write_wav_slice(source, &dest, start, end)? {
                     slice_rows.push(build_slice_row(
@@ -845,21 +882,8 @@ pub(crate) async fn align_one_recording(
             }
         }
 
-        let word_rows = words
-            .iter()
-            .map(|word| db::WordRow {
-                word: word.word.trim().to_string(),
-                start_ms: (word.start * 1000.0).round() as i64,
-                end_ms: (word.end * 1000.0).round() as i64,
-                probability: word.probability,
-            })
-            .collect();
-        let prompts = script
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToString::to_string)
-            .collect();
+        let word_rows = word_rows_from(&words);
+        let prompts = prompts_from_script(script);
 
         let alignment = db::RecordingAlignment {
             recording_id: recording_id.to_string(),
@@ -918,16 +942,7 @@ fn slice_background_recording(
         }
     };
     // Remove any slice files a previous pass produced before writing the new set.
-    let old_paths = {
-        let conn = db.lock().expect("db lock poisoned");
-        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
-    };
-    for old in old_paths {
-        let old = PathBuf::from(old);
-        if old.is_file() {
-            let _ = fs::remove_file(old);
-        }
-    }
+    remove_stale_slice_files(db, recording_id)?;
 
     let total = wav_duration_seconds(source).unwrap_or(0.0);
     if total < BACKGROUND_MIN_CHUNK_SECONDS {
@@ -1024,16 +1039,7 @@ fn slice_positive_by_energy(
             return Ok(());
         }
     };
-    let old_paths = {
-        let conn = db.lock().expect("db lock poisoned");
-        db::active_slice_paths(&conn, recording_id).map_err(db_error)?
-    };
-    for old in old_paths {
-        let old = PathBuf::from(old);
-        if old.is_file() {
-            let _ = fs::remove_file(old);
-        }
-    }
+    remove_stale_slice_files(db, recording_id)?;
 
     // Read the whole take as mono 16-bit PCM to compute the energy envelope.
     let mut reader = WavReader::open(source)
@@ -1188,5 +1194,147 @@ pub(crate) fn review_clip_path(
         )));
     }
     Ok(data_root.join(slug).join(category).join(file_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(text: &str, start: f64, end: f64) -> WhisperWord {
+        WhisperWord {
+            word: text.to_string(),
+            start,
+            end,
+            probability: 1.0,
+        }
+    }
+
+    #[test]
+    fn expects_positive_only_for_non_negative_kinds() {
+        assert!(expects_positive_for_kind("positive"));
+        assert!(expects_positive_for_kind("mixed"));
+        assert!(expects_positive_for_kind("")); // legacy/empty normalizes to mixed
+        assert!(!expects_positive_for_kind("negative"));
+        assert!(!expects_positive_for_kind("hard_negative"));
+    }
+
+    #[test]
+    fn negative_pass_config_matches_kind() {
+        assert_eq!(negative_pass_config("positive"), (false, "negative"));
+        assert_eq!(negative_pass_config("hard_negative"), (true, "hard_negative"));
+        assert_eq!(negative_pass_config("negative"), (true, "negative"));
+        assert_eq!(negative_pass_config("mixed"), (true, "negative"));
+        assert_eq!(negative_pass_config(""), (true, "negative"));
+    }
+
+    #[test]
+    fn neg_category_only_hard_negative_gets_own_bucket() {
+        assert_eq!(neg_category_for_label("hard_negative"), "hard_negative");
+        assert_eq!(neg_category_for_label("negative"), "negative");
+        assert_eq!(neg_category_for_label("anything_else"), "negative");
+    }
+
+    #[test]
+    fn partition_phrase_ranges_by_take_kind() {
+        // "all set" spoken twice: first inside a near-miss frame, then a clean
+        // occurrence spaced far enough that the 8-word hard-negative lookback
+        // cannot reach the earlier "not the wake phrase" cue.
+        let words = vec![
+            word("this", 0.0, 0.2),
+            word("is", 0.25, 0.4),
+            word("not", 0.45, 0.6),
+            word("the", 0.65, 0.75),
+            word("wake", 0.8, 1.0),
+            word("phrase", 1.05, 1.3),
+            word("all", 1.5, 1.7),
+            word("set", 1.75, 2.0),
+            word("okay", 2.5, 2.7),
+            word("now", 2.75, 2.9),
+            word("let", 3.0, 3.1),
+            word("us", 3.15, 3.25),
+            word("go", 3.3, 3.4),
+            word("ahead", 3.45, 3.6),
+            word("and", 3.65, 3.75),
+            word("finally", 3.8, 4.0),
+            word("say", 4.1, 4.3),
+            word("all", 4.4, 4.6),
+            word("set", 4.65, 4.9),
+        ];
+        let phrase = normalized_words("all set");
+
+        // A positive take treats every occurrence as a positive.
+        let (pos, hard) = partition_phrase_ranges(&words, &phrase, "positive");
+        assert_eq!(pos, vec![(6, 7), (17, 18)]);
+        assert!(hard.is_empty());
+
+        // A negative/hard_negative take yields no phrase ranges at all.
+        assert_eq!(
+            partition_phrase_ranges(&words, &phrase, "negative"),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            partition_phrase_ranges(&words, &phrase, "hard_negative"),
+            (Vec::new(), Vec::new())
+        );
+
+        // Legacy mixed splits the near-miss-framed occurrence into hard negatives.
+        let (pos, hard) = partition_phrase_ranges(&words, &phrase, "mixed");
+        assert_eq!(pos, vec![(17, 18)]);
+        assert_eq!(hard, vec![(6, 7)]);
+    }
+
+    #[test]
+    fn prompts_from_script_keeps_nonempty_trimmed_lines() {
+        let prompts = prompts_from_script("  first line \n\n  second \n   \nthird");
+        assert_eq!(prompts, vec!["first line", "second", "third"]);
+        assert!(prompts_from_script("   \n\n").is_empty());
+    }
+
+    #[test]
+    fn word_rows_from_trims_and_rounds_to_ms() {
+        let rows = word_rows_from(&[word("  hi ", 0.1234, 0.5678)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].word, "hi");
+        assert_eq!(rows[0].start_ms, 123);
+        assert_eq!(rows[0].end_ms, 568);
+        assert!((rows[0].probability - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn join_slice_words_trims_and_spaces() {
+        let joined = join_slice_words(&[word(" all", 0.0, 0.1), word("set ", 0.2, 0.3)]);
+        assert_eq!(joined, "all set");
+        assert_eq!(join_slice_words(&[]), "");
+    }
+
+    #[test]
+    fn phrase_slice_geometry_matches_manual_pipeline() {
+        let words = vec![
+            word("alpha", 0.00, 0.20),
+            word("bravo", 0.35, 0.55),
+            word("charlie", 0.90, 1.10),
+            word("wake", 1.30, 1.55),
+            word("word", 1.65, 1.90),
+        ];
+        let source_end = 3.0;
+        // The helper must equal the inline positive-cut pipeline it replaced.
+        let context_first = positive_context_first(&words, 3, 4);
+        let (start, end) = padded_bounds(
+            &words,
+            context_first,
+            4,
+            source_end,
+            CUT_LEAD_PADDING_SECONDS,
+            POSITIVE_TAIL_PADDING_SECONDS,
+            false,
+        );
+        let (start, end) = clamp_slice_span(start, end, true);
+        let (vf, vl) = visible_range(&words, context_first, 4, start, end);
+
+        let (gs, ge, gvf, gvl) = phrase_slice_geometry(&words, 3, 4, source_end);
+        assert!((gs - start).abs() < 1e-12);
+        assert!((ge - end).abs() < 1e-12);
+        assert_eq!((gvf, gvl), (vf, vl));
+    }
 }
 
