@@ -57,6 +57,19 @@ def to_float(value: str) -> float | None:
         return None
 
 
+def _total_positive(params: dict, summary: dict) -> int | None:
+    """The model's total positive input across all three sources.
+
+    kokoro (built-in TTS pool) + own real (already boosted) + F5 synth. Returns
+    None only if the built-in pool count is unknown, since it dominates."""
+    kokoro = params.get("n_samples")
+    if not isinstance(kokoro, int):
+        return None
+    own = summary.get("own_positive") or summary.get("positive") or 0
+    synth = summary.get("synth_positive") or 0
+    return kokoro + own + synth
+
+
 def main() -> int:
     slug = env("SLUG")
     run_id = env("RUNID")
@@ -96,9 +109,15 @@ def main() -> int:
         "background_paths": params.get("background_paths"),
         "custom_negative_count": params.get("custom_negative_count"),
         "target_phrases": params.get("target_phrases"),
-        # Real vs synthetic training data (how much of the user's voice went in).
-        "real_positive": summary.get("positive"),
+        # Positive training data by source. The model's total positive input is
+        # three streams: the trainer's built-in TTS pool (kokoro_positive =
+        # n_samples), the user's own real recordings replicated x positive_boost
+        # (real_positive), and the F5 voice-cloned clips (synth_positive).
+        "real_positive": summary.get("own_positive", summary.get("positive")),
         "real_positive_unique": summary.get("positive_unique"),
+        "synth_positive": summary.get("synth_positive"),
+        "kokoro_positive": params.get("n_samples"),
+        "total_positive_input": _total_positive(params, summary),
         "real_negative": summary.get("negative"),
         "real_background": summary.get("background"),
         "own_negative": summary.get("own_negative"),

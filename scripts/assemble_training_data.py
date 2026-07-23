@@ -81,6 +81,28 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--synth-root",
+        type=Path,
+        default=Path("data/synth_f5"),
+        help=(
+            "Root of the F5 voice-cloned synthetic positives, laid out as "
+            "<root>/<slug>/positive (default: data/synth_f5). Up to --synth-count "
+            "of these are pooled into the target's positives as a second synthetic "
+            "source that carries the user's timbre."
+        ),
+    )
+    parser.add_argument(
+        "--synth-count",
+        type=int,
+        default=0,
+        help=(
+            "How many F5 voice-cloned positives to fold into training (0 = none). "
+            "The trainer's own built-in TTS pool (n_samples) and the user's real "
+            "positives (x --positive-boost) are the other two positive sources; "
+            "together they are the model's total positive input."
+        ),
+    )
+    parser.add_argument(
         "--summary-json",
         type=Path,
         default=None,
@@ -96,6 +118,8 @@ def main() -> int:
         raise SystemExit(f"unsafe slug: {args.slug!r}")
     if args.positive_boost < 1:
         raise SystemExit("--positive-boost must be 1 or greater")
+    if args.synth_count < 0:
+        raise SystemExit("--synth-count must be 0 or greater")
     # No own recordings is allowed: the trainer synthesizes positives/negatives
     # from the phrase, and other wake words' clips are still pooled in as
     # negatives/background. Warn but continue so a brand-new word can train on a
@@ -114,6 +138,8 @@ def main() -> int:
         borrow_background=not args.no_borrow_background,
         copy=args.copy,
         positive_boost=args.positive_boost,
+        synth_root=args.synth_root,
+        synth_count=args.synth_count,
     )
 
     dest = args.out / args.slug
@@ -123,7 +149,13 @@ def main() -> int:
         if args.positive_boost > 1
         else ""
     )
-    print(f"  positive:   {summary['positive']} (own{boost_note})")
+    synth_note = (
+        f", F5 synth {summary['synth_positive']}" if summary["synth_positive"] else ""
+    )
+    print(
+        f"  positive:   {summary['positive']} "
+        f"(own {summary['own_positive']}{boost_note}{synth_note})"
+    )
     print(
         f"  negative:   {summary['negative']} "
         f"(own {summary['own_negative']}, own hard negatives {summary['own_hard_negative']}, "
@@ -142,7 +174,14 @@ def main() -> int:
         # model's provenance record.
         args.summary_json.parent.mkdir(parents=True, exist_ok=True)
         args.summary_json.write_text(
-            json.dumps({**summary, "positive_boost": args.positive_boost}, indent=2)
+            json.dumps(
+                {
+                    **summary,
+                    "positive_boost": args.positive_boost,
+                    "synth_count": args.synth_count,
+                },
+                indent=2,
+            )
         )
     return 0
 
@@ -169,6 +208,8 @@ def assemble(
     borrow_background: bool = True,
     copy: bool = False,
     positive_boost: int = 1,
+    synth_root: Path | None = None,
+    synth_count: int = 0,
 ) -> dict:
     dest = out_root / slug
     if dest.exists():
@@ -180,12 +221,28 @@ def assemble(
     counts = {k: 0 for k in ("own_negative", "own_hard_negative", "borrowed_negative", "borrowed_positive", "own_background", "borrowed_background")}
     contributing: set[str] = set()
 
-    # Positives: own only, optionally replicated `positive_boost` times so the
-    # real clips are a larger fraction of the trainer's synthetic positive pool.
+    # Positives come from up to three sources that together are the model's total
+    # positive input:
+    #   1. the user's own real recordings, optionally replicated `positive_boost`
+    #      times so they weigh more against the synthetic pools;
+    #   2. up to `synth_count` F5 voice-cloned clips (data/synth_f5/<slug>), a
+    #      synthetic source that carries the user's timbre;
+    #   3. the trainer's own built-in TTS pool (n_samples), synthesized later by
+    #      `livekit-wakeword setup`, not pooled here.
     n_pos_unique = _count_wavs(data_root / slug / "positive")
-    n_pos = _link_category(
+    own_pos = _link_category(
         data_root / slug / "positive", dest / "positive", slug, copy, boost=positive_boost
     )
+    synth_pos = 0
+    if synth_root is not None and synth_count > 0:
+        synth_pos = _link_category(
+            synth_root / slug / "positive",
+            dest / "positive",
+            f"{slug}_f5synth",
+            copy,
+            limit=synth_count,
+        )
+    n_pos = own_pos + synth_pos
 
     # Negatives: own negatives, own hard negatives (project-scoped, never
     # borrowed from or lent to another slug), then every other slug's negatives,
@@ -217,6 +274,8 @@ def assemble(
     return {
         "positive": n_pos,
         "positive_unique": n_pos_unique,
+        "own_positive": own_pos,
+        "synth_positive": synth_pos,
         "negative": counts["own_negative"] + counts["own_hard_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"],
         "background": counts["own_background"] + counts["borrowed_background"],
         "own_negative": counts["own_negative"],
@@ -234,7 +293,7 @@ def _count_wavs(src_dir: Path) -> int:
 
 
 def _link_category(
-    src_dir: Path, dest_dir: Path, src_slug: str, copy: bool, boost: int = 1
+    src_dir: Path, dest_dir: Path, src_slug: str, copy: bool, boost: int = 1, limit: int | None = None
 ) -> int:
     """Link/copy every ``*.wav`` in *src_dir* into *dest_dir*, namespaced by slug.
 
@@ -242,12 +301,17 @@ def _link_category(
     so clips pooled from different wake words never collide in the flat dir. When
     *boost* > 1 each source clip is placed *boost* times with a distinct suffix,
     so the trainer treats every replica as its own clip and samples/augments it,
-    raising that source's weight in the pool.
+    raising that source's weight in the pool. When *limit* is set, at most that
+    many source clips are placed (used to cap the F5 synth pool to the count the
+    user asked training for even if more clips exist on disk).
     """
     if not src_dir.is_dir():
         return 0
     placed = 0
-    for clip in sorted(src_dir.glob("*.wav")):
+    clips = sorted(src_dir.glob("*.wav"))
+    if limit is not None:
+        clips = clips[:limit]
+    for clip in clips:
         for replica in range(boost):
             suffix = "" if boost == 1 else f"__x{replica}"
             target = dest_dir / f"{src_slug}__{clip.stem}{suffix}{clip.suffix}"
