@@ -247,17 +247,10 @@ pub(crate) fn background_chunk_bounds(total: f64) -> Vec<(f64, f64)> {
     bounds
 }
 
-/// Segment a mono PCM take into sound-burst windows by short-frame RMS energy.
-/// Pure (no audio IO) so the burst detection is unit-testable. Returns padded,
-/// clamped `(start, end)` spans in seconds, in order. Used as the positive-take
-/// fallback when Whisper finds no words: each repeated sound burst (e.g. one
-/// fast "beep beep") becomes one positive clip.
-pub(crate) fn energy_burst_bounds(samples: &[i16], sample_rate: f64) -> Vec<(f64, f64)> {
-    if sample_rate <= 0.0 || samples.is_empty() {
-        return Vec::new();
-    }
-    let frame_len = ((ENERGY_FRAME_SECONDS * sample_rate).round() as usize).max(1);
-    // Short-frame RMS envelope. Frame `i` covers `[i*frame_len, ..)` samples.
+/// Short-frame RMS energy envelope of a mono PCM take. Frame `i` covers
+/// `[i*frame_len, (i+1)*frame_len)` samples (the final frame is short); each
+/// value is that frame's root-mean-square amplitude.
+fn rms_envelope(samples: &[i16], frame_len: usize) -> Vec<f64> {
     let mut rms: Vec<f64> = Vec::new();
     let mut i = 0;
     while i < samples.len() {
@@ -270,23 +263,31 @@ pub(crate) fn energy_burst_bounds(samples: &[i16], sample_rate: f64) -> Vec<(f64
         rms.push((sum / (end - i) as f64).sqrt());
         i += frame_len;
     }
-    if rms.is_empty() {
-        return Vec::new();
-    }
-    // Noise floor as a low percentile of frame energy; peak as the loudest frame.
-    let mut sorted = rms.clone();
+    rms
+}
+
+/// The hysteresis open/close thresholds for burst detection, derived from the
+/// envelope's noise floor (a low percentile) and peak (loudest frame). Returns
+/// `None` for a flat take whose peak does not rise meaningfully above its floor,
+/// so no bursts should be cut. Caller guarantees `rms` is non-empty.
+fn energy_open_close(rms: &[f64]) -> Option<(f64, f64)> {
+    let mut sorted = rms.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let floor = sorted[(sorted.len() as f64 * 0.10) as usize];
     let peak = *sorted.last().unwrap();
     // A flat take (no burst rises meaningfully above its own floor) yields nothing.
     if peak - floor < 1.0 {
-        return Vec::new();
+        return None;
     }
     let open = floor + ENERGY_OPEN_FRACTION * (peak - floor);
     let close = floor + ENERGY_CLOSE_FRACTION * (peak - floor);
-    let frame_secs = frame_len as f64 / sample_rate;
+    Some((open, close))
+}
 
-    // Hysteresis walk: open a burst above `open`, close it below `close`.
+/// Hysteresis walk over the RMS envelope: open a voiced run when energy rises to
+/// `open`, close it when energy falls below `close`. Returns each run as a
+/// `[start_frame, end_frame)` half-open frame-index span.
+fn hysteresis_runs(rms: &[f64], open: f64, close: f64) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut voiced = false;
     let mut run_start = 0usize;
@@ -304,14 +305,21 @@ pub(crate) fn energy_burst_bounds(samples: &[i16], sample_rate: f64) -> Vec<(f64
     if voiced {
         runs.push((run_start, rms.len()));
     }
+    runs
+}
 
-    // Merge runs whose silent gap is short enough to be inside one utterance,
-    // then drop anything too short to be a real burst.
-    let total = samples.len() as f64 / sample_rate;
+/// Turn frame-index runs into final second spans: convert to seconds, merge runs
+/// whose silent gap is short enough to be inside one utterance, drop anything too
+/// short to be a real burst, and pad the survivors' edges (clamped to `total`).
+fn merge_and_pad_bursts(
+    runs: &[(usize, usize)],
+    frame_secs: f64,
+    total: f64,
+) -> Vec<(f64, f64)> {
     let mut bursts: Vec<(f64, f64)> = Vec::new();
     for (start_frame, end_frame) in runs {
-        let start = start_frame as f64 * frame_secs;
-        let end = (end_frame as f64 * frame_secs).min(total);
+        let start = *start_frame as f64 * frame_secs;
+        let end = (*end_frame as f64 * frame_secs).min(total);
         match bursts.last_mut() {
             Some(last) if start - last.1 < ENERGY_MERGE_GAP_SECONDS => last.1 = end,
             _ => bursts.push((start, end)),
@@ -327,6 +335,29 @@ pub(crate) fn energy_burst_bounds(samples: &[i16], sample_rate: f64) -> Vec<(f64
             )
         })
         .collect()
+}
+
+/// Segment a mono PCM take into sound-burst windows by short-frame RMS energy.
+/// Pure (no audio IO) so the burst detection is unit-testable. Returns padded,
+/// clamped `(start, end)` spans in seconds, in order. Used as the positive-take
+/// fallback when Whisper finds no words: each repeated sound burst (e.g. one
+/// fast "beep beep") becomes one positive clip.
+pub(crate) fn energy_burst_bounds(samples: &[i16], sample_rate: f64) -> Vec<(f64, f64)> {
+    if sample_rate <= 0.0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let frame_len = ((ENERGY_FRAME_SECONDS * sample_rate).round() as usize).max(1);
+    let rms = rms_envelope(samples, frame_len);
+    if rms.is_empty() {
+        return Vec::new();
+    }
+    let Some((open, close)) = energy_open_close(&rms) else {
+        return Vec::new();
+    };
+    let frame_secs = frame_len as f64 / sample_rate;
+    let runs = hysteresis_runs(&rms, open, close);
+    let total = samples.len() as f64 / sample_rate;
+    merge_and_pad_bursts(&runs, frame_secs, total)
 }
 
 #[cfg(test)]
@@ -458,6 +489,50 @@ mod tests {
         assert!(bursts[0].1 - bursts[0].0 > 0.25);
         // Second burst lands well after the ~1s inter-repetition gap.
         assert!(bursts[1].0 > 1.4);
+    }
+
+    #[test]
+    fn rms_envelope_frames_and_averages() {
+        // frame_len 2 over 5 samples => 3 frames, last one short (a single sample).
+        let env = rms_envelope(&[3, 4, 0, 0, 6], 2);
+        assert_eq!(env.len(), 3);
+        // sqrt((9+16)/2) = 3.5355..
+        assert!((env[0] - (25.0f64 / 2.0).sqrt()).abs() < 1e-9);
+        assert!((env[1] - 0.0).abs() < 1e-9);
+        assert!((env[2] - 6.0).abs() < 1e-9); // single-sample tail frame
+    }
+
+    #[test]
+    fn energy_open_close_flat_take_is_none() {
+        // Peak barely above floor -> no thresholds.
+        assert!(energy_open_close(&[10.0, 10.0, 10.5]).is_none());
+        // A clear peak yields open>close, both between floor and peak.
+        let (open, close) = energy_open_close(&[0.0, 0.0, 0.0, 100.0]).unwrap();
+        assert!(open > close);
+        assert!(open > 0.0 && open < 100.0);
+        assert!(close > 0.0 && close < 100.0);
+    }
+
+    #[test]
+    fn hysteresis_runs_open_high_close_low() {
+        // Rise above open (10), stay voiced through the dip that is still >= close
+        // (5), then drop below close to end the run; a final voiced tail closes at
+        // the envelope end.
+        let rms = [0.0, 12.0, 6.0, 0.0, 11.0];
+        let runs = hysteresis_runs(&rms, 10.0, 5.0);
+        assert_eq!(runs, vec![(1, 3), (4, 5)]);
+    }
+
+    #[test]
+    fn merge_and_pad_bursts_merges_short_gaps_and_drops_short() {
+        // Two runs 0.10s apart (< merge gap) fuse; a lone tiny run is dropped for
+        // being below the minimum burst length.
+        let frame_secs = 0.05;
+        // run A: frames 6..8 => 0.30-0.40s; run B: 10..14 => 0.50-0.70s (gap 0.10s).
+        let bursts = merge_and_pad_bursts(&[(6, 8), (10, 14)], frame_secs, 2.0);
+        assert_eq!(bursts.len(), 1, "expected the two close runs to merge: {bursts:?}");
+        // A single 1-frame run (0.05s) is below ENERGY_MIN_BURST_SECONDS -> dropped.
+        assert!(merge_and_pad_bursts(&[(0, 1)], frame_secs, 2.0).is_empty());
     }
 
     #[test]
