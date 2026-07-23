@@ -27,9 +27,11 @@ Design notes
   the repetitions, or keep them as short multi-hit positives.
 """
 import argparse
+import contextlib
 import glob
 import os
 import random
+import wave
 
 
 def main():
@@ -71,6 +73,18 @@ def main():
                          "reference voice and target text vs. drifting (F5 default "
                          "2.0; raise toward 3.0 to hew closer to your timbre, too "
                          "high can sound tense/artifacty).")
+    ap.add_argument("--sec-per-word", type=float, default=0.42,
+                    help="Seconds F5 is told to allocate PER WORD of gen_text. F5 "
+                         "otherwise sizes the spoken part from the reference's "
+                         "rate (ref_audio_len/ref_text_len), which starves short "
+                         "phrases when the reference is a long enrollment passage "
+                         "and crushes/drops the lead-in. We instead pass an explicit "
+                         "fix_duration = ref_len + words*sec_per_word/speed + margin, "
+                         "so the words always get real time. remove_silence trims any "
+                         "slack, so erring generous is safe.")
+    ap.add_argument("--dur-margin", type=float, default=0.5,
+                    help="Extra seconds added to the gen-portion duration budget "
+                         "(trimmed back by remove_silence).")
     ap.add_argument("--seed-base", type=int, default=1234)
     ap.add_argument("--out-sr", type=int, default=0,
                     help="If >0, resample each clip to this rate (mono, 16-bit PCM) "
@@ -89,6 +103,16 @@ def main():
     rng = random.Random(args.seed_base)
     phrase_text = " ".join([args.gen_text.strip()] * args.repeat)
     carriers = [c.strip() for c in args.lead_carriers.split("|") if c.strip()]
+
+    _ref_secs = {}
+
+    def ref_seconds(path):
+        # F5 prepends the reference audio then slices it back off, so the
+        # fix_duration we pass is TOTAL (ref + gen). Cache each ref's length.
+        if path not in _ref_secs:
+            with contextlib.closing(wave.open(path)) as w:
+                _ref_secs[path] = w.getnframes() / float(w.getframerate())
+        return _ref_secs[path]
 
     def to_out_sr(path):
         # Downsample F5's 24 kHz render to the trainer's 16 kHz mono 16-bit in
@@ -115,6 +139,7 @@ def main():
                 return text
         return args.ref_text
 
+    skipped = 0
     for i in range(args.count):
         ref = refs[i % len(refs)]                 # rotate timbre across refs
         speed = rng.uniform(args.speed_min, args.speed_max)
@@ -130,21 +155,45 @@ def main():
             lead = rng.choice(carriers) + " "
         gen_text = f"{lead}{phrase_text}"
 
+        # Give the words real time. Without this F5 sizes the spoken part from
+        # the reference's rate, so a short phrase against the long enrollment
+        # passage renders far too short and the lead-in gets dropped. Budget the
+        # gen portion by word count; fix_duration is ref_len + that (silence
+        # trimmed back afterward).
+        n_words = max(1, len(gen_text.split()))
+        gen_secs = n_words * args.sec_per_word / speed + args.dur_margin
+        fix_duration = ref_seconds(ref) + gen_secs
+
         out = os.path.join(args.out_dir, f"f5_{i:05d}.wav")
-        tts.infer(
-            ref_file=ref,
-            ref_text=ref_text_for(ref),
-            gen_text=gen_text,
-            speed=speed,
-            seed=seed,
-            nfe_step=args.nfe_step,
-            cfg_strength=args.cfg_strength,
-            remove_silence=True,
-            file_wave=out,
-        )
-        to_out_sr(out)
+        # F5 occasionally emits a bad/undecodeable render; skip that one clip
+        # rather than aborting the whole batch (one glitch must not cost 100).
+        try:
+            tts.infer(
+                ref_file=ref,
+                ref_text=ref_text_for(ref),
+                gen_text=gen_text,
+                speed=speed,
+                seed=seed,
+                nfe_step=args.nfe_step,
+                cfg_strength=args.cfg_strength,
+                fix_duration=fix_duration,
+                remove_silence=True,
+                file_wave=out,
+            )
+            to_out_sr(out)
+        except Exception as e:
+            skipped += 1
+            if os.path.exists(out):
+                os.remove(out)
+            print(f"[{i+1}/{args.count}] SKIP {os.path.basename(ref)} "
+                  f"text={gen_text!r}: {e}", flush=True)
+            continue
         print(f"[{i+1}/{args.count}] {os.path.basename(ref)} speed={speed:.2f} "
-              f"text={gen_text!r} -> {out}", flush=True)
+              f"text={gen_text!r} dur={gen_secs:.2f}s -> {out}", flush=True)
+
+    if skipped:
+        print(f"done: {args.count - skipped}/{args.count} written, {skipped} skipped",
+              flush=True)
 
 
 if __name__ == "__main__":

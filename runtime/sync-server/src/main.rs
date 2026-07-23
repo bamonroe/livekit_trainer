@@ -1984,18 +1984,22 @@ async fn generate_synth(
         .unwrap_or(60)
         .clamp(1, 1000);
 
-    // Prefer the enrollment read (long, clean, exact-transcript sidecar) as the
-    // cloning reference; fall back to real positive clips. Refuse early if there
-    // is nothing to clone from.
+    // Prefer SHORT real positive clips as the cloning reference; fall back to the
+    // enrollment read only if none exist. F5 sizes the spoken output from the
+    // reference's rate (ref_audio_len/ref_text_len), so a long enrollment passage
+    // starves the short wake phrase and crushes/drops it — short clips of the user
+    // actually saying the phrase (exact transcript, F5-friendly length) clone the
+    // timbre AND give the right duration. Refuse early if there is nothing to
+    // clone from.
     let enroll_dir = state.data_root.join(&slug).join("enrollment");
     let positive_dir = state.data_root.join(&slug).join("positive");
-    let refs_server_dir = if dir_has_wav(&enroll_dir) {
-        enroll_dir
-    } else if dir_has_wav(&positive_dir) {
+    let refs_server_dir = if dir_has_wav(&positive_dir) {
         positive_dir
+    } else if dir_has_wav(&enroll_dir) {
+        enroll_dir
     } else {
         return Err(AppError::bad_request(
-            "no enrollment or positive clips to clone from; record a voice enrollment take first",
+            "no positive or enrollment clips to clone from; record positives or a voice enrollment take first",
         ));
     };
 

@@ -32,16 +32,20 @@ CFG_STRENGTH="${F5_CFG_STRENGTH:-2.0}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT_HOST="$REPO/data/synth_f5/$SLUG/positive"
 
-# Prefer the enrollment read as the cloning reference (a long clean passage with
-# its exact transcript in a sidecar .txt); fall back to real positive clips
-# (ref_text = the phrase) when no enrollment take has been recorded yet.
+# Prefer SHORT real positive clips as the cloning reference (ref_text = the
+# phrase): F5 sizes its output from the reference's rate, so a long enrollment
+# passage starves the short wake phrase and crushes it. Fall back to the
+# enrollment read only if no positives exist yet.
+POS_HOST="$REPO/data/real/$SLUG/positive"
 ENROLL_HOST="$REPO/data/real/$SLUG/enrollment"
-if ls "$ENROLL_HOST"/*.wav >/dev/null 2>&1; then
+if ls "$POS_HOST"/*.wav >/dev/null 2>&1; then
+  REFS_HOST="$POS_HOST"
+  echo "using positive-clip reference(s) from $POS_HOST"
+elif ls "$ENROLL_HOST"/*.wav >/dev/null 2>&1; then
   REFS_HOST="$ENROLL_HOST"
-  echo "using enrollment reference(s) from $ENROLL_HOST"
+  echo "no positives; falling back to enrollment reference(s) from $ENROLL_HOST"
 else
-  REFS_HOST="$REPO/data/real/$SLUG/positive"
-  echo "no enrollment take; falling back to positive clips in $REFS_HOST"
+  REFS_HOST="$POS_HOST"
 fi
 [ -d "$REFS_HOST" ] || { echo "no reference clips at $REFS_HOST" >&2; exit 1; }
 mkdir -p "$OUT_HOST"
