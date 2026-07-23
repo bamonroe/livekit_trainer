@@ -248,10 +248,7 @@ async fn compute_score(
     // the next request re-scores. An archived run is immutable, so its id alone
     // is a stable fingerprint and keeps each run's cached curves distinct from
     // the current model's and from each other.
-    let model_fp = match run {
-        Some(r) => format!("run-{r}"),
-        None => model_fingerprint(&state.models_root, slug),
-    };
+    let model_fp = resolve_model_fp(&state.models_root, slug, run);
 
     let cached = if force {
         None
@@ -453,10 +450,7 @@ fn grades_response(
     mode: &str,
     run: Option<&str>,
 ) -> Result<Json<ModelGradesResponse>, AppError> {
-    let model_fp = match run {
-        Some(r) => format!("run-{r}"),
-        None => model_fingerprint(&state.models_root, slug),
-    };
+    let model_fp = resolve_model_fp(&state.models_root, slug, run);
     let (test_takes, grades) = {
         let conn = state.db.lock().expect("db lock poisoned");
         let ids = db::test_take_ids(&conn, slug).map_err(db_error)?;
@@ -482,6 +476,17 @@ fn grades_response(
         totals,
         grades,
     }))
+}
+
+/// The cache-key fingerprint for the model being scored: an archived run's id is
+/// itself immutable (so `run-<id>` is stable and distinct per run), while the
+/// mutable current model is fingerprinted from its `.onnx` on disk. Shared by the
+/// scoring and grade-listing paths so both key their caches identically.
+fn resolve_model_fp(models_root: &Path, slug: &str, run: Option<&str>) -> String {
+    match run {
+        Some(r) => format!("run-{r}"),
+        None => model_fingerprint(models_root, slug),
+    }
 }
 
 /// Fingerprint the trained `.onnx` for a wake word so cached score curves stay
@@ -631,25 +636,8 @@ fn locate_targets(
     if tokens.is_empty() || words.is_empty() {
         return Vec::new();
     }
-    let normalized: Vec<String> = words.iter().map(|w| normalize_token(&w.word)).collect();
     // First pass: locate every phrase occurrence and its Whisper start/end.
-    let mut occ: Vec<(i64, i64, String)> = Vec::new();
-    let mut i = 0;
-    while i + tokens.len() <= normalized.len() {
-        if normalized[i..i + tokens.len()] == tokens[..] {
-            let start_ms = words[i].start_ms;
-            let end_ms = words[i + tokens.len() - 1].end_ms;
-            let text = words[i..i + tokens.len()]
-                .iter()
-                .map(|w| w.word.trim())
-                .collect::<Vec<_>>()
-                .join(" ");
-            occ.push((start_ms, end_ms, text));
-            i += tokens.len();
-        } else {
-            i += 1;
-        }
-    }
+    let occ = phrase_occurrences(&tokens, words);
     // Second pass: score each occurrence at the model's peak within its drift
     // window (neighbor-clamped so dense repeats can't claim each other's firing).
     let ends: Vec<f64> = occ.iter().map(|(_, end, _)| *end as f64).collect();
@@ -668,6 +656,32 @@ fn locate_targets(
             }
         })
         .collect()
+}
+
+/// Every non-overlapping run of transcript words whose normalized tokens equal
+/// `tokens`, as `(start_ms, end_ms, joined_text)`. Matching consumes the phrase
+/// (advances past it) so dense repeats yield one occurrence each. Pure, so the
+/// occurrence-finding is testable without a scorer curve.
+fn phrase_occurrences(tokens: &[String], words: &[db::WordRow]) -> Vec<(i64, i64, String)> {
+    let normalized: Vec<String> = words.iter().map(|w| normalize_token(&w.word)).collect();
+    let mut occ: Vec<(i64, i64, String)> = Vec::new();
+    let mut i = 0;
+    while i + tokens.len() <= normalized.len() {
+        if normalized[i..i + tokens.len()] == tokens[..] {
+            let start_ms = words[i].start_ms;
+            let end_ms = words[i + tokens.len() - 1].end_ms;
+            let text = words[i..i + tokens.len()]
+                .iter()
+                .map(|w| w.word.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            occ.push((start_ms, end_ms, text));
+            i += tokens.len();
+        } else {
+            i += 1;
+        }
+    }
+    occ
 }
 
 /// One detection search window per located phrase, in time order. Whisper word
