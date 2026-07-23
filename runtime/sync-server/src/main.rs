@@ -4782,7 +4782,7 @@ fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
         target_fp_per_hour,
         personal: request.personal.unwrap_or(false),
         positive_boost: request.positive_boost.unwrap_or(1).clamp(1, 50),
-        f5_count: request.f5_count.unwrap_or(0).min(2000),
+        f5_count: request.f5_count.unwrap_or(0).min(50_000),
         n_samples: request.n_samples,
         n_samples_val: request.n_samples_val,
         positive_per_batch: request.positive_per_batch,

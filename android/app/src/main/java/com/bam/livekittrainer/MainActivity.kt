@@ -1687,7 +1687,7 @@ class MainActivity : Activity() {
         val totalView = text("", 13f, textColor(), Typeface.BOLD)
         fun recomputeTotal() {
             val kokoro = kokoroInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 200_000) ?: 0
-            val f5 = f5Input.text.toString().trim().toIntOrNull()?.coerceIn(0, 2000) ?: 0
+            val f5 = f5Input.text.toString().trim().toIntOrNull()?.coerceIn(0, 50_000) ?: 0
             val boost = boostInput.text.toString().trim().toIntOrNull()?.coerceIn(1, 50) ?: 1
             val real = realPositiveCount * boost
             val total = kokoro + f5 + real
@@ -2411,7 +2411,7 @@ class MainActivity : Activity() {
     private fun savedTrainF5Count(): Int {
         return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
             .getInt(KEY_TRAIN_F5_COUNT, 20)
-            .coerceIn(0, 2000)
+            .coerceIn(0, 50_000)
     }
 
     private fun saveTrainNumbers(
@@ -2426,7 +2426,7 @@ class MainActivity : Activity() {
             if (targetFp != null) putFloat(KEY_TRAIN_TARGET_FP, targetFp.coerceIn(0f, 100f))
             if (boost != null) putInt(KEY_TRAIN_POSITIVE_BOOST, boost.coerceIn(1, 50))
             if (kokoroCount != null) putInt(KEY_TRAIN_KOKORO_COUNT, kokoroCount.coerceIn(0, 200_000))
-            if (f5Count != null) putInt(KEY_TRAIN_F5_COUNT, f5Count.coerceIn(0, 2000))
+            if (f5Count != null) putInt(KEY_TRAIN_F5_COUNT, f5Count.coerceIn(0, 50_000))
         }.apply()
     }
 
