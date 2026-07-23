@@ -13,7 +13,7 @@ use crate::db;
 use crate::docker::{docker_ok, f5_container, run_docker};
 use crate::error::{db_error, AppError};
 use crate::state::{now_ms, AppState, SynthJob};
-use crate::ValidatedTrain;
+use crate::train::ValidatedTrain;
 use crate::util::{is_safe_slug, parse_query};
 use axum::{
     extract::{Path as AxumPath, RawQuery, State},
