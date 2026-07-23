@@ -1635,6 +1635,49 @@ class MainActivity : Activity() {
             setText(savedTrainPositiveBoost().toString())
             styleInput()
         }
+        val kokoroInput = EditText(this).apply {
+            hint = "Kokoro synthetic clips"
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(savedTrainKokoroCount().toString())
+            styleInput()
+        }
+        val f5Input = EditText(this).apply {
+            hint = "F5 voice-cloned clips"
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(savedTrainF5Count().toString())
+            styleInput()
+        }
+        // The model's total positive input = Kokoro (built-in TTS pool) + F5
+        // (voice-cloned) + your own real positives x boost. This wake word's real
+        // positive count is fixed from the server tally, so the calculator below
+        // updates live as the three knobs change.
+        val realPositiveCount = projectCounts[project.slug]?.positive ?: 0
+        val totalView = text("", 13f, textColor(), Typeface.BOLD)
+        fun recomputeTotal() {
+            val kokoro = kokoroInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 200_000) ?: 0
+            val f5 = f5Input.text.toString().trim().toIntOrNull()?.coerceIn(0, 2000) ?: 0
+            val boost = boostInput.text.toString().trim().toIntOrNull()?.coerceIn(1, 50) ?: 1
+            val real = realPositiveCount * boost
+            val total = kokoro + f5 + real
+            totalView.text = "Total positive input: $total\n" +
+                "= $kokoro Kokoro + $f5 F5 + $real your voice ($realPositiveCount×$boost)"
+        }
+        for (field in listOf(kokoroInput, f5Input, boostInput)) {
+            field.addTextChangedListener(object : android.text.TextWatcher {
+                override fun afterTextChanged(s: android.text.Editable?) = recomputeTotal()
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            })
+        }
+        recomputeTotal()
 
         // --- Realistic-augmentation numeric inputs ---------------------------
         // A small factory keeps the dozen compositing knobs consistent. Whole =
@@ -1669,6 +1712,8 @@ class MainActivity : Activity() {
                 stepsInput.text.toString().trim().toIntOrNull(),
                 targetFpInput.text.toString().trim().toFloatOrNull(),
                 boostInput.text.toString().trim().toIntOrNull(),
+                kokoroInput.text.toString().trim().toIntOrNull(),
+                f5Input.text.toString().trim().toIntOrNull(),
             )
             saveRealisticNumbers(
                 leadProbability = leadProbInput.text.toString().trim().toFloatOrNull(),
@@ -1778,8 +1823,40 @@ class MainActivity : Activity() {
                 }.withTop(dp(8)),
             )
 
-            addView(text("Positive boost", 15f, mutedColor()).withTop(dp(14)))
+            // --- Positives (the model's total positive input) ---------------
+            addView(text("Positives", 16f, textColor(), Typeface.BOLD).withTop(dp(20)))
+            addView(
+                text(
+                    "Three sources feed the model's positives: the built-in Kokoro TTS pool, F5 voice-cloned clips (generated on the server at train time from your recordings), and your own real positives replicated by the boost. The calculator sums them.",
+                    12f,
+                    mutedColor(),
+                ).withTop(dp(4)),
+            )
+
+            addView(text("Kokoro synthetic clips", 15f, mutedColor()).withTop(dp(14)))
+            addView(kokoroInput.withTop(dp(6)))
+
+            addView(text("F5 voice-cloned clips", 15f, mutedColor()).withTop(dp(14)))
+            addView(
+                text(
+                    "Cloned from your recorded positives. Generated fresh at train time; needs at least one real positive to clone from.",
+                    11f,
+                    mutedColor(),
+                ).withTop(dp(2)),
+            )
+            addView(f5Input.withTop(dp(6)))
+
+            addView(text("Positive boost (replicate your voice)", 15f, mutedColor()).withTop(dp(14)))
             addView(boostInput.withTop(dp(6)))
+
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(12), dp(10), dp(12), dp(10))
+                    background = rounded(promptColor(), dp(14), 0)
+                    addView(totalView)
+                }.withTop(dp(12)),
+            )
 
             // --- Realistic augmentation -------------------------------------
             addView(text("Realistic augmentation", 16f, textColor(), Typeface.BOLD).withTop(dp(20)))
@@ -2178,10 +2255,19 @@ class MainActivity : Activity() {
             append("State: $label")
             val progress = status.optJSONObject("progress")
             val activeStep = progress?.optInt("active_step", 0) ?: 0
+            // The pre-launch "f5gen" phase: the sync-server is cloning voice
+            // positives before the trainer container starts. Show it as its own
+            // stage with the clip counts, ahead of the six trainer steps.
+            if (step == "f5gen") {
+                val requested = status.optInt("f5_requested", 0)
+                val wrote = status.optInt("f5_wrote", 0)
+                append("\n  ▶ [G] Voice cloning (F5)")
+                append(if (wrote > 0) "  $wrote / $requested clips" else "  generating $requested clips…")
+            }
             // The coarse `step` (assemble/setup/train…) is only useful before the
             // six-stage pipeline starts; once a pipeline stage is active the
             // granular view below replaces it, so don't show both.
-            if (state == "running" && step.isNotBlank() && activeStep == 0) append("  ·  step: $step")
+            if (state == "running" && step.isNotBlank() && step != "f5gen" && activeStep == 0) append("  ·  step: $step")
             if (progress != null && (state == "running" || state == "starting" || state == "succeeded")) {
                 val overall = progress.optInt("overall_percent", 0)
                 append("  ·  ${overall}% overall")
@@ -2247,10 +2333,12 @@ class MainActivity : Activity() {
         val targetFp = savedTrainTargetFp()
         val personal = savedTrainPersonal()
         val boost = savedTrainPositiveBoost()
+        val kokoro = savedTrainKokoroCount()
+        val f5 = savedTrainF5Count()
         val tokenType = savedTrainTokenType(project.slug)
         val r = savedRealistic()
         return """
-            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"token_type":"$tokenType","realistic":${r.realistic},"lead_probability":${r.leadProbability},"real_lead_fraction":${r.realLeadFraction},"synthetic_lead":${r.syntheticLead},"max_lead_ms":${r.maxLeadMs},"lead_gap_min_ms":${r.leadGapMinMs},"lead_gap_max_ms":${r.leadGapMaxMs},"margin_min_ms":${r.marginMinMs},"margin_max_ms":${r.marginMaxMs},"snr_min_db":${r.snrMinDb},"snr_max_db":${r.snrMaxDb},"background_augment":${r.backgroundAugment},"voice_peak":${r.voicePeak}}
+            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"n_samples":$kokoro,"f5_count":$f5,"token_type":"$tokenType","realistic":${r.realistic},"lead_probability":${r.leadProbability},"real_lead_fraction":${r.realLeadFraction},"synthetic_lead":${r.syntheticLead},"max_lead_ms":${r.maxLeadMs},"lead_gap_min_ms":${r.leadGapMinMs},"lead_gap_max_ms":${r.leadGapMaxMs},"margin_min_ms":${r.marginMinMs},"margin_max_ms":${r.marginMaxMs},"snr_min_db":${r.snrMinDb},"snr_max_db":${r.snrMaxDb},"background_augment":${r.backgroundAugment},"voice_peak":${r.voicePeak}}
         """.trimIndent()
     }
 
@@ -2287,11 +2375,34 @@ class MainActivity : Activity() {
             .coerceIn(1, 50)
     }
 
-    private fun saveTrainNumbers(steps: Int?, targetFp: Float?, boost: Int?) {
+    // Kokoro = the trainer's built-in synthetic positive pool (n_samples). 20000
+    // is the standard-preset default; the user now sets it explicitly here.
+    private fun savedTrainKokoroCount(): Int {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_TRAIN_KOKORO_COUNT, 20_000)
+            .coerceIn(0, 200_000)
+    }
+
+    // F5 voice-cloned positives generated at train time. 0 = none (opt-in).
+    private fun savedTrainF5Count(): Int {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_TRAIN_F5_COUNT, 20)
+            .coerceIn(0, 2000)
+    }
+
+    private fun saveTrainNumbers(
+        steps: Int?,
+        targetFp: Float?,
+        boost: Int?,
+        kokoroCount: Int? = null,
+        f5Count: Int? = null,
+    ) {
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE).edit().apply {
             if (steps != null) putInt(KEY_TRAIN_STEPS, steps.coerceIn(100, 500_000))
             if (targetFp != null) putFloat(KEY_TRAIN_TARGET_FP, targetFp.coerceIn(0f, 100f))
             if (boost != null) putInt(KEY_TRAIN_POSITIVE_BOOST, boost.coerceIn(1, 50))
+            if (kokoroCount != null) putInt(KEY_TRAIN_KOKORO_COUNT, kokoroCount.coerceIn(0, 200_000))
+            if (f5Count != null) putInt(KEY_TRAIN_F5_COUNT, f5Count.coerceIn(0, 2000))
         }.apply()
     }
 
@@ -4996,6 +5107,12 @@ class MainActivity : Activity() {
         const val KEY_TRAIN_TARGET_FP = "train_target_fp"
         const val KEY_TRAIN_PERSONAL = "train_personal"
         const val KEY_TRAIN_POSITIVE_BOOST = "train_positive_boost"
+        // Two synthetic positive sources whose counts join the boosted real
+        // positives to form the model's total positive input. Kokoro = the
+        // trainer's built-in TTS pool (n_samples); F5 = voice-cloned clips
+        // generated at train time (f5_count).
+        const val KEY_TRAIN_KOKORO_COUNT = "train_kokoro_count"
+        const val KEY_TRAIN_F5_COUNT = "train_f5_count"
         const val KEY_TRAIN_TOKEN_TYPE = "train_token_type"
         const val KEY_TRAIN_REALISTIC = "train_realistic"
         const val KEY_TRAIN_LEAD_PROB = "train_lead_prob"
