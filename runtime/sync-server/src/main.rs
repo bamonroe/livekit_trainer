@@ -2165,6 +2165,13 @@ async fn run_synth_generation(
         count.to_string(),
         "--out-sr".into(),
         "16000".into(),
+        // Fidelity knobs (F5 defaults unless overridden in the environment).
+        // Raise F5_NFE_STEP for a sharper, more faithful render (slower);
+        // raise F5_CFG_STRENGTH to hew closer to the user's timbre.
+        "--nfe-step".into(),
+        env::var("F5_NFE_STEP").unwrap_or_else(|_| "32".to_string()),
+        "--cfg-strength".into(),
+        env::var("F5_CFG_STRENGTH").unwrap_or_else(|_| "2.0".to_string()),
     ])
     .await?;
 

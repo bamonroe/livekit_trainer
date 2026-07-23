@@ -24,6 +24,10 @@ SLUG="${1:?usage: f5_gen_positives.sh <slug> \"<phrase>\" [count]}"
 PHRASE="${2:?phrase required}"
 COUNT="${3:-200}"
 CONTAINER="${F5_CONTAINER:-speech-f5tts}"
+# Fidelity knobs (F5 defaults). Raise NFE_STEP for a sharper, more faithful
+# render (slower); raise CFG_STRENGTH to hew closer to your timbre.
+NFE_STEP="${F5_NFE_STEP:-32}"
+CFG_STRENGTH="${F5_CFG_STRENGTH:-2.0}"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT_HOST="$REPO/data/synth_f5/$SLUG/positive"
@@ -65,7 +69,9 @@ docker exec "$CONTAINER" python3 "/tmp/f5gen_$STAMP/gen.py" \
   --ref-text "$PHRASE" \
   --gen-text "$PHRASE" \
   --out-dir "$COUT" \
-  --count "$COUNT"
+  --count "$COUNT" \
+  --nfe-step "$NFE_STEP" \
+  --cfg-strength "$CFG_STRENGTH"
 
 # Pull the 24 kHz output back and resample to the trainer's 16 kHz mono 16-bit.
 TMP_PULL="/tmp/f5gen_pull_$STAMP"; mkdir -p "$TMP_PULL"
