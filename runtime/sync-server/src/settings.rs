@@ -86,3 +86,45 @@ pub(crate) async fn update_settings(
         settings,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::now_ms;
+
+    #[test]
+    fn clean_optional_url_trims_and_blanks_to_none() {
+        assert_eq!(
+            clean_optional_url(Some("  https://sync.example  ".to_string())),
+            Some("https://sync.example".to_string())
+        );
+        assert_eq!(clean_optional_url(Some("   ".to_string())), None);
+        assert_eq!(clean_optional_url(Some(String::new())), None);
+        assert_eq!(clean_optional_url(None), None);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_settings() {
+        let path = std::env::temp_dir().join(format!("lkww_settings_{}.json", now_ms()));
+        let settings = ServerSettings {
+            sync_server_url: Some("https://sync.example".to_string()),
+        };
+        save_settings(&path, &settings).expect("save");
+        let loaded = load_settings(&path);
+        assert_eq!(loaded.sync_server_url.as_deref(), Some("https://sync.example"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_settings_defaults_when_missing_or_unparseable() {
+        // A missing file yields the default (no URL) rather than an error.
+        let missing = std::env::temp_dir().join(format!("lkww_missing_{}.json", now_ms()));
+        assert!(load_settings(&missing).sync_server_url.is_none());
+
+        // Garbage on disk also falls back to the default so the server still starts.
+        let bad = std::env::temp_dir().join(format!("lkww_bad_{}.json", now_ms()));
+        fs::write(&bad, "not json at all").expect("write");
+        assert!(load_settings(&bad).sync_server_url.is_none());
+        let _ = fs::remove_file(&bad);
+    }
+}

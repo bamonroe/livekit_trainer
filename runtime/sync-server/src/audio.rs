@@ -127,3 +127,115 @@ pub(crate) fn build_slice_row(
         file_name: file_name.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Write a mono 16-bit PCM WAV of `n` samples (a simple ramp) at `rate` Hz.
+    fn write_test_wav(path: &Path, rate: u32, n: usize) {
+        let mut writer = WavWriter::create(
+            path,
+            WavSpec {
+                channels: 1,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: SampleFormat::Int,
+            },
+        )
+        .expect("create wav");
+        for i in 0..n {
+            writer.write_sample((i % 100) as i16).expect("write sample");
+        }
+        writer.finalize().expect("finalize");
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("lkww_audio_{tag}_{}.wav", Utc::now().timestamp_nanos_opt().unwrap_or(0)))
+    }
+
+    #[test]
+    fn wav_duration_seconds_reports_length() {
+        let path = temp_path("dur");
+        // 16000 samples at 16 kHz = exactly 1.0s.
+        write_test_wav(&path, 16_000, 16_000);
+        let dur = wav_duration_seconds(&path).expect("duration");
+        assert!((dur - 1.0).abs() < 1e-9);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_wav_slice_extracts_span_and_rejects_empty() {
+        let src = temp_path("src");
+        write_test_wav(&src, 16_000, 16_000); // 1.0s
+        let dest = temp_path("slice");
+        // Cut [0.25, 0.75) = 0.5s -> 8000 samples.
+        let wrote = write_wav_slice(&src, &dest, 0.25, 0.75).expect("slice");
+        assert!(wrote);
+        let dur = wav_duration_seconds(&dest).expect("slice duration");
+        assert!((dur - 0.5).abs() < 1e-3, "got {dur}");
+        // An empty span writes nothing and reports false.
+        let empty = temp_path("empty");
+        assert!(!write_wav_slice(&src, &empty, 0.5, 0.5).expect("empty slice"));
+        assert!(!empty.exists());
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn file_sha256_is_stable_and_content_dependent() {
+        let a = temp_path("sha_a");
+        let b = temp_path("sha_b");
+        write_test_wav(&a, 16_000, 1000);
+        write_test_wav(&b, 16_000, 1000);
+        // Identical content -> identical digest; hex-encoded 32-byte SHA-256.
+        let da = file_sha256(&a).expect("sha a");
+        let db_ = file_sha256(&b).expect("sha b");
+        assert_eq!(da, db_);
+        assert_eq!(da.len(), 64);
+        // Different content -> different digest.
+        let c = temp_path("sha_c");
+        write_test_wav(&c, 16_000, 2000);
+        assert_ne!(da, file_sha256(&c).expect("sha c"));
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
+        let _ = fs::remove_file(&c);
+    }
+
+    #[test]
+    fn build_slice_row_joins_words_and_averages_probability() {
+        let words = [
+            WhisperWord { word: " all".to_string(), start: 0.1, end: 0.4, probability: 0.8 },
+            WhisperWord { word: "set ".to_string(), start: 0.5, end: 0.9, probability: 0.6 },
+        ];
+        let row = build_slice_row(
+            "clip1",
+            "positive",
+            "positive",
+            Path::new("/tmp/clip1.wav"),
+            "clip1.wav",
+            0.1,
+            0.9,
+            &words,
+        );
+        assert_eq!(row.spoken_phrase, "all set");
+        assert_eq!(row.word_count, 2);
+        assert!((row.avg_probability - 0.7).abs() < 1e-9);
+        assert_eq!(row.source_start_ms, 100);
+        assert_eq!(row.source_end_ms, 900);
+        // No words -> empty phrase and zero average.
+        let empty = build_slice_row(
+            "c",
+            "background",
+            "background",
+            Path::new("/tmp/c.wav"),
+            "c.wav",
+            0.0,
+            2.0,
+            &[],
+        );
+        assert_eq!(empty.spoken_phrase, "");
+        assert_eq!(empty.avg_probability, 0.0);
+    }
+}

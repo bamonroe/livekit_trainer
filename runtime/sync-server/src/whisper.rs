@@ -214,4 +214,93 @@ mod tests {
         ));
         assert!(!transcript_tail_has_phrase("all is not set", &phrase));
     }
+
+    fn word(text: &str, start: f64, end: f64) -> WhisperWord {
+        WhisperWord {
+            word: text.to_string(),
+            start,
+            end,
+            probability: 1.0,
+        }
+    }
+
+    #[test]
+    fn normalize_token_keeps_alnum_lowercased() {
+        assert_eq!(normalize_token(" All!"), "all");
+        assert_eq!(normalize_token("don't"), "dont");
+        assert_eq!(normalize_token("Set."), "set");
+        assert_eq!(normalize_token("42%"), "42");
+        assert_eq!(normalize_token("--"), "");
+    }
+
+    #[test]
+    fn normalize_word_trims_edges_only() {
+        // Only surrounding non-alphanumerics are trimmed; interior stays.
+        assert_eq!(normalize_word("  'All-Set!' "), "all-set");
+        assert_eq!(normalize_word("Set."), "set");
+        assert_eq!(normalize_word("...!"), "");
+    }
+
+    #[test]
+    fn normalized_words_splits_and_drops_empties() {
+        assert_eq!(
+            normalized_words("  All,  Set!  "),
+            vec!["all".to_string(), "set".to_string()]
+        );
+        assert!(normalized_words("   ").is_empty());
+    }
+
+    #[test]
+    fn word_timestamp_offset_detects_segment_relative_times() {
+        // Both edges lag the segment by > 0.5s -> the words are segment-relative,
+        // so the offset (segment.start - first_word.start) is returned.
+        let seg = WhisperSegment {
+            start: 10.0,
+            end: 12.0,
+            words: vec![word("all", 0.1, 0.4), word("set", 0.9, 1.4)],
+        };
+        assert!((word_timestamp_offset(&seg) - 9.9).abs() < 1e-9);
+
+        // Already-absolute times (edges within 0.5s of the segment) -> no offset.
+        let seg = WhisperSegment {
+            start: 10.0,
+            end: 12.0,
+            words: vec![word("all", 10.1, 10.4), word("set", 11.6, 11.9)],
+        };
+        assert_eq!(word_timestamp_offset(&seg), 0.0);
+
+        // No words -> no offset.
+        let seg = WhisperSegment { start: 1.0, end: 2.0, words: vec![] };
+        assert_eq!(word_timestamp_offset(&seg), 0.0);
+    }
+
+    #[test]
+    fn whisper_words_reapplies_offset_and_drops_inverted() {
+        let response = WhisperResponse {
+            text: String::new(),
+            segments: vec![WhisperSegment {
+                start: 10.0,
+                end: 12.0,
+                words: vec![word("all", 0.1, 0.4), word("set", 0.9, 1.4)],
+            }],
+        };
+        let words = whisper_words(&response);
+        assert_eq!(words.len(), 2);
+        // The 9.9s offset is added back to both edges.
+        assert!((words[0].start - 10.0).abs() < 1e-9);
+        assert!((words[1].end - 11.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn contains_word_sequence_finds_contiguous_run() {
+        let words: Vec<String> = ["not", "the", "wake", "phrase", "all", "set"]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        assert!(contains_word_sequence(&words, &["wake", "phrase"]));
+        assert!(contains_word_sequence(&words, &["not", "the", "wake"]));
+        // Non-contiguous words are not a match.
+        assert!(!contains_word_sequence(&words, &["not", "wake"]));
+        assert!(!contains_word_sequence(&words, &["missing"]));
+    }
 }

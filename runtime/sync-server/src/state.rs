@@ -78,3 +78,33 @@ pub(crate) fn rfc3339_ms(value: &str) -> Option<i64> {
         .ok()
         .map(|dt| dt.timestamp_millis())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_ms_parses_valid_and_rejects_garbage() {
+        // 1970-01-01T00:00:01Z is exactly 1000 ms past the epoch.
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:01Z"), Some(1000));
+        // A timezone offset is honored.
+        assert_eq!(
+            rfc3339_ms("1970-01-01T00:00:01+00:00"),
+            Some(1000)
+        );
+        // Non-timestamps parse to None rather than panicking.
+        assert_eq!(rfc3339_ms("not a timestamp"), None);
+        assert_eq!(rfc3339_ms(""), None);
+        // A date without a time is not a full RFC 3339 timestamp.
+        assert_eq!(rfc3339_ms("2026-07-23"), None);
+    }
+
+    #[test]
+    fn now_ms_is_positive_and_advancing() {
+        let a = now_ms();
+        // A sanity floor: well after 2020-01-01 (1_577_836_800_000 ms).
+        assert!(a > 1_577_836_800_000);
+        let b = now_ms();
+        assert!(b >= a);
+    }
+}
