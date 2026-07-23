@@ -119,14 +119,7 @@ pub(crate) async fn synthetic_samples(
     let total = files.len();
 
     const MAX_SAMPLES: usize = 24;
-    let sampled: Vec<String> = if total <= MAX_SAMPLES {
-        files
-    } else {
-        let stride = total as f64 / MAX_SAMPLES as f64;
-        (0..MAX_SAMPLES)
-            .map(|i| files[((i as f64) * stride) as usize].clone())
-            .collect()
-    };
+    let sampled = evenly_spaced_sample(files, MAX_SAMPLES);
 
     let phrase = {
         let conn = state.db.lock().expect("db lock poisoned");
@@ -172,6 +165,49 @@ pub(crate) async fn synthetic_audio(
     let path = synth_positive_dir(&state.data_root, &slug).join(&file_name);
     let bytes = fs::read(path)?;
     Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
+}
+
+/// Pick an evenly-spaced sample of at most `max` items from a sorted list: all of
+/// them when the batch is small, otherwise a deterministic stride across it (no
+/// RNG) so the sample spans start, middle, and end. Pure so the spread is
+/// unit-testable. Extracted verbatim from `synthetic_samples`.
+fn evenly_spaced_sample(files: Vec<String>, max: usize) -> Vec<String> {
+    let total = files.len();
+    if total <= max {
+        files
+    } else {
+        let stride = total as f64 / max as f64;
+        (0..max)
+            .map(|i| files[((i as f64) * stride) as usize].clone())
+            .collect()
+    }
+}
+
+/// The ≤8 reference WAV file names to stage for one F5 batch: every `.wav` in the
+/// reference dir, sorted, truncated to the first eight. Errors when none exist.
+/// Extracted from `run_synth_generation`'s staging step.
+fn staged_reference_names(refs_server_dir: &Path) -> Result<Vec<String>, AppError> {
+    let mut names: Vec<String> = fs::read_dir(refs_server_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".wav"))
+        .collect();
+    names.sort();
+    names.truncate(8);
+    if names.is_empty() {
+        return Err(AppError::internal("no reference wavs to stage"));
+    }
+    Ok(names)
+}
+
+/// Parse the `ls | wc -l` clip count the container prints for a finished batch,
+/// defaulting to 0 on any non-numeric output. Pure. Extracted from
+/// `run_synth_generation`.
+fn parse_wc_count(stdout: &[u8]) -> usize {
+    String::from_utf8_lossy(stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0)
 }
 
 /// Does this directory hold at least one `.wav`?
@@ -498,16 +534,7 @@ async fn run_synth_generation(
     .await?;
 
     // Stage a small, clean subset of references (rotated inside the python).
-    let mut names: Vec<String> = fs::read_dir(refs_server_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.ends_with(".wav"))
-        .collect();
-    names.sort();
-    names.truncate(8);
-    if names.is_empty() {
-        return Err(AppError::internal("no reference wavs to stage"));
-    }
+    let names = staged_reference_names(refs_server_dir)?;
     for name in &names {
         docker_ok(vec![
             "cp".into(),
@@ -580,10 +607,7 @@ async fn run_synth_generation(
         format!("ls -1 {cout}/*.wav 2>/dev/null | wc -l"),
     ])
     .await?;
-    let wrote = String::from_utf8_lossy(&counted.stdout)
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(0);
+    let wrote = parse_wc_count(&counted.stdout);
 
     // Best-effort scratch cleanup.
     let _ = run_docker(vec![
@@ -638,4 +662,80 @@ pub(crate) async fn generate_synth_status(
             idle: true,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(dir: &Path, name: &str) {
+        fs::write(dir.join(name), b"x").expect("write test file");
+    }
+
+    #[test]
+    fn evenly_spaced_sample_returns_all_when_small() {
+        let files = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(evenly_spaced_sample(files.clone(), 24), files);
+    }
+
+    #[test]
+    fn evenly_spaced_sample_strides_across_large_batch() {
+        let files: Vec<String> = (0..100).map(|i| format!("{i:03}")).collect();
+        let sampled = evenly_spaced_sample(files, 4);
+        // Stride 25: indices 0, 25, 50, 75.
+        assert_eq!(sampled, vec!["000", "025", "050", "075"]);
+    }
+
+    #[test]
+    fn synth_positive_dir_is_sibling_of_data_root() {
+        let dir = synth_positive_dir(Path::new("/data/real"), "all_set");
+        assert_eq!(dir, PathBuf::from("/data/synth_f5/all_set/positive"));
+    }
+
+    #[test]
+    fn dir_has_wav_and_count_wavs_over_temp_dir() {
+        let base = env::temp_dir().join(format!("synth_test_{}", now_ms()));
+        fs::create_dir_all(&base).expect("mkdir");
+        // A missing dir counts as zero and no wav.
+        let missing = base.join("missing");
+        assert!(!dir_has_wav(&missing));
+        assert_eq!(count_wavs(&missing), 0);
+        // Non-wav files are ignored.
+        touch(&base, "notes.txt");
+        assert!(!dir_has_wav(&base));
+        assert_eq!(count_wavs(&base), 0);
+        // Wavs are counted.
+        touch(&base, "a.wav");
+        touch(&base, "b.wav");
+        assert!(dir_has_wav(&base));
+        assert_eq!(count_wavs(&base), 2);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn staged_reference_names_sorts_truncates_and_requires_some() {
+        let base = env::temp_dir().join(format!("synth_refs_{}", now_ms()));
+        fs::create_dir_all(&base).expect("mkdir");
+        // No wavs -> error.
+        assert!(staged_reference_names(&base).is_err());
+        // Ten wavs (plus a txt) -> the first eight by sort order, wavs only.
+        for i in 0..10 {
+            touch(&base, &format!("ref_{i:02}.wav"));
+        }
+        touch(&base, "ref_00.txt");
+        let names = staged_reference_names(&base).expect("names");
+        assert_eq!(names.len(), 8);
+        assert_eq!(names[0], "ref_00.wav");
+        assert_eq!(names[7], "ref_07.wav");
+        assert!(names.iter().all(|n| n.ends_with(".wav")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_wc_count_reads_number_or_defaults_zero() {
+        assert_eq!(parse_wc_count(b"  42\n"), 42);
+        assert_eq!(parse_wc_count(b"0\n"), 0);
+        assert_eq!(parse_wc_count(b"not a number"), 0);
+        assert_eq!(parse_wc_count(b""), 0);
+    }
 }
