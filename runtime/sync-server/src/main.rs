@@ -24,10 +24,14 @@ use zip::ZipArchive;
 
 mod constants;
 mod db;
+mod docker;
 mod error;
 mod util;
 
 use constants::*;
+use docker::{
+    container_running, docker_ok, f5_container, push_env, run_docker, training_container_name,
+};
 use error::{db_error, AppError};
 use util::{
     category_for_label, is_safe_recording_id, is_safe_run_id, is_safe_slug, parse_query, safe_join,
@@ -1912,11 +1916,6 @@ async fn synthetic_audio(
     Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
 }
 
-/// The container running the resident F5-TTS model (speech_services stack).
-fn f5_container() -> String {
-    env::var("F5_CONTAINER").unwrap_or_else(|_| "speech-f5tts".to_string())
-}
-
 /// Does this directory hold at least one `.wav`?
 fn dir_has_wav(dir: &Path) -> bool {
     fs::read_dir(dir)
@@ -2094,18 +2093,6 @@ fn write_f5_status(
         "updated_at": now,
     });
     let _ = fs::write(dir.join("train_status.json"), body.to_string());
-}
-
-/// Run `docker` and fail with its stderr if the command exits non-zero.
-async fn docker_ok(args: Vec<String>) -> Result<std::process::Output, AppError> {
-    let output = run_docker(args).await?;
-    if !output.status.success() {
-        return Err(AppError::internal(format!(
-            "docker command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(output)
 }
 
 #[derive(Serialize)]
@@ -4496,39 +4483,6 @@ struct TrainRequest {
     snr_max_db: Option<f64>,
     background_augment: Option<bool>,
     voice_peak: Option<f64>,
-}
-
-fn training_container_name(slug: &str) -> String {
-    format!("lkww-train-{slug}")
-}
-
-/// Append a `-e KEY=VALUE` pair to a docker argv.
-fn push_env(args: &mut Vec<String>, key: &str, value: String) {
-    args.push("-e".into());
-    args.push(format!("{key}={value}"));
-}
-
-/// Run `docker` with the given args off the async executor, returning its output.
-async fn run_docker(args: Vec<String>) -> Result<std::process::Output, AppError> {
-    tokio::task::spawn_blocking(move || std::process::Command::new("docker").args(&args).output())
-        .await
-        .map_err(|e| AppError::internal(format!("docker task join failed: {e}")))?
-        .map_err(|e| AppError::internal(format!("failed to run docker: {e}")))
-}
-
-/// Is a container by this name currently running? Uses `docker inspect`; a
-/// missing container (the `--rm` run already exited) reports false.
-async fn container_running(name: &str) -> bool {
-    let name = name.to_string();
-    let out = run_docker(vec![
-        "inspect".into(),
-        "-f".into(),
-        "{{.State.Running}}".into(),
-        name,
-    ])
-    .await;
-    matches!(out, Ok(o) if o.status.success()
-        && String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
 /// Allowlisted trainer model sizes. generate_config.py writes this straight into
