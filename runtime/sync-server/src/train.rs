@@ -811,6 +811,16 @@ fn reconcile_status_body(file_status: Option<Value>, running: bool, slug: &str) 
     }
 }
 
+/// The run-duration in milliseconds from start/finish wall-clock stamps (already
+/// parsed to epoch ms), or None when either is missing or the finish precedes the
+/// start. Pure. Extracted from `training_status`'s terminal-run bookkeeping.
+fn run_duration_ms(started_ms: Option<i64>, finished_ms: Option<i64>) -> Option<i64> {
+    match (started_ms, finished_ms) {
+        (Some(a), Some(b)) if b >= a => Some(b - a),
+        _ => None,
+    }
+}
+
 pub(crate) async fn training_status(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
@@ -881,10 +891,7 @@ pub(crate) async fn training_status(
     let terminal = matches!(run_state.as_str(), "succeeded" | "failed" | "stopped");
     if terminal {
         let finished_ms = updated_at.as_deref().and_then(rfc3339_ms);
-        let duration_ms = match (started_ms, finished_ms) {
-            (Some(a), Some(b)) if b >= a => Some(b - a),
-            _ => None,
-        };
+        let duration_ms = run_duration_ms(started_ms, finished_ms);
         if let Some(d) = duration_ms {
             body["duration_ms"] = json!(d);
         }
@@ -1276,6 +1283,18 @@ mod tests {
         let _ = fs::remove_file(&path);
         // A missing file is None, not an error.
         assert!(read_tail_bytes(&path, 4).is_none());
+    }
+
+    #[test]
+    fn run_duration_ms_needs_ordered_stamps() {
+        assert_eq!(run_duration_ms(Some(100), Some(400)), Some(300));
+        // Equal stamps are a zero-length run, not a rejection.
+        assert_eq!(run_duration_ms(Some(400), Some(400)), Some(0));
+        // Finish before start (clock skew) -> None.
+        assert_eq!(run_duration_ms(Some(400), Some(100)), None);
+        // A missing stamp on either side -> None.
+        assert_eq!(run_duration_ms(None, Some(400)), None);
+        assert_eq!(run_duration_ms(Some(100), None), None);
     }
 
     #[test]
