@@ -185,7 +185,7 @@ one-at-a-time short-prompt recording flow, no per-clip label picker, and no
 manual Export/Sync of individual clips. That orphaned path was removed. Do not
 reintroduce it without an explicit decision to change direction.
 
-The Record page is now **five straight recorders, one per take kind** — it is no
+The Record page is now **four straight recorders, one per take kind** — it is no
 longer a single mixed randomized script read in one take. Each recorder captures
 a plain record-and-stop take of exactly one kind:
 
@@ -201,28 +201,38 @@ a plain record-and-stop take of exactly one kind:
 - **Background noise** — a long ambient/non-speech take (room tone, near-silence,
   appliances, typing). It is *not* transcribed; the server chops it into
   fixed-length background clips.
-- **Voice enrollment** — the second prompted recorder: it shows a fixed passage
-  to read aloud once. The take is stored **whole and never sliced** as the
-  F5-TTS voice-cloning reference. The passage is constant so the reference text
-  fed to F5 is always exact. The server copies each enrollment take into a
-  stable `<slug>/enrollment/` bucket with a sidecar `.txt` transcript so the
-  synthetic-positive generator (`trainer/scripts/f5_gen_positives.sh`) can find
-  the reference audio and its exact text with no DB lookup.
 
 Speech takes (positive/negative/hard_negative) are transcribed and sliced with
-Whisper word timestamps. Background takes are chopped by fixed length. Enrollment
-takes are stored whole (no Whisper, no slices). Keep all these long-take modes;
-do not fold them back into a single scripted read.
+Whisper word timestamps. Background takes are chopped by fixed length. Keep all
+these long-take modes; do not fold them back into a single scripted read.
 
-**Voice cloning (F5-TTS) for synthetic positives.** The trainer's synthetic
-positives were Kokoro voices that don't sound like the user. The direction is to
-generate most synthetic positives with F5-TTS zero-shot voice cloning, seeded by
-the enrollment read, so they carry the user's timbre. Real recordings stay the
-anchor and negatives stay voice-diverse. F5 runs in the `speech_services` stack
-(`/data/speech_services`, `speech-f5tts` on :7860). The generator writes clips to
-`data/synth_f5/<slug>/positive`; the Review page has a **synthetic samples** card
-that plays a server-returned spread of them (`GET /synth/:slug/sample`) so the
-user can spot-check quality by ear.
+Voice enrollment has been **retired**. It was a fifth prompted recorder that
+stored a fixed-passage read whole as the F5 reference, but a long passage
+starved the short wake phrase and leaked its own tail text ("warm gold") into
+the cloned output. F5 now seeds solely from the user's real positive takes
+(their transcript is exactly the phrase and their length is F5-friendly), so
+there is no separate enrollment recorder or passage. Legacy enrollment takes on
+the server still play back and delete from the Review page; the server's
+`enrollment` align branch is kept only so any legacy take is stored whole rather
+than sliced. Do not reintroduce an enrollment recorder without an explicit
+decision.
+
+**Voice cloning (F5-TTS) for synthetic positives.** The trainer's built-in
+synthetic positives (Kokoro/VoxCPM TTS pool, sized by `n_samples`) don't sound
+like the user, so a second synthetic source clones the user's timbre with
+F5-TTS zero-shot voice cloning, seeded by the real positive takes. A model's
+**total positive input** is three streams whose sum the Train page shows in a
+live calculator: the built-in TTS pool (`n_samples`), the F5 clips (`f5_count`),
+and the user's own real positives replicated `x positive_boost`. F5 clips are
+generated **at train time in the sync-server** (only it can reach the F5
+service — the trainer container has no docker access): `launch_train_container`
+tops the synth bucket up to `f5_count` before the trainer runs, writing a
+pre-launch `f5gen` phase into `train_status.json`, and the trainer's
+`assemble_training_data.py` pools `data/synth_f5/<slug>/positive` into
+positives. F5 runs in the `speech_services` stack (`/data/speech_services`,
+`speech-f5tts` on :7860). The Review page's **synthetic samples** card plays a
+server-returned spread (`GET /synth/:slug/sample`), regenerates on demand
+(`POST /synth/:slug/generate`), and clears the batch (`DELETE /synth/:slug`).
 
 **Non-lexical wake words (sounds, not words).** Some wake words are fast or
 non-lexical — e.g. "beep beep" said quickly — and Whisper returns no words for
@@ -237,8 +247,8 @@ negatives — and the energy path is only a fallback, never a replacement.
 Core workflows:
 
 - Create and edit wake-word projects.
-- Record a straight per-kind take (positive, negative, hard negative,
-  background, or voice enrollment) in one take.
+- Record a straight per-kind take (positive, negative, hard negative, or
+  background) in one take.
 - Sync recordings to the server, which slices each take by its kind.
 - Review the generated slices per recording: see each slice's transcript,
   confidence, and source timing; replay it; and delete bad slices.
