@@ -821,6 +821,19 @@ fn run_duration_ms(started_ms: Option<i64>, finished_ms: Option<i64>) -> Option<
     }
 }
 
+/// Projected total run time in ms from the benchmark average per step and the
+/// configured step count. Pure. Extracted from `training_status`'s ETA overlay.
+fn estimated_total_ms(avg_ms_per_step: f64, steps: i64) -> i64 {
+    (avg_ms_per_step * steps as f64) as i64
+}
+
+/// Remaining run time in ms: the projected total minus elapsed, floored at zero
+/// so a run that overshoots its benchmark never reports negative time left.
+/// Pure. Extracted from `training_status`'s ETA overlay.
+fn remaining_ms(estimated_total_ms: i64, elapsed_ms: i64) -> i64 {
+    (estimated_total_ms - elapsed_ms).max(0)
+}
+
 pub(crate) async fn training_status(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
@@ -934,7 +947,7 @@ pub(crate) async fn training_status(
         db::avg_ms_per_step(&conn, model_size.as_deref()).map_err(db_error)?
     };
     if let (Some((avg_ms_per_step, based_on)), true) = (avg, steps > 0) {
-        let estimated_total = (avg_ms_per_step * steps as f64) as i64;
+        let estimated_total = estimated_total_ms(avg_ms_per_step, steps);
         body["avg_ms_per_step"] = json!(avg_ms_per_step);
         body["based_on_runs"] = json!(based_on);
         body["estimated_total_ms"] = json!(estimated_total);
@@ -942,7 +955,7 @@ pub(crate) async fn training_status(
             if let Some(started) = started_ms {
                 let elapsed = (now_ms() - started).max(0);
                 body["elapsed_ms"] = json!(elapsed);
-                body["remaining_ms"] = json!((estimated_total - elapsed).max(0));
+                body["remaining_ms"] = json!(remaining_ms(estimated_total, elapsed));
             }
         }
     }
@@ -1295,6 +1308,17 @@ mod tests {
         // A missing stamp on either side -> None.
         assert_eq!(run_duration_ms(None, Some(400)), None);
         assert_eq!(run_duration_ms(Some(100), None), None);
+    }
+
+    #[test]
+    fn eta_math_projects_total_and_floors_remaining() {
+        // Projected total is avg-per-step times the step count, truncated to i64.
+        assert_eq!(estimated_total_ms(2.0, 50_000), 100_000);
+        assert_eq!(estimated_total_ms(1.5, 3), 4); // 4.5 truncates toward zero
+        // Remaining is total minus elapsed while there is time left...
+        assert_eq!(remaining_ms(100_000, 40_000), 60_000);
+        // ...and floors at zero once a run overshoots its benchmark.
+        assert_eq!(remaining_ms(100_000, 140_000), 0);
     }
 
     #[test]
