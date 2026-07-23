@@ -166,49 +166,25 @@ pub(crate) async fn score_recording(
     if !is_safe_slug(&slug) || !is_safe_recording_id(&recording_id) {
         return Err(AppError::bad_request("unsafe score path"));
     }
-    let params = parse_query(query.as_deref());
-    let mode = match params.get("mode").map(String::as_str) {
-        Some("full") | None => "full",
-        Some("reset") => "reset",
-        Some(other) => return Err(AppError::bad_request(format!("unknown mode: {other}"))),
-    };
-    let step_ms = params
-        .get("step_ms")
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(if mode == "reset" { 40 } else { 10 });
-    let keep_ms = params
-        .get("keep_ms")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(700);
-    let threshold = params
-        .get("threshold")
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.5);
-    // Optional archived run id: score a specific past model version instead of
-    // the mutable current model, so retraining never overwrites a run's scores.
-    let run = match params.get("run").map(String::as_str) {
-        Some(r) if is_safe_run_id(r) => Some(r.to_string()),
-        Some(_) => return Err(AppError::bad_request("unsafe run id")),
-        None => None,
-    };
+    // Shared param parsing (mode/step/keep/threshold/run) — identical to the bulk
+    // score endpoint. `nocache` is single-endpoint only, so it is parsed here.
+    let sp = parse_score_params(query.as_deref())?;
+    let force = parse_query(query.as_deref()).get("nocache").map(String::as_str) == Some("1");
 
     let scorer_url = resolve_scorer_url(&state, &headers).ok_or_else(|| {
         AppError::bad_request("scorer not configured; set SCORER_SERVER_URL or x-scorer-server-url")
     })?;
-    let force = params.get("nocache").map(String::as_str) == Some("1");
 
     let response = compute_score(
         &state,
         &scorer_url,
         &slug,
         &recording_id,
-        mode,
-        step_ms,
-        keep_ms,
-        threshold,
-        run.as_deref(),
+        sp.mode,
+        sp.step_ms,
+        sp.keep_ms,
+        sp.threshold,
+        sp.run.as_deref(),
         force,
     )
     .await?;
@@ -295,10 +271,7 @@ async fn compute_score(
     // A representative single score for the take: the peak over located target
     // phrases, or the whole-curve maximum when the take has no target phrase (so
     // a negative take still shows how hot the model got). Persist the grade.
-    let max_score = curve.scores.iter().cloned().fold(0.0_f64, f64::max);
-    let has_target = !targets.is_empty();
-    let target_peak = targets.iter().map(|t| t.peak_score).fold(0.0_f64, f64::max);
-    let peak_score = if has_target { target_peak } else { max_score };
+    let (max_score, peak_score, has_target) = grade_peak(&curve.scores, &targets);
     {
         let conn = state.db.lock().expect("db lock poisoned");
         db::store_score_grade(
@@ -717,6 +690,18 @@ fn peak_in_window(curve: &ScorerCurve, lo_ms: f64, hi_ms: f64) -> (f64, f64) {
     best
 }
 
+/// Reduce a take to a single representative score: the whole-curve maximum, the
+/// peak used for grading (the best over located target phrases when the take has
+/// any, else the whole-curve maximum so a negative take still shows how hot the
+/// model got), and whether it has a target. Pure. Extracted from `compute_score`.
+fn grade_peak(scores: &[f64], targets: &[ScoreTarget]) -> (f64, f64, bool) {
+    let max_score = scores.iter().cloned().fold(0.0_f64, f64::max);
+    let has_target = !targets.is_empty();
+    let target_peak = targets.iter().map(|t| t.peak_score).fold(0.0_f64, f64::max);
+    let peak_score = if has_target { target_peak } else { max_score };
+    (max_score, peak_score, has_target)
+}
+
 /// Count above-threshold detections that do not overlap any target window. A
 /// contiguous run above threshold counts once. A detection whose time falls in
 /// any target's search band is a true positive, not a false one.
@@ -738,4 +723,170 @@ fn count_false_positives(curve: &ScorerCurve, targets: &[ScoreTarget], threshold
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(text: &str, start_ms: i64, end_ms: i64) -> db::WordRow {
+        db::WordRow {
+            word: text.to_string(),
+            start_ms,
+            end_ms,
+            probability: 1.0,
+        }
+    }
+
+    fn curve(times_ms: Vec<f64>, scores: Vec<f64>) -> ScorerCurve {
+        ScorerCurve {
+            duration_ms: times_ms.last().copied().unwrap_or(0.0),
+            times_ms,
+            scores,
+        }
+    }
+
+    fn target(end_ms: i64, peak_score: f64) -> ScoreTarget {
+        ScoreTarget {
+            text: "all set".to_string(),
+            start_ms: end_ms - 300,
+            end_ms,
+            peak_score,
+            peak_time_ms: end_ms as f64,
+            detected: peak_score >= 0.5,
+        }
+    }
+
+    #[test]
+    fn phrase_occurrences_finds_nonoverlapping_runs() {
+        let tokens = vec!["all".to_string(), "set".to_string()];
+        let words = vec![
+            word("hey", 0, 100),
+            word("all", 200, 300),
+            word("set", 320, 500),
+            word("then", 600, 700),
+            word("all", 900, 1000),
+            word("set", 1020, 1200),
+        ];
+        let occ = phrase_occurrences(&tokens, &words);
+        assert_eq!(occ.len(), 2);
+        assert_eq!(occ[0], (200, 500, "all set".to_string()));
+        assert_eq!(occ[1], (900, 1200, "all set".to_string()));
+    }
+
+    #[test]
+    fn phrase_occurrences_consumes_match_so_dense_repeats_count_once_each() {
+        // "all all set" must not double-count: matching advances past the phrase.
+        let tokens = vec!["all".to_string(), "set".to_string()];
+        let words = vec![word("all", 0, 100), word("all", 120, 220), word("set", 240, 400)];
+        let occ = phrase_occurrences(&tokens, &words);
+        assert_eq!(occ, vec![(120, 400, "all set".to_string())]);
+    }
+
+    #[test]
+    fn target_windows_clamp_to_neighbor_midpoints() {
+        // Isolated end: full ±MAX_DRIFT_MS band, with lo floored at 0.
+        let w = target_windows(&[1000.0]);
+        assert_eq!(w, vec![((1000.0 - MAX_DRIFT_MS).max(0.0), 1000.0 + MAX_DRIFT_MS)]);
+
+        // Two ends 400ms apart (< 2*MAX_DRIFT): each clamps to the 200ms midpoint
+        // between them so neighbors can't claim the same firing.
+        let w = target_windows(&[1000.0, 1400.0]);
+        let mid = 1200.0;
+        assert!((w[0].1 - mid).abs() < 1e-9, "first hi clamps to midpoint");
+        assert!((w[1].0 - mid).abs() < 1e-9, "second lo clamps to midpoint");
+    }
+
+    #[test]
+    fn peak_in_window_picks_best_inside_band() {
+        let c = curve(vec![0.0, 100.0, 200.0, 300.0], vec![0.1, 0.9, 0.4, 0.95]);
+        // Restrict to [50, 250]: the 0.95 at 300 is outside, so 0.9 at 100 wins.
+        let (t, s) = peak_in_window(&c, 50.0, 250.0);
+        assert!((t - 100.0).abs() < 1e-9);
+        assert!((s - 0.9).abs() < 1e-9);
+        // Empty band returns the floored lo with score 0.
+        let (t, s) = peak_in_window(&c, 500.0, 600.0);
+        assert!((t - 500.0).abs() < 1e-9 && s == 0.0);
+    }
+
+    #[test]
+    fn count_false_positives_counts_hot_runs_outside_targets() {
+        // One target at end 1000 (band ~1000±drift). A hot run near it is a true
+        // positive; a separate hot run far away is a false positive counted once.
+        let targets = vec![target(1000, 0.9)];
+        let c = curve(
+            vec![950.0, 1000.0, 5000.0, 5040.0, 5080.0],
+            vec![0.8, 0.9, 0.7, 0.7, 0.7],
+        );
+        assert_eq!(count_false_positives(&c, &targets, 0.5), 1);
+        // Raising the threshold above every score yields no false positives.
+        assert_eq!(count_false_positives(&c, &targets, 0.99), 0);
+    }
+
+    #[test]
+    fn grade_peak_prefers_target_peak_else_curve_max() {
+        // With a target, peak_score is the best target peak (not the hotter curve
+        // max), and max_score is the whole-curve maximum.
+        let targets = vec![target(1000, 0.6), target(2000, 0.7)];
+        let (max_score, peak_score, has_target) = grade_peak(&[0.3, 0.95, 0.7], &targets);
+        assert!((max_score - 0.95).abs() < 1e-9);
+        assert!((peak_score - 0.7).abs() < 1e-9);
+        assert!(has_target);
+        // With no target, peak_score falls back to the whole-curve maximum.
+        let (max_score, peak_score, has_target) = grade_peak(&[0.3, 0.95, 0.7], &[]);
+        assert!((max_score - 0.95).abs() < 1e-9);
+        assert!((peak_score - 0.95).abs() < 1e-9);
+        assert!(!has_target);
+    }
+
+    #[test]
+    fn parse_score_params_defaults_and_mode_specific_step() {
+        let sp = parse_score_params(None).expect("defaults");
+        assert_eq!(sp.mode, "full");
+        assert_eq!(sp.step_ms, 10); // full-mode default
+        assert_eq!(sp.keep_ms, 700);
+        assert!((sp.threshold - 0.5).abs() < 1e-9);
+        assert!(sp.run.is_none());
+
+        // reset mode changes the step default and honors explicit params.
+        let sp = parse_score_params(Some("mode=reset")).expect("reset");
+        assert_eq!(sp.mode, "reset");
+        assert_eq!(sp.step_ms, 40);
+
+        let sp = parse_score_params(Some("step_ms=25&keep_ms=900&threshold=0.7&run=run123"))
+            .expect("explicit");
+        assert_eq!(sp.step_ms, 25);
+        assert_eq!(sp.keep_ms, 900);
+        assert!((sp.threshold - 0.7).abs() < 1e-9);
+        assert_eq!(sp.run.as_deref(), Some("run123"));
+
+        // Unknown mode and unsafe run id are rejected.
+        assert!(parse_score_params(Some("mode=bogus")).is_err());
+        assert!(parse_score_params(Some("run=../escape")).is_err());
+    }
+
+    #[test]
+    fn resolve_model_fp_uses_run_id_or_onnx_fingerprint() {
+        let root = std::env::temp_dir().join(format!("score_fp_{}", now_ms()));
+        // An archived run is fingerprinted by its immutable id alone.
+        assert_eq!(resolve_model_fp(&root, "all_set", Some("run_9")), "run-run_9");
+        // No run and no model file -> the stable sentinel.
+        assert_eq!(resolve_model_fp(&root, "all_set", None), "nomodel");
+    }
+
+    #[test]
+    fn model_fingerprint_changes_when_model_file_changes() {
+        let root = std::env::temp_dir().join(format!("score_mfp_{}", now_ms()));
+        let dir = root.join("all_set");
+        fs::create_dir_all(&dir).expect("mkdir");
+        // Missing model -> sentinel.
+        assert_eq!(model_fingerprint(&root, "all_set"), "nomodel");
+        // Present model -> a size-mtime fingerprint (not the sentinel).
+        let onnx = dir.join("all_set.onnx");
+        fs::write(&onnx, b"hello").expect("write onnx");
+        let fp = model_fingerprint(&root, "all_set");
+        assert_ne!(fp, "nomodel");
+        assert!(fp.starts_with("5-"), "size 5 bytes leads the fingerprint: {fp}");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
