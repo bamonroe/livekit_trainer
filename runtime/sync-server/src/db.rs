@@ -1699,4 +1699,341 @@ mod tests {
         let sums = recording_checksums(&conn, "all_set").expect("checksums");
         assert_eq!(sums, vec![("bulk_1".to_string(), Some("abc123".to_string()))]);
     }
+
+    fn slice_row(id: &str, start: i64, end: i64, category: &str, phrase: &str) -> SliceRow {
+        SliceRow {
+            id: id.to_string(),
+            label: category.to_string(),
+            category: category.to_string(),
+            spoken_phrase: phrase.to_string(),
+            source_start_ms: start,
+            source_end_ms: end,
+            avg_probability: 0.9,
+            word_count: 2,
+            wav_path: format!("/data/{id}.wav"),
+            file_name: format!("{id}.wav"),
+        }
+    }
+
+    #[test]
+    fn store_alignment_round_trips_words_prompts_slices_and_versions() {
+        let mut conn = test_conn();
+        let mut alignment = RecordingAlignment {
+            recording_id: "bulk_1".to_string(),
+            project_slug: "all_set".to_string(),
+            phrase: "all set".to_string(),
+            external_id: Some("wake-1".to_string()),
+            script: "all set".to_string(),
+            kind: "positive".to_string(),
+            recorded_at: "2026-07-18T00:00:00Z".to_string(),
+            duration_ms: 5000,
+            source_wav: "/x.wav".to_string(),
+            source_sha256: Some("abc".to_string()),
+            bundle: None,
+            transcript_text: "all set".to_string(),
+            whisper_url: Some("http://whisper".to_string()),
+            words: vec![
+                WordRow { word: "all".to_string(), start_ms: 100, end_ms: 200, probability: 0.9 },
+                WordRow { word: "set".to_string(), start_ms: 250, end_ms: 400, probability: 0.8 },
+            ],
+            prompts: vec!["all set".to_string()],
+            // Deliberately out of start order to prove the read orders them.
+            slices: vec![
+                slice_row("s_late", 900, 1400, "positive", "all set"),
+                slice_row("s_early", 100, 400, "positive", "all set"),
+            ],
+            capture: CaptureMeta::default(),
+        };
+        let v1 = store_recording_alignment(&mut conn, &alignment, 10).expect("store v1");
+        assert_eq!(v1, 1, "first transcript is version 1");
+
+        // Words come back in ordinal order.
+        let words = current_transcript_words(&conn, "bulk_1").expect("words");
+        assert_eq!(words.iter().map(|w| w.word.as_str()).collect::<Vec<_>>(), vec!["all", "set"]);
+
+        // Cuts are ordered by source_start_ms and carry the derived duration.
+        let cuts = recording_cuts(&conn, "bulk_1").expect("cuts");
+        assert_eq!(cuts.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["s_early", "s_late"]);
+        // review_slices computes duration_ms = end - start for each stored slice.
+        let review = review_slices(&conn, "all_set").expect("review");
+        let early = review.iter().find(|r| r.id == "s_early").expect("early slice");
+        assert_eq!(early.duration_ms, 300);
+        assert_eq!(early.category, "positive");
+
+        // Re-storing bumps the transcript version, retires the old one, and
+        // replaces the words/slices with the new pass's set.
+        alignment.transcript_text = "all set now".to_string();
+        alignment.words = vec![WordRow {
+            word: "hi".to_string(),
+            start_ms: 0,
+            end_ms: 50,
+            probability: 1.0,
+        }];
+        alignment.slices = vec![slice_row("s_only", 0, 500, "positive", "hi")];
+        let v2 = store_recording_alignment(&mut conn, &alignment, 20).expect("store v2");
+        assert_eq!(v2, 2, "second transcript is version 2");
+        // Exactly one current transcript remains, and its words are the new set.
+        let current_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transcripts WHERE recording_id = 'bulk_1' AND is_current = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_count, 1);
+        let words = current_transcript_words(&conn, "bulk_1").expect("words v2");
+        assert_eq!(words.iter().map(|w| w.word.as_str()).collect::<Vec<_>>(), vec!["hi"]);
+        let cuts = recording_cuts(&conn, "bulk_1").expect("cuts v2");
+        assert_eq!(cuts.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["s_only"]);
+    }
+
+    #[test]
+    fn train_queue_walks_queued_running_finished() {
+        let conn = test_conn();
+        let a = enqueue_training(&conn, "all_set", "{\"a\":1}", 100).expect("enqueue a");
+        let b = enqueue_training(&conn, "beep_beep", "{\"b\":2}", 200).expect("enqueue b");
+        assert!(b > a, "ids increase with enqueue order");
+
+        // Active queue is oldest-first; next_queued is the head.
+        let active = active_queue(&conn).expect("active");
+        assert_eq!(active.iter().map(|e| e.id).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!(next_queued(&conn).expect("next").unwrap().id, a);
+
+        // Both queued: 1-based positions by id order.
+        assert_eq!(queue_position(&conn, a).expect("pos a"), Some(1));
+        assert_eq!(queue_position(&conn, b).expect("pos b"), Some(2));
+
+        // Launch the head: it becomes running (position 0) and next_queued rolls on.
+        mark_queue_running(&conn, a, "trainer-all_set", 300).expect("mark running");
+        assert_eq!(running_queue(&conn).expect("running").iter().map(|e| e.id).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(queue_position(&conn, a).expect("pos a running"), Some(0));
+        assert_eq!(queue_position(&conn, b).expect("pos b after"), Some(1));
+        assert_eq!(next_queued(&conn).expect("next2").unwrap().id, b);
+        assert_eq!(active_entry_for_slug(&conn, "beep_beep").expect("entry").unwrap().id, b);
+
+        // Finish the running job: it leaves the active set, a terminal position is None.
+        finish_queue_entry(&conn, a, "succeeded", 400).expect("finish");
+        assert_eq!(active_queue(&conn).expect("active2").iter().map(|e| e.id).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(queue_position(&conn, a).expect("pos a done"), None);
+    }
+
+    #[test]
+    fn cancel_queue_entry_and_slug_jobs() {
+        let conn = test_conn();
+        let a = enqueue_training(&conn, "all_set", "{}", 100).expect("a");
+        // Cancelling a live entry returns it; cancelling again is a no-op.
+        assert_eq!(cancel_queue_entry(&conn, a, 150).expect("cancel").unwrap().id, a);
+        assert!(cancel_queue_entry(&conn, a, 160).expect("re-cancel").is_none());
+
+        let b = enqueue_training(&conn, "beep_beep", "{}", 200).expect("b");
+        let c = enqueue_training(&conn, "beep_beep", "{}", 210).expect("c");
+        mark_queue_running(&conn, b, "trainer-beep", 220).expect("run b");
+        // Cancels every queued/running entry for the slug and hands them back.
+        let cancelled = cancel_slug_jobs(&conn, "beep_beep", 300).expect("cancel slug");
+        // cancel_slug_jobs does not order its returned rows, so compare as a set.
+        let mut ids = cancelled.iter().map(|e| e.id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![b, c]);
+        assert!(active_queue(&conn).expect("active").is_empty());
+    }
+
+    #[test]
+    fn avg_ms_per_step_prefers_size_then_falls_back() {
+        let conn = test_conn();
+        // 10 and 20 ms/step for medium; 50 for small; one failed run is ignored.
+        record_training_run(&conn, "s", 100, Some("medium"), false, "t1", None, Some(1000), "succeeded").unwrap();
+        record_training_run(&conn, "s", 200, Some("medium"), false, "t2", None, Some(4000), "succeeded").unwrap();
+        record_training_run(&conn, "s", 100, Some("small"), false, "t3", None, Some(5000), "succeeded").unwrap();
+        record_training_run(&conn, "s", 100, Some("medium"), false, "t4", None, Some(9999), "failed").unwrap();
+
+        // Same-size history wins: medium averages its two successful ratios.
+        let (avg, n) = avg_ms_per_step(&conn, Some("medium")).unwrap().unwrap();
+        assert_eq!(n, 2);
+        assert!((avg - 15.0).abs() < 1e-9);
+
+        // An unseen size falls back to all sizes (three successful runs).
+        let (avg, n) = avg_ms_per_step(&conn, Some("large")).unwrap().unwrap();
+        assert_eq!(n, 3);
+        assert!((avg - (10.0 + 20.0 + 50.0) / 3.0).abs() < 1e-9);
+
+        // No data at all -> None.
+        let empty = test_conn();
+        assert!(avg_ms_per_step(&empty, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn score_curve_cache_hits_only_on_matching_fingerprint() {
+        let conn = test_conn();
+        store_score_curve(&conn, "bulk_1", "full", 10, 700, "fp-1", 2000.0, &[0.0, 10.0], &[0.1, 0.9], 0)
+            .expect("store curve");
+        let hit = cached_score_curve(&conn, "bulk_1", "full", 10, 700, "fp-1").expect("hit").unwrap();
+        assert_eq!(hit.0, 2000.0);
+        assert_eq!(hit.1, vec![0.0, 10.0]);
+        assert_eq!(hit.2, vec![0.1, 0.9]);
+        // A changed model fingerprint (retrain) reads as a cache miss.
+        assert!(cached_score_curve(&conn, "bulk_1", "full", 10, 700, "fp-2").expect("miss").is_none());
+    }
+
+    #[test]
+    fn grades_for_model_returns_only_test_takes() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (slug, phrase, created_at_ms) VALUES ('all_set', 'all set', 0)",
+            [],
+        )
+        .unwrap();
+        insert_recording(&conn, "test_1", "all_set", 5000, "Pixel");
+        insert_recording(&conn, "bulk_1", "all_set", 5000, "Pixel");
+        let grade = |rec: &str| ScoreGrade {
+            recording_id: rec.to_string(),
+            run_id: None,
+            threshold: 0.5,
+            peak_score: 0.8,
+            max_score: 0.9,
+            has_target: true,
+            target_count: 1,
+            true_positives: 1,
+            false_negatives: 0,
+            false_positives: 0,
+            detected: true,
+            created_at_ms: 0,
+        };
+        store_score_grade(&conn, "fp-1", "full", &grade("test_1")).expect("grade test");
+        store_score_grade(&conn, "fp-1", "full", &grade("bulk_1")).expect("grade bulk");
+
+        // Only the test_ take is returned, and its i64 flags round-trip to bools.
+        let grades = grades_for_model(&conn, "all_set", "fp-1", "full").expect("grades");
+        assert_eq!(grades.len(), 1);
+        assert_eq!(grades[0].recording_id, "test_1");
+        assert!(grades[0].has_target && grades[0].detected);
+        // A different fingerprint has no grades.
+        assert!(grades_for_model(&conn, "all_set", "fp-2", "full").expect("other fp").is_empty());
+    }
+
+    #[test]
+    fn project_summaries_pool_count_excludes_hard_negatives() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (slug, phrase, created_at_ms) VALUES ('all_set', 'all set', 5)",
+            [],
+        )
+        .unwrap();
+        insert_recording(&conn, "bulk_1", "all_set", 5000, "Pixel");
+        insert_slice(&conn, "p1", "bulk_1", "all_set", "positive", "active");
+        insert_slice(&conn, "n1", "bulk_1", "all_set", "negative", "active");
+        insert_slice(&conn, "n2", "bulk_1", "all_set", "negative", "active");
+        insert_slice(&conn, "h1", "bulk_1", "all_set", "hard_negative", "active");
+        insert_slice(&conn, "bg", "bulk_1", "all_set", "background", "active");
+
+        let rows = project_summaries(&conn).expect("summaries");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.bulk_slice_count, 5);
+        assert_eq!(row.positive_count, 1);
+        // negative_count pools plain + hard negatives...
+        assert_eq!(row.negative_count, 3);
+        // ...but poolable_negative_count keeps hard negatives project-scoped.
+        assert_eq!(row.poolable_negative_count, 2);
+        assert_eq!(row.background_count, 1);
+        // external_id falls back to the slug when the column is null.
+        assert_eq!(row.external_id, "all_set");
+    }
+
+    #[test]
+    fn delete_recording_cascades_slices_and_clears_scores() {
+        let mut conn = test_conn();
+        let alignment = RecordingAlignment {
+            recording_id: "bulk_1".to_string(),
+            project_slug: "all_set".to_string(),
+            phrase: "all set".to_string(),
+            external_id: None,
+            script: "all set".to_string(),
+            kind: "positive".to_string(),
+            recorded_at: "2026-07-18T00:00:00Z".to_string(),
+            duration_ms: 5000,
+            source_wav: "/x.wav".to_string(),
+            source_sha256: None,
+            bundle: None,
+            transcript_text: "all set".to_string(),
+            whisper_url: None,
+            words: vec![WordRow { word: "all".to_string(), start_ms: 0, end_ms: 100, probability: 1.0 }],
+            prompts: vec!["all set".to_string()],
+            slices: vec![slice_row("s1", 0, 500, "positive", "all set")],
+            capture: CaptureMeta::default(),
+        };
+        store_recording_alignment(&mut conn, &alignment, 0).expect("store");
+        store_score_curve(&conn, "bulk_1", "full", 10, 700, "fp-1", 2000.0, &[0.0], &[0.1], 0)
+            .expect("curve");
+
+        assert!(delete_recording(&conn, "bulk_1").expect("delete"));
+        // Recording gone -> its slices/words cascade, and the FK-less score cache
+        // is cleared explicitly.
+        let slices: i64 = conn.query_row("SELECT COUNT(*) FROM slices", [], |r| r.get(0)).unwrap();
+        let curves: i64 = conn.query_row("SELECT COUNT(*) FROM score_curves", [], |r| r.get(0)).unwrap();
+        assert_eq!(slices, 0);
+        assert_eq!(curves, 0);
+        // Deleting a missing recording reports no change.
+        assert!(!delete_recording(&conn, "bulk_1").expect("delete again"));
+    }
+
+    #[test]
+    fn insert_clip_is_idempotent_and_delete_slice_by_file_is_one_shot() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO projects (slug, phrase, created_at_ms) VALUES ('all_set', 'all set', 0)",
+            [],
+        )
+        .unwrap();
+        let clip = ClipRow {
+            id: "c1".to_string(),
+            project_slug: "all_set".to_string(),
+            label: "positive".to_string(),
+            category: "positive".to_string(),
+            spoken_phrase: "all set".to_string(),
+            wav_path: "/c1.wav".to_string(),
+            source_file: "orig.wav".to_string(),
+            bundle: None,
+        };
+        assert!(insert_clip(&conn, &clip, 0).expect("first insert"));
+        assert!(!insert_clip(&conn, &clip, 1).expect("second insert ignored"));
+
+        insert_recording(&conn, "bulk_1", "all_set", 5000, "Pixel");
+        insert_slice(&conn, "s1", "bulk_1", "all_set", "positive", "active");
+        // First delete flips active -> deleted; a repeat finds nothing active.
+        assert!(delete_slice_by_file(&conn, "all_set", "positive", "s1").expect("delete"));
+        assert!(!delete_slice_by_file(&conn, "all_set", "positive", "s1").expect("re-delete"));
+    }
+
+    #[test]
+    fn list_model_records_orders_newest_first_and_nests_json() {
+        let conn = test_conn();
+        let base = ModelRecord {
+            slug: "all_set".to_string(),
+            phrase: "all set".to_string(),
+            model_size: Some("medium".to_string()),
+            metrics: Some("{\"recall\":0.9}".to_string()),
+            ..Default::default()
+        };
+        let mut older = base.clone();
+        older.run_id = "run_a".to_string();
+        older.onnx_path = "runs/run_a/all_set.onnx".to_string();
+        let mut newer = base.clone();
+        newer.run_id = "run_b".to_string();
+        newer.onnx_path = "runs/run_b/all_set.onnx".to_string();
+        record_model(&conn, &older, 100, false).expect("older");
+        record_model(&conn, &newer, 200, true).expect("newer");
+
+        let rows = list_model_records(&conn).expect("records");
+        assert_eq!(rows.len(), 2);
+        let parsed: Vec<serde_json::Value> =
+            rows.iter().map(|s| serde_json::from_str(s).unwrap()).collect();
+        // Newest created_at_ms first.
+        assert_eq!(parsed[0]["run_id"], "run_b");
+        assert_eq!(parsed[1]["run_id"], "run_a");
+        // is_current reflects the make_current flip on the newer run.
+        assert_eq!(parsed[0]["is_current"], 1);
+        assert_eq!(parsed[1]["is_current"], 0);
+        // metrics is re-parsed via json(...) so it nests as an object, not a string.
+        assert_eq!(parsed[0]["metrics"]["recall"], 0.9);
+    }
 }
