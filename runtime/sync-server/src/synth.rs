@@ -28,6 +28,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// How many real reference clips to stage per F5 batch. The generator
+/// concatenates a rotating window (`--concat-size`) of these into each priming
+/// clip and rolls the window forward per set, so this caps how many distinct
+/// real positives a batch can draw on (and how many small files we `docker cp`).
+const STAGED_REFERENCE_CAP: usize = 48;
+
 /// Directory holding the F5 voice-cloned positives for a slug. The trainer
 /// writes these to `<repo>/data/synth_f5/<slug>/positive`; the container mounts
 /// the repo `data/` at the parent of `data_root` (DATA_ROOT=/data/real →
@@ -183,9 +189,12 @@ fn evenly_spaced_sample(files: Vec<String>, max: usize) -> Vec<String> {
     }
 }
 
-/// The ≤8 reference WAV file names to stage for one F5 batch: every `.wav` in the
-/// reference dir, sorted, truncated to the first eight. Errors when none exist.
-/// Extracted from `run_synth_generation`'s staging step.
+/// The reference WAV file names to stage for one F5 batch: every `.wav` in the
+/// reference dir, sorted, truncated to the first `STAGED_REFERENCE_CAP`. Errors
+/// when none exist. The generator concatenates a rotating window of these into
+/// each priming clip, so the cap must comfortably exceed one window; it bounds
+/// how many small files we `docker cp` per run. Extracted from
+/// `run_synth_generation`'s staging step.
 fn staged_reference_names(refs_server_dir: &Path) -> Result<Vec<String>, AppError> {
     let mut names: Vec<String> = fs::read_dir(refs_server_dir)?
         .filter_map(|e| e.ok())
@@ -193,7 +202,7 @@ fn staged_reference_names(refs_server_dir: &Path) -> Result<Vec<String>, AppErro
         .filter(|n| n.ends_with(".wav"))
         .collect();
     names.sort();
-    names.truncate(8);
+    names.truncate(STAGED_REFERENCE_CAP);
     if names.is_empty() {
         return Err(AppError::internal("no reference wavs to stage"));
     }
@@ -586,6 +595,12 @@ async fn run_synth_generation(
         env::var("F5_NFE_STEP").unwrap_or_else(|_| "32".to_string()),
         "--cfg-strength".into(),
         env::var("F5_CFG_STRENGTH").unwrap_or_else(|_| "2.0".to_string()),
+        // Batched-priming rotation: concatenate this many real refs into one
+        // priming clip, render this many seeds off it, then rotate the window.
+        "--concat-size".into(),
+        env::var("F5_CONCAT_SIZE").unwrap_or_else(|_| "5".to_string()),
+        "--seeds-per-set".into(),
+        env::var("F5_SEEDS_PER_SET").unwrap_or_else(|_| "5".to_string()),
     ])
     .await?;
 
@@ -718,15 +733,15 @@ mod tests {
         fs::create_dir_all(&base).expect("mkdir");
         // No wavs -> error.
         assert!(staged_reference_names(&base).is_err());
-        // Ten wavs (plus a txt) -> the first eight by sort order, wavs only.
-        for i in 0..10 {
-            touch(&base, &format!("ref_{i:02}.wav"));
+        // More wavs than the cap (plus a txt) -> the first CAP by sort order,
+        // wavs only.
+        for i in 0..(STAGED_REFERENCE_CAP + 5) {
+            touch(&base, &format!("ref_{i:03}.wav"));
         }
-        touch(&base, "ref_00.txt");
+        touch(&base, "ref_000.txt");
         let names = staged_reference_names(&base).expect("names");
-        assert_eq!(names.len(), 8);
-        assert_eq!(names[0], "ref_00.wav");
-        assert_eq!(names[7], "ref_07.wav");
+        assert_eq!(names.len(), STAGED_REFERENCE_CAP);
+        assert_eq!(names[0], "ref_000.wav");
         assert!(names.iter().all(|n| n.ends_with(".wav")));
         let _ = fs::remove_dir_all(&base);
     }

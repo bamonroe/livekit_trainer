@@ -2789,15 +2789,15 @@ class MainActivity : Activity() {
                 ).withTop(dp(4)),
             )
             val generatingThis = synthGenerating && synthGenSlug == project.slug
-            val f5Count = savedTrainF5Count()
+            val previewCount = SYNTH_PREVIEW_COUNT
             addView(
                 LinearLayout(this@MainActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
                     addView(
                         actionButton(
-                            if (generatingThis) "Generating…" else "✨ Generate $f5Count now",
+                            if (generatingThis) "Generating…" else "✨ Generate $previewCount now",
                             ButtonStyle.Primary,
-                        ) { if (!generatingThis) startSyntheticGeneration(project, f5Count) }
+                        ) { if (!generatingThis) startSyntheticGeneration(project, previewCount) }
                             .apply { isEnabled = !generatingThis }.weight1(),
                     )
                     addView(
@@ -2809,7 +2809,7 @@ class MainActivity : Activity() {
             )
             addView(
                 text(
-                    "“Generate now” clones $f5Count clips from your recorded positives (set the count on the Train page). Training also regenerates them automatically.",
+                    "“Generate now” clones a small $previewCount-clip preview from your recorded positives so you can hear how they sound. Training generates the full batch (its count is set on the Train page) automatically.",
                     12f,
                     mutedColor(),
                 ).withTop(dp(4)),
@@ -3027,7 +3027,7 @@ class MainActivity : Activity() {
      * completion, updating the status line in place. On success the samples are
      * reloaded so the Review page's Synthetic samples card shows the fresh batch.
      */
-    private fun startSyntheticGeneration(project: WakeWordProject, count: Int = 100) {
+    private fun startSyntheticGeneration(project: WakeWordProject, count: Int = SYNTH_PREVIEW_COUNT) {
         val serverUrl = savedServerUrl()
         if (serverUrl.isBlank()) {
             statusMessage = "Set a sync server URL in Settings first"
@@ -5130,6 +5130,11 @@ class MainActivity : Activity() {
     private companion object {
         const val REQUEST_RECORD_AUDIO = 100
         const val TAKE_PAGE_SIZE = 5
+
+        // Review-page "Generate now" makes a small preview batch to audition the
+        // cloned voice; the full training batch count is set separately on the
+        // Train page.
+        const val SYNTH_PREVIEW_COUNT = 25
 
         const val SYNC_PREFS = "sync"
         const val KEY_SYNC_SERVER_URL = "server_url"
