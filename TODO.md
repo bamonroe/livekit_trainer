@@ -41,6 +41,14 @@ discovered. Prefer small, actionable items with clear status.
     samples card, and listen. Tune count/speed jitter.
   - [ ] Wire the synth bucket into a training run (shrink the Kokoro pool; keep
     real clips as the boosted anchor) and evaluate recall vs. the current model.
+  - [x] Second synthetic-positive source: **Zonos** (controllable-prosody voice
+    clone), selected via `?source=f5|zonos` on the `/synth/:slug/*` endpoints.
+    App: Review Synthetic section now stacks two independent cards ("F5 voice
+    clones" / "Zonos voice clones (prosody levers)"), per-source sample/generate/
+    delete/status state keyed by source string so they don't clobber each other.
+    Train page: **Zonos clips** count knob next to F5, folded into the live total-
+    positive-input calculator (`total = n_samples + f5_count + zonos_count +
+    real×boost`) and sent as `zonos_count` in the train-request JSON.
 
 
 - [~] Non-lexical wake words (sounds, not words, e.g. fast "beep beep").

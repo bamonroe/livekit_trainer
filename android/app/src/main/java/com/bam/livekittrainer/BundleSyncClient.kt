@@ -265,8 +265,10 @@ class BundleSyncClient(
      * server enumerates the synth bucket and returns an evenly-spaced spread; each
      * sample's [SyntheticSample.audioUrl] streams the clip bytes from the server.
      */
-    fun loadSyntheticSamples(wakeWordSlug: String): List<SyntheticSample> {
-        val endpoint = URL(serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/sample")
+    fun loadSyntheticSamples(wakeWordSlug: String, source: String = "f5"): List<SyntheticSample> {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/sample?source=${urlPart(source)}",
+        )
         val connection = endpoint.openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
         connection.connectTimeout = 10_000
@@ -282,7 +284,7 @@ class BundleSyncClient(
                         id = item.getString("id"),
                         fileName = fileName,
                         text = item.optString("text"),
-                        audioUrl = syntheticAudioUrl(wakeWordSlug, fileName),
+                        audioUrl = syntheticAudioUrl(wakeWordSlug, fileName, source),
                     ),
                 )
             }
@@ -294,9 +296,10 @@ class BundleSyncClient(
      * enrollment take. Returns immediately with the requested count; the server
      * runs the batch in the background and [syntheticGenerationStatus] polls it.
      */
-    fun startSyntheticGeneration(wakeWordSlug: String, count: Int): Int {
+    fun startSyntheticGeneration(wakeWordSlug: String, count: Int, source: String = "f5"): Int {
         val endpoint = URL(
-            serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/generate?count=$count",
+            serverUrl.trimEnd('/') +
+                "/synth/${urlPart(wakeWordSlug)}/generate?count=$count&source=${urlPart(source)}",
         )
         val connection = endpoint.openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
@@ -310,8 +313,10 @@ class BundleSyncClient(
 
     /** Delete every F5 synthetic positive for a wake word. Returns how many were
      *  removed. */
-    fun deleteSyntheticSamples(wakeWordSlug: String): Int {
-        val endpoint = URL(serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}")
+    fun deleteSyntheticSamples(wakeWordSlug: String, source: String = "f5"): Int {
+        val endpoint = URL(
+            serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}?source=${urlPart(source)}",
+        )
         val connection = endpoint.openConnection() as HttpURLConnection
         connection.requestMethod = "DELETE"
         connection.connectTimeout = 10_000
@@ -321,9 +326,10 @@ class BundleSyncClient(
     }
 
     /** Poll the state of a slug's F5 generation run. */
-    fun syntheticGenerationStatus(wakeWordSlug: String): SyntheticGenStatus {
+    fun syntheticGenerationStatus(wakeWordSlug: String, source: String = "f5"): SyntheticGenStatus {
         val endpoint = URL(
-            serverUrl.trimEnd('/') + "/synth/${urlPart(wakeWordSlug)}/generate/status",
+            serverUrl.trimEnd('/') +
+                "/synth/${urlPart(wakeWordSlug)}/generate/status?source=${urlPart(source)}",
         )
         val connection = endpoint.openConnection() as HttpURLConnection
         connection.requestMethod = "GET"
@@ -747,9 +753,9 @@ class BundleSyncClient(
             "/review/${urlPart(wakeWordSlug)}/${urlPart(category)}/${urlPart(fileName)}"
     }
 
-    private fun syntheticAudioUrl(wakeWordSlug: String, fileName: String): String {
+    private fun syntheticAudioUrl(wakeWordSlug: String, fileName: String, source: String = "f5"): String {
         return serverUrl.trimEnd('/') +
-            "/synth/${urlPart(wakeWordSlug)}/audio/${urlPart(fileName)}"
+            "/synth/${urlPart(wakeWordSlug)}/audio/${urlPart(fileName)}?source=${urlPart(source)}"
     }
 
     private fun bulkSourceAudioUrl(wakeWordSlug: String, sourceRecording: String): String {

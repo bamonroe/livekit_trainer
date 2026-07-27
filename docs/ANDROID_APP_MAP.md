@@ -251,8 +251,19 @@ switches on `reviewSection`). The `Sync & process` card is global to Review and
 always stays on top, above whichever section is selected. The sections are:
 Wake word (the POSITIVE `recordingsCard`), Negatives, Hard negatives (their
 respective `recordingsCard`s, always shown even when empty so the section stays
-visible), Background (`backgroundRecordingsCard`), and Synthetic
-(`syntheticSamplesCard`). Legacy ENROLLMENT and "other"/mixed takes have no
+visible), Background (`backgroundRecordingsCard`), and Synthetic. The Synthetic
+section stacks **two independent `syntheticSamplesCard(project, source, …)`
+cards**, one per synthetic-positive source the server exposes behind a
+`?source=f5|zonos` query param: "F5 voice clones" and "Zonos voice clones
+(prosody levers)". Each card loads/plays its source's sample spread, runs its own
+"Generate N now" and "Delete all", and polls its own generation status. All the
+per-source UI state is keyed by source string in `HashMap`s (`syntheticSlug`,
+`syntheticSamples`, `loadingSynthetic`, `synthGenSlug`, `synthGenerating`,
+`synthGenMessage`) so the two cards never clobber each other; the playback key is
+`synthetic:<source>:<id>`. The client methods
+(`loadSyntheticSamples` / `startSyntheticGeneration` / `deleteSyntheticSamples` /
+`syntheticGenerationStatus` and the audio URL) all take a `source` param that
+defaults to `"f5"`. Legacy ENROLLMENT and "other"/mixed takes have no
 recorder of their own; they are folded under the Wake word section as extra
 cards ("Enrollment takes (legacy)" / "Other takes (legacy)") that surface only
 when such takes actually exist, so legacy takes stay reviewable and deletable
@@ -263,6 +274,17 @@ recordings from the Record page's "Record background" control) in the Background
 section. Each row plays the local take back with a Play/Pause button and
 can delete it; delete removes the local WAV, its SQLite row, and the server-side
 background clips via `DELETE /bulk/<slug>/<recording_id>`.
+
+The **Train page** (`renderTrainPage`) exposes the model's positive-input knobs.
+A model's total positive input is four streams the live calculator sums:
+`total = n_samples (Kokoro built-in TTS) + f5_count + zonos_count + realPositives × positive_boost`.
+Each stream has its own numeric field (Kokoro / F5 / Zonos clips, positive
+boost); the calculator (`recomputeTotal`) re-renders the breakdown line as any
+field changes. The counts persist via `saveTrainNumbers`
+(`KEY_TRAIN_KOKORO_COUNT` / `KEY_TRAIN_F5_COUNT` / `KEY_TRAIN_ZONOS_COUNT`) and
+are sent in the train-request JSON as `n_samples` / `f5_count` / `zonos_count`
+(`buildTrainRequestBody`). The sync-server pools up to `f5_count` F5 clips and
+`zonos_count` Zonos clips as two of the three positive sources at train time.
 
 ## Build And Test Loop
 
