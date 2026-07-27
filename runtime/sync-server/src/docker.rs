@@ -20,6 +20,13 @@ pub(crate) fn zonos_container() -> String {
     env::var("ZONOS_CONTAINER").unwrap_or_else(|_| "speech-zonos".to_string())
 }
 
+/// The container running the resident Kokoro TTS FastAPI (speech_services stack).
+/// Used to synthesize impostor negatives — the wake phrase in female Kokoro
+/// voices — for the speaker-discriminative negative pool.
+pub(crate) fn kokoro_container() -> String {
+    env::var("KOKORO_CONTAINER").unwrap_or_else(|_| "speech-kokoro".to_string())
+}
+
 /// The by-convention trainer container name for a wake word.
 pub(crate) fn training_container_name(slug: &str) -> String {
     format!("lkww-train-{slug}")

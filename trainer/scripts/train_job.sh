@@ -30,6 +30,12 @@ F5_COUNT="${F5_COUNT:-0}"
 # BEFORE the trainer container starts; here we just tell the assembler how many to
 # pool into positives as a third positive source.
 ZONOS_COUNT="${ZONOS_COUNT:-0}"
+# How many Kokoro impostor negatives (the wake phrase in female voices) to fold
+# into training as NEGATIVES (0 = none). The sync-server generates these into
+# data/synth_impostor_neg/<slug>/negative BEFORE the trainer starts; here we just
+# tell the assembler how many to pool into the negative set so the model learns
+# to reject the phrase in other people's voices.
+IMPOSTOR_NEG_COUNT="${IMPOSTOR_NEG_COUNT:-0}"
 N_SAMPLES="${N_SAMPLES:-}"
 N_SAMPLES_VAL="${N_SAMPLES_VAL:-}"
 POSITIVE_PER_BATCH="${POSITIVE_PER_BATCH:-}"
@@ -102,6 +108,7 @@ write_status "running" "assemble" 0 "assembling pooled data"
 ASSEMBLE_SUMMARY="$OUT_DIR/assemble_summary.json"
 assemble_args=(--slug "$SLUG" --positive-boost "$POSITIVE_BOOST"
   --synth-count "$F5_COUNT" --synth-zonos-count "$ZONOS_COUNT"
+  --synth-impostor-neg-count "$IMPOSTOR_NEG_COUNT"
   --summary-json "$ASSEMBLE_SUMMARY")
 python3 scripts/assemble_training_data.py "${assemble_args[@]}" >>"$LOG" 2>&1 \
   || fail assemble $? "assemble_training_data failed"

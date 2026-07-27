@@ -14,7 +14,7 @@ use crate::docker::{container_running, push_env, run_docker, training_container_
 use crate::error::{db_error, AppError};
 use crate::score::read_model_manifest;
 use crate::state::{now_ms, rfc3339_ms, AppState};
-use crate::synth::{ensure_f5_positives, ensure_zonos_positives};
+use crate::synth::{ensure_f5_positives, ensure_impostor_negatives, ensure_zonos_positives};
 use crate::util::{is_safe_slug, parse_query};
 use axum::{
     extract::{Path as AxumPath, RawQuery, State},
@@ -44,6 +44,10 @@ pub(crate) struct TrainRequest {
     // How many Zonos voice-cloned positives to generate (same pre-launch path as
     // F5, from the resident speech-zonos container). 0/omitted = no Zonos clips.
     zonos_count: Option<u32>,
+    // How many Kokoro impostor negatives to generate (the phrase in female voices,
+    // pre-launch from the resident speech-kokoro container) and fold into the
+    // NEGATIVE pool. 0/omitted = none.
+    impostor_neg_count: Option<u32>,
     positive_per_batch: Option<u32>,
     real_samples_dir: Option<String>,
     // "start" | "end". Selects the leading-context recipe (see
@@ -95,6 +99,7 @@ pub(crate) struct ValidatedTrain {
     positive_boost: u32,
     pub(crate) f5_count: u32,
     pub(crate) zonos_count: u32,
+    pub(crate) impostor_neg_count: u32,
     n_samples: Option<u32>,
     n_samples_val: Option<u32>,
     positive_per_batch: Option<u32>,
@@ -181,6 +186,7 @@ fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
         positive_boost: request.positive_boost.unwrap_or(1).clamp(1, 50),
         f5_count: request.f5_count.unwrap_or(0).min(50_000),
         zonos_count: request.zonos_count.unwrap_or(0).min(50_000),
+        impostor_neg_count: request.impostor_neg_count.unwrap_or(0).min(50_000),
         n_samples: request.n_samples,
         n_samples_val: request.n_samples_val,
         positive_per_batch: request.positive_per_batch,
@@ -313,6 +319,7 @@ fn build_train_argv(
     push_env(&mut args, "POSITIVE_BOOST", vt.positive_boost.to_string());
     push_env(&mut args, "F5_COUNT", vt.f5_count.to_string());
     push_env(&mut args, "ZONOS_COUNT", vt.zonos_count.to_string());
+    push_env(&mut args, "IMPOSTOR_NEG_COUNT", vt.impostor_neg_count.to_string());
     if let Some(n) = vt.n_samples {
         push_env(&mut args, "N_SAMPLES", n.to_string());
     }
@@ -399,6 +406,12 @@ async fn launch_train_container(
     // speech-zonos container, as an independent third positive source. Runs after
     // F5 so the two pre-launch top-ups never contend for the same job-map key.
     ensure_zonos_positives(state, slug, phrase, vt).await;
+
+    // Kokoro impostor negatives (the phrase in female voices) are generated the
+    // same pre-launch way from the resident speech-kokoro container and pooled
+    // into the NEGATIVE bucket, so the model learns to reject the phrase spoken
+    // by anyone who is not the user.
+    ensure_impostor_negatives(state, slug, phrase, vt).await;
 
     let output = run_docker(args).await?;
     if !output.status.success() {
@@ -798,7 +811,7 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
 /// phases are written by the sync-server before any trainer container exists, so
 /// a "running" status with no live container is expected, not a crash.
 fn is_pregen_phase(step: &str) -> bool {
-    matches!(step, "f5gen" | "zonosgen")
+    matches!(step, "f5gen" | "zonosgen" | "impostorgen")
 }
 
 /// Build the base training-status body from the persisted train_status.json (if
@@ -882,15 +895,46 @@ pub(crate) async fn training_status(
 
     // Templated per-step progress parsed from the trainer log tail.
     {
-        let run_state = body.get("state").and_then(Value::as_str).unwrap_or("none");
-        let step = body.get("step").and_then(Value::as_str).unwrap_or("");
+        // Owned copies so we can mutate `body` below without holding a borrow of it.
+        let run_state = body
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string();
+        let step = body
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         // Skip the six-step trainer progress during a pre-launch generation phase
         // (f5gen/zonosgen): the trainer hasn't run yet, so any train.log is stale
         // from a prior run. The app renders that phase from the status body instead.
-        if matches!(run_state, "running" | "starting" | "succeeded") && !is_pregen_phase(step) {
+        if matches!(run_state.as_str(), "running" | "starting" | "succeeded")
+            && !is_pregen_phase(&step)
+        {
             let log_path = state.models_root.join(&slug).join("train.log");
             if let Some(text) = read_tail_bytes(&log_path, 1_048_576) {
-                body["progress"] = parse_train_progress(&text, run_state);
+                body["progress"] = parse_train_progress(&text, &run_state);
+            }
+        }
+        // During a pre-launch generation phase the status file only carries the
+        // start/end snapshot, but the generator updates its SynthJob live as clips
+        // land. Overlay that live count so the app's `<tag>_wrote` ticks up while
+        // the batch generates instead of jumping 0 -> final.
+        let pregen_tag = match step.as_str() {
+            "f5gen" => Some("f5"),
+            "zonosgen" => Some("zonos"),
+            "impostorgen" => Some("impostor"),
+            _ => None,
+        };
+        if let Some(tag) = pregen_tag {
+            let live = {
+                let jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+                jobs.get(&format!("{tag}:{slug}")).map(|j| (j.wrote, j.requested))
+            };
+            if let Some((wrote, requested)) = live {
+                body[format!("{tag}_wrote")] = json!(wrote);
+                body[format!("{tag}_requested")] = json!(requested);
             }
         }
     }
@@ -1105,6 +1149,7 @@ mod tests {
             positive_boost: 3,
             f5_count: 7,
             zonos_count: 9,
+            impostor_neg_count: 11,
             n_samples: Some(500),
             n_samples_val: None,
             positive_per_batch: None,

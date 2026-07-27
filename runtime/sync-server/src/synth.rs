@@ -10,7 +10,7 @@
 //! hook that tops the bucket up before the trainer assembles it.
 
 use crate::db;
-use crate::docker::{docker_ok, f5_container, run_docker, zonos_container};
+use crate::docker::{docker_ok, f5_container, kokoro_container, run_docker, zonos_container};
 use crate::error::{db_error, AppError};
 use crate::state::{now_ms, AppState, SynthJob};
 use crate::train::ValidatedTrain;
@@ -45,16 +45,39 @@ const STAGED_REFERENCE_CAP: usize = 48;
 pub(crate) enum SynthSource {
     F5,
     Zonos,
+    /// Impostor negatives: the wake phrase spoken by not-the-user, female Kokoro
+    /// voices. Pooled into NEGATIVES (not positives) so a personal detector learns
+    /// to reject the phrase in other people's voices. Has no user reference clips.
+    Impostor,
 }
 
 impl SynthSource {
-    /// Parse the `?source=` query value; anything but an explicit `zonos` (incl.
-    /// the absent/default case) is F5, so existing callers keep F5 behavior.
+    /// Parse the `?source=` query value; anything but an explicit `zonos` /
+    /// `impostor` (incl. the absent/default case) is F5, so existing callers keep
+    /// F5 behavior.
     fn from_str(value: Option<&str>) -> SynthSource {
         match value {
             Some(v) if v.eq_ignore_ascii_case("zonos") => SynthSource::Zonos,
+            Some(v) if v.eq_ignore_ascii_case("impostor") || v.eq_ignore_ascii_case("kokoro") => {
+                SynthSource::Impostor
+            }
             _ => SynthSource::F5,
         }
+    }
+
+    /// Which pooled category this source feeds: F5/Zonos clone the user so they
+    /// are positives; Impostor is the phrase in other voices, so it is a negative.
+    fn category(self) -> &'static str {
+        match self {
+            SynthSource::F5 | SynthSource::Zonos => "positive",
+            SynthSource::Impostor => "negative",
+        }
+    }
+
+    /// Whether this source clones the user's real reference clips. F5/Zonos do;
+    /// the Kokoro impostor source uses its own named voices and stages no refs.
+    fn has_refs(self) -> bool {
+        matches!(self, SynthSource::F5 | SynthSource::Zonos)
     }
 
     /// Resolve the source from a raw query string's `source` param (default F5).
@@ -63,11 +86,12 @@ impl SynthSource {
         SynthSource::from_str(params.get("source").map(String::as_str))
     }
 
-    /// The `data/<subdir>/<slug>/positive` bucket subdir for this source.
+    /// The `data/<subdir>/<slug>/<category>` bucket subdir for this source.
     fn subdir(self) -> &'static str {
         match self {
             SynthSource::F5 => "synth_f5",
             SynthSource::Zonos => "synth_zonos",
+            SynthSource::Impostor => "synth_impostor_neg",
         }
     }
 
@@ -76,6 +100,7 @@ impl SynthSource {
         match self {
             SynthSource::F5 => f5_container(),
             SynthSource::Zonos => zonos_container(),
+            SynthSource::Impostor => kokoro_container(),
         }
     }
 
@@ -84,6 +109,7 @@ impl SynthSource {
         match self {
             SynthSource::F5 => "/trainer/scripts/f5_gen_positives.py",
             SynthSource::Zonos => "/trainer/scripts/zonos_gen_positives.py",
+            SynthSource::Impostor => "/trainer/scripts/kokoro_gen_negatives.py",
         }
     }
 
@@ -93,6 +119,7 @@ impl SynthSource {
         match self {
             SynthSource::F5 => "f5",
             SynthSource::Zonos => "zonos",
+            SynthSource::Impostor => "impostor",
         }
     }
 
@@ -101,15 +128,17 @@ impl SynthSource {
         match self {
             SynthSource::F5 => "F5",
             SynthSource::Zonos => "Zonos",
+            SynthSource::Impostor => "Impostor (Kokoro)",
         }
     }
 
     /// The `train_status.json` pre-launch phase step for this source. The trainer
-    /// module treats both as pre-launch generation phases (not a crashed run).
+    /// module treats all of these as pre-launch generation phases (not a crash).
     fn status_step(self) -> &'static str {
         match self {
             SynthSource::F5 => "f5gen",
             SynthSource::Zonos => "zonosgen",
+            SynthSource::Impostor => "impostorgen",
         }
     }
 
@@ -120,17 +149,18 @@ impl SynthSource {
     }
 }
 
-/// Directory holding a source's voice-cloned positives for a slug. The trainer
-/// writes these to `<repo>/data/<subdir>/<slug>/positive`; the container mounts
-/// the repo `data/` at the parent of `data_root` (DATA_ROOT=/data/real →
-/// /data), so the synth bucket is a sibling of `data_root`.
-fn synth_positive_dir(data_root: &Path, slug: &str, source: SynthSource) -> PathBuf {
+/// Directory holding a source's generated clips for a slug. The bucket lives at
+/// `<repo>/data/<subdir>/<slug>/<category>`; the container mounts the repo `data/`
+/// at the parent of `data_root` (DATA_ROOT=/data/real → /data), so the bucket is
+/// a sibling of `data_root`. F5/Zonos land under `positive`, the Kokoro impostor
+/// source under `negative`.
+fn synth_bucket_dir(data_root: &Path, slug: &str, source: SynthSource) -> PathBuf {
     data_root
         .parent()
         .unwrap_or(data_root)
         .join(source.subdir())
         .join(slug)
-        .join("positive")
+        .join(source.category())
 }
 
 #[derive(Serialize)]
@@ -177,12 +207,12 @@ pub(crate) async fn delete_synth(
     }
     // The synth bucket is data/<subdir>/<slug>/positive; remove its <slug> parent
     // so nothing for this wake word is left behind.
-    let slug_dir = synth_positive_dir(&state.data_root, &slug, source)
+    let slug_dir = synth_bucket_dir(&state.data_root, &slug, source)
         .parent()
         .map(Path::to_path_buf);
     let removed = match slug_dir {
         Some(dir) if dir.exists() => {
-            let count = count_wavs(&synth_positive_dir(&state.data_root, &slug, source));
+            let count = count_wavs(&synth_bucket_dir(&state.data_root, &slug, source));
             fs::remove_dir_all(&dir)
                 .map_err(|e| AppError::internal(format!("failed to delete synth dir: {e}")))?;
             count
@@ -201,7 +231,7 @@ pub(crate) async fn synthetic_samples(
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
     }
     let source = SynthSource::from_query(query.as_deref());
-    let dir = synth_positive_dir(&state.data_root, &slug, source);
+    let dir = synth_bucket_dir(&state.data_root, &slug, source);
     let mut files: Vec<String> = Vec::new();
     if dir.is_dir() {
         for entry in fs::read_dir(&dir)? {
@@ -260,7 +290,7 @@ pub(crate) async fn synthetic_audio(
         return Err(AppError::bad_request(format!("unsafe file name: {file_name}")));
     }
     let source = SynthSource::from_query(query.as_deref());
-    let path = synth_positive_dir(&state.data_root, &slug, source).join(&file_name);
+    let path = synth_bucket_dir(&state.data_root, &slug, source).join(&file_name);
     let bytes = fs::read(path)?;
     Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
 }
@@ -338,10 +368,11 @@ fn resolve_synth_refs(data_root: &Path, slug: &str) -> Result<PathBuf, AppError>
     }
 }
 
-/// Drive one F5 batch for a slug: resolve its reference clips, run the resident
-/// generator, and land the resampled clips in the synth bucket. Returns how many
-/// clips this run produced. Shared by the manual `/synth/generate` endpoint and
-/// the train-time pre-generation step.
+/// Drive one generation batch for a slug: resolve reference clips when the source
+/// clones the user (F5/Zonos), run the resident generator, and land the resampled
+/// clips in the source's bucket. Returns how many clips this run produced. Shared
+/// by the manual `/synth/generate` endpoint and the train-time pre-generation
+/// step. The Kokoro impostor source stages no refs — it uses its own voices.
 async fn generate_synth_batch(
     state: &AppState,
     slug: &str,
@@ -349,20 +380,19 @@ async fn generate_synth_batch(
     count: usize,
     source: SynthSource,
 ) -> Result<usize, AppError> {
-    let refs = resolve_synth_refs(&state.data_root, slug)?;
-    let synth_dir = synth_positive_dir(&state.data_root, slug, source);
-    let cp_refs = refs.to_string_lossy().to_string();
-    let cp_out = synth_dir.to_string_lossy().to_string();
-    let cp_gen_py = source.gen_script().to_string();
+    let refs = if source.has_refs() {
+        Some(resolve_synth_refs(&state.data_root, slug)?)
+    } else {
+        None
+    };
+    let synth_dir = synth_bucket_dir(&state.data_root, slug, source);
     run_synth_generation(
+        state,
         slug,
         phrase,
         count,
         source,
-        &refs,
-        &cp_refs,
-        &cp_gen_py,
-        &cp_out,
+        refs.as_deref(),
         &synth_dir,
         state.whisper_url.as_deref(),
     )
@@ -392,6 +422,26 @@ pub(crate) async fn ensure_zonos_positives(
         .await
 }
 
+/// Ensure the Kokoro impostor-negative bucket holds `vt.impostor_neg_count` clips
+/// (the phrase in female voices) before the trainer assembles them. Thin wrapper
+/// over `ensure_synth_positives`. No user references are needed.
+pub(crate) async fn ensure_impostor_negatives(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+) -> usize {
+    ensure_synth_positives(
+        state,
+        slug,
+        phrase,
+        vt,
+        vt.impostor_neg_count as usize,
+        SynthSource::Impostor,
+    )
+    .await
+}
+
 /// Ensure a source's synth bucket for `slug` holds `target` voice-cloned
 /// positives before the trainer assembles them, generating a fresh batch when it
 /// is short. Reuses an existing batch that is already large enough (so repeated
@@ -412,7 +462,13 @@ pub(crate) async fn ensure_synth_positives(
     source: SynthSource,
 ) -> usize {
     let label = source.label();
-    let synth_dir = synth_positive_dir(&state.data_root, slug, source);
+    // What this source contributes, for human-readable status messages.
+    let noun = if source.has_refs() {
+        "voice-cloned positives"
+    } else {
+        "impostor negatives"
+    };
+    let synth_dir = synth_bucket_dir(&state.data_root, slug, source);
     if target == 0 {
         return count_wavs(&synth_dir);
     }
@@ -420,11 +476,14 @@ pub(crate) async fn ensure_synth_positives(
     if existing >= target {
         return existing;
     }
-    // Can we clone at all? Resolve references before touching the bucket so a
-    // slug with no positives keeps whatever clips it already has.
-    if let Err(e) = resolve_synth_refs(&state.data_root, slug) {
-        eprintln!("{label} pregen: no reference clips for {slug}: {}", e.message);
-        return existing;
+    // Cloning sources need the user's real positives to clone from; resolve them
+    // before touching the bucket so a slug with none keeps whatever it already
+    // has. Reference-free sources (Kokoro impostor) skip this check.
+    if source.has_refs() {
+        if let Err(e) = resolve_synth_refs(&state.data_root, slug) {
+            eprintln!("{label} pregen: no reference clips for {slug}: {}", e.message);
+            return existing;
+        }
     }
     // Don't collide with a manual generation already running for this slug/source.
     let key = source.job_key(slug);
@@ -455,7 +514,7 @@ pub(crate) async fn ensure_synth_positives(
         source,
         target,
         0,
-        &format!("generating {target} voice-cloned positives ({label})"),
+        &format!("generating {target} {noun} ({label})"),
     );
     // Fresh batch: clear the bucket so the count is exactly `target` (no stale
     // clips from a previous, larger run linger).
@@ -474,7 +533,7 @@ pub(crate) async fn ensure_synth_positives(
         }
     }
     let msg = match &result {
-        Ok(w) => format!("generated {w} voice-cloned positives ({label})"),
+        Ok(w) => format!("generated {w} {noun} ({label})"),
         Err(e) => format!(
             "{label} generation failed: {}; training on existing clips",
             e.message
@@ -553,11 +612,16 @@ pub(crate) async fn generate_synth(
         .unwrap_or(60)
         .clamp(1, 1000);
 
-    // Clone from the user's SHORT real positive clips: their transcript is exactly
-    // the phrase and their length is F5-friendly. (F5 sizes the spoken output from
-    // the reference's rate, so a long passage starves the short wake phrase and
-    // leaks its own text.) Refuse early if there is nothing to clone from.
-    let refs_server_dir = resolve_synth_refs(&state.data_root, &slug)?;
+    // Cloning sources (F5/Zonos) clone the user's SHORT real positive clips: their
+    // transcript is exactly the phrase and their length is F5-friendly. (F5 sizes
+    // the spoken output from the reference's rate, so a long passage starves the
+    // short wake phrase and leaks its own text.) Refuse early if there is nothing
+    // to clone from. The Kokoro impostor source stages no refs.
+    let refs_server_dir = if source.has_refs() {
+        Some(resolve_synth_refs(&state.data_root, &slug)?)
+    } else {
+        None
+    };
 
     let phrase = {
         let conn = state.db.lock().expect("db lock poisoned");
@@ -591,13 +655,7 @@ pub(crate) async fn generate_synth(
         );
     }
 
-    // These paths feed `docker cp`, whose local side is resolved inside THIS
-    // container, so they must be container paths (the repo `data/` is mounted at
-    // /data, trainer scripts at /trainer), not host paths.
-    let synth_server_dir = synth_positive_dir(&state.data_root, &slug, source);
-    let cp_refs = refs_server_dir.to_string_lossy().to_string();
-    let cp_gen_py = source.gen_script().to_string();
-    let cp_out = synth_server_dir.to_string_lossy().to_string();
+    let synth_server_dir = synth_bucket_dir(&state.data_root, &slug, source);
 
     let task_state = state.clone();
     let task_slug = slug.clone();
@@ -605,14 +663,12 @@ pub(crate) async fn generate_synth(
     let task_key = key.clone();
     tokio::spawn(async move {
         let result = run_synth_generation(
+            &task_state,
             &task_slug,
             &task_phrase,
             count,
             source,
-            &refs_server_dir,
-            &cp_refs,
-            &cp_gen_py,
-            &cp_out,
+            refs_server_dir.as_deref(),
             &synth_server_dir,
             task_state.whisper_url.as_deref(),
         )
@@ -649,19 +705,19 @@ pub(crate) async fn generate_synth(
 /// repo `data/` is mounted at /data and trainer scripts at /trainer.
 #[allow(clippy::too_many_arguments)]
 async fn run_synth_generation(
+    state: &AppState,
     slug: &str,
     phrase: &str,
     count: usize,
     source: SynthSource,
-    refs_server_dir: &Path,
-    cp_refs: &str,
-    cp_gen_py: &str,
-    cp_out: &str,
+    refs_server_dir: Option<&Path>,
     synth_server_dir: &Path,
     whisper_url: Option<&str>,
 ) -> Result<usize, AppError> {
     let container = source.container();
     let tag = source.tag();
+    let cp_out = synth_server_dir.to_string_lossy().to_string();
+    let cp_gen_py = source.gen_script();
     let stamp = now_ms();
     let scratch = format!("/tmp/{tag}gen_{slug}_{stamp}");
     let crefs = format!("{scratch}/refs");
@@ -677,50 +733,55 @@ async fn run_synth_generation(
     ])
     .await?;
 
-    // Stage a small, clean subset of references (rotated inside the python).
-    let names = staged_reference_names(refs_server_dir)?;
-    for name in &names {
-        docker_ok(vec![
-            "cp".into(),
-            format!("{cp_refs}/{name}"),
-            format!("{container}:{crefs}/{name}"),
-        ])
-        .await?;
-        // An enrollment reference ships its exact passage in a sibling .txt; stage
-        // it too so F5 gets the right ref_text.
-        let sidecar = format!("{}.txt", name.trim_end_matches(".wav"));
-        if refs_server_dir.join(&sidecar).is_file() {
-            docker_ok(vec![
-                "cp".into(),
-                format!("{cp_refs}/{sidecar}"),
-                format!("{container}:{crefs}/{sidecar}"),
-            ])
-            .await?;
-        }
-    }
-
-    // Zonos clones its accent best from ~16s of varied phonetics, so also stage
-    // the user's real NEGATIVE takes (full sentences, sibling `negative` dir) —
-    // the generator builds each priming clip half from these and half from the
-    // short positives. Best-effort: no negatives → positives-only priming.
+    // Cloning sources (F5/Zonos) stage the user's real references; the Kokoro
+    // impostor source has none (it uses its own named voices), so skip staging.
     let cnegs = format!("{scratch}/negs");
     let mut have_negs = false;
-    if matches!(source, SynthSource::Zonos) {
-        if let Some(neg_server_dir) = refs_server_dir.parent().map(|p| p.join("negative")) {
-            if dir_has_wav(&neg_server_dir) {
-                docker_ok(vec!["exec".into(), container.clone(), "mkdir".into(),
-                    "-p".into(), cnegs.clone()])
+    if let Some(refs_server_dir) = refs_server_dir {
+        let cp_refs = refs_server_dir.to_string_lossy().to_string();
+        // Stage a small, clean subset of references (rotated inside the python).
+        let names = staged_reference_names(refs_server_dir)?;
+        for name in &names {
+            docker_ok(vec![
+                "cp".into(),
+                format!("{cp_refs}/{name}"),
+                format!("{container}:{crefs}/{name}"),
+            ])
+            .await?;
+            // An enrollment reference ships its exact passage in a sibling .txt;
+            // stage it too so F5 gets the right ref_text.
+            let sidecar = format!("{}.txt", name.trim_end_matches(".wav"));
+            if refs_server_dir.join(&sidecar).is_file() {
+                docker_ok(vec![
+                    "cp".into(),
+                    format!("{cp_refs}/{sidecar}"),
+                    format!("{container}:{crefs}/{sidecar}"),
+                ])
                 .await?;
-                let cp_negs = neg_server_dir.to_string_lossy().to_string();
-                for name in staged_reference_names(&neg_server_dir)? {
-                    docker_ok(vec![
-                        "cp".into(),
-                        format!("{cp_negs}/{name}"),
-                        format!("{container}:{cnegs}/{name}"),
-                    ])
+            }
+        }
+
+        // Zonos clones its accent best from ~16s of varied phonetics, so also
+        // stage the user's real NEGATIVE takes (full sentences, sibling `negative`
+        // dir) — the generator builds each priming clip half from these and half
+        // from the short positives. Best-effort: no negatives → positives-only.
+        if matches!(source, SynthSource::Zonos) {
+            if let Some(neg_server_dir) = refs_server_dir.parent().map(|p| p.join("negative")) {
+                if dir_has_wav(&neg_server_dir) {
+                    docker_ok(vec!["exec".into(), container.clone(), "mkdir".into(),
+                        "-p".into(), cnegs.clone()])
                     .await?;
+                    let cp_negs = neg_server_dir.to_string_lossy().to_string();
+                    for name in staged_reference_names(&neg_server_dir)? {
+                        docker_ok(vec![
+                            "cp".into(),
+                            format!("{cp_negs}/{name}"),
+                            format!("{container}:{cnegs}/{name}"),
+                        ])
+                        .await?;
+                    }
+                    have_negs = true;
                 }
-                have_negs = true;
             }
         }
     }
@@ -732,17 +793,14 @@ async fn run_synth_generation(
         format!("{container}:{scratch}/gen.py"),
     ])
     .await?;
-    // Common CLI shape shared by both generators (F5 and Zonos accept the same
-    // --refs-dir/--ref-text/--gen-text/--out-dir/--count/--out-sr contract).
+    // Common CLI shape: every generator accepts --gen-text/--out-dir/--count/
+    // --out-sr. Cloning generators (F5/Zonos) additionally take the staged
+    // --refs-dir/--ref-text; the Kokoro impostor generator does not.
     let mut gen_args = vec![
         "exec".into(),
         container.clone(),
         "python3".into(),
         format!("{scratch}/gen.py"),
-        "--refs-dir".into(),
-        crefs.clone(),
-        "--ref-text".into(),
-        phrase.to_string(),
         "--gen-text".into(),
         phrase.to_string(),
         "--out-dir".into(),
@@ -752,6 +810,14 @@ async fn run_synth_generation(
         "--out-sr".into(),
         "16000".into(),
     ];
+    if source.has_refs() {
+        gen_args.extend([
+            "--refs-dir".into(),
+            crefs.clone(),
+            "--ref-text".into(),
+            phrase.to_string(),
+        ]);
+    }
     match source {
         SynthSource::F5 => gen_args.extend([
             // Fidelity knobs (F5 defaults unless overridden in the environment).
@@ -776,8 +842,35 @@ async fn run_synth_generation(
                 gen_args.extend(["--neg-refs-dir".into(), cnegs.clone()]);
             }
         }
+        // Kokoro impostor carries its own female-voice pool and prosody jitter
+        // defaults, so it runs on the common args alone.
+        SynthSource::Impostor => {}
     }
-    docker_ok(gen_args).await?;
+    // Run generation while polling the container's out dir so the app can show a
+    // live wave-file count. `docker exec ls` runs concurrently with the generator
+    // process; each tick updates this source's SynthJob, which both the Review
+    // and training status endpoints read back.
+    let job_key = source.job_key(slug);
+    let gen_fut = docker_ok(gen_args);
+    tokio::pin!(gen_fut);
+    loop {
+        tokio::select! {
+            res = &mut gen_fut => { res?; break; }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                if let Ok(out) = run_docker(vec![
+                    "exec".into(), container.clone(), "sh".into(), "-c".into(),
+                    format!("ls -1 {cout}/*.wav 2>/dev/null | wc -l"),
+                ]).await {
+                    if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() {
+                        let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
+                        if let Some(j) = jobs.get_mut(&job_key) {
+                            j.wrote = n;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Copy the finished clips into the synth bucket (dir must exist first).
     fs::create_dir_all(synth_server_dir)?;
@@ -967,11 +1060,11 @@ mod tests {
     }
 
     #[test]
-    fn synth_positive_dir_is_sibling_of_data_root() {
-        let dir = synth_positive_dir(Path::new("/data/real"), "all_set", SynthSource::F5);
+    fn synth_bucket_dir_is_sibling_of_data_root() {
+        let dir = synth_bucket_dir(Path::new("/data/real"), "all_set", SynthSource::F5);
         assert_eq!(dir, PathBuf::from("/data/synth_f5/all_set/positive"));
         // Zonos lands in its own sibling bucket, keyed by the source subdir.
-        let zdir = synth_positive_dir(Path::new("/data/real"), "all_set", SynthSource::Zonos);
+        let zdir = synth_bucket_dir(Path::new("/data/real"), "all_set", SynthSource::Zonos);
         assert_eq!(zdir, PathBuf::from("/data/synth_zonos/all_set/positive"));
     }
 
