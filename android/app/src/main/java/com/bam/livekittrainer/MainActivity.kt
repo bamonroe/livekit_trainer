@@ -22,6 +22,7 @@ import android.text.style.BackgroundColorSpan
 import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -29,6 +30,7 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -49,9 +51,16 @@ class MainActivity : Activity() {
     private lateinit var exporter: BundleExporter
     private lateinit var lexicon: PromptLexicon
     private lateinit var root: LinearLayout
-    private lateinit var bottomNav: LinearLayout
+    private lateinit var topAppBar: LinearLayout
+    private lateinit var contentFrame: FrameLayout
+    private lateinit var railPanel: LinearLayout
+    private lateinit var railScrim: View
     private lateinit var workspaceScroll: ScrollView
     private lateinit var workspace: LinearLayout
+    // Collapsible left navigation rail state. Tracked as a field so an in-place
+    // render() (e.g. tapping play on a slice) never slams the rail shut; only
+    // openRail()/closeRail() flip visibility.
+    private var railOpen: Boolean = false
     private lateinit var serverUrlInput: EditText
     private lateinit var bulkWakePlacementsInput: EditText
     private var currentPage: AppPage = AppPage.Record
@@ -203,6 +212,14 @@ class MainActivity : Activity() {
             insets
         }
 
+        // Persistent top app bar: hamburger (rail toggle), project dropdown, and a
+        // settings gear. Populated by renderTopBar() so the project label refreshes.
+        topAppBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+
         workspace = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(18), dp(14), dp(18), dp(24))
@@ -211,18 +228,68 @@ class MainActivity : Activity() {
 
         workspaceScroll = ScrollView(this).apply {
             addView(workspace)
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
             isFillViewport = false
             setBackgroundColor(surfaceColor())
         }
 
-        bottomNav = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        // Dim behind the open rail; a tap closes it. Hidden until the rail opens.
+        railScrim = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.argb(102, 0, 0, 0))
+            visibility = View.GONE
+            isClickable = true
+            setOnClickListener { closeRail() }
         }
 
-        root.addView(workspaceScroll)
-        root.addView(bottomNav)
+        // The rail itself: a left panel of primary destinations. Populated by
+        // renderRail(); its open/closed visibility is owned by openRail/closeRail.
+        railPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = FrameLayout.LayoutParams(dp(248), FrameLayout.LayoutParams.MATCH_PARENT)
+            visibility = View.GONE
+        }
+
+        // Custom frame so we can hand-roll edge-swipe open/close without a
+        // DrawerLayout. Workspace sits at the bottom of the z-order, scrim over it,
+        // rail on top.
+        contentFrame = object : FrameLayout(this) {
+            private var downX = 0f
+            private var downY = 0f
+            private val edge = dp(24).toFloat()
+            private val slop = dp(16).toFloat()
+
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = ev.x
+                        downY = ev.y
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = ev.x - downX
+                        val dy = ev.y - downY
+                        if (Math.abs(dx) <= Math.abs(dy)) return false
+                        if (!railOpen && downX <= edge && dx > slop) {
+                            openRail()
+                            return true
+                        }
+                        if (railOpen && dx < -slop) {
+                            closeRail()
+                            return true
+                        }
+                    }
+                }
+                return false
+            }
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+            addView(workspaceScroll)
+            addView(railScrim)
+            addView(railPanel)
+        }
+
+        root.addView(topAppBar)
+        root.addView(contentFrame)
         setContentView(root)
         render()
         // Projects are server-shared: pull anything created on another device so
@@ -264,7 +331,8 @@ class MainActivity : Activity() {
             AppPage.Train -> renderTrainPage(project)
             AppPage.Settings -> renderSettingsPage()
         }
-        renderBottomNav()
+        renderTopBar()
+        renderRail()
 
         lastRenderedPage = currentPage
         lastRenderedDetailId = selectedBulkRecordingId
@@ -273,32 +341,73 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun renderBottomNav() {
-        bottomNav.removeAllViews()
-        bottomNav.background = topBorder(navColor(), strokeColor())
-        bottomNav.setPadding(dp(6), dp(6), dp(6), dp(6))
-        bottomNav.addView(navTab("Record", "●", AppPage.Record))
-        bottomNav.addView(navTab("Review", "≡", AppPage.Review))
-        bottomNav.addView(navTab("Test", "◇", AppPage.Test))
-        bottomNav.addView(navTab("Train", "▲", AppPage.Train))
-        bottomNav.addView(navTab("Settings", "⚙", AppPage.Settings))
+    // Persistent top app bar: hamburger toggles the rail, the project chip opens
+    // the project dropdown, and the gear jumps to Settings (which lives here now
+    // rather than in the rail).
+    private fun renderTopBar() {
+        topAppBar.removeAllViews()
+        topAppBar.background = bottomBorder(navColor(), strokeColor())
+        topAppBar.setPadding(dp(6), dp(4), dp(8), dp(4))
+        topAppBar.addView(
+            iconButton("☰").apply {
+                setOnClickListener { toggleRail() }
+            },
+        )
+        topAppBar.addView(projectChip().apply { withLeft(dp(4)) })
+        topAppBar.addView(
+            View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(0, dp(1), 1f)
+            },
+        )
+        topAppBar.addView(
+            iconButton("⚙").apply {
+                setOnClickListener {
+                    if (currentPage != AppPage.Settings) {
+                        hideKeyboard()
+                        statusMessage = ""
+                        currentPage = AppPage.Settings
+                        render()
+                    }
+                }
+            },
+        )
     }
 
-    private fun navTab(label: String, glyph: String, page: AppPage): View {
+    // Primary destinations. Settings intentionally omitted — it lives on the gear.
+    private fun renderRail() {
+        railPanel.removeAllViews()
+        railPanel.background = rounded(navColor(), 0, strokeColor())
+        railPanel.setPadding(dp(8), dp(12), dp(8), dp(12))
+        railPanel.addView(
+            text("Navigate", 12f, mutedColor(), Typeface.BOLD)
+                .apply { setPadding(dp(10), dp(6), dp(10), dp(10)) },
+        )
+        railPanel.addView(railRow("Record", "●", AppPage.Record))
+        railPanel.addView(railRow("Review", "≡", AppPage.Review))
+        railPanel.addView(railRow("Test", "◇", AppPage.Test))
+        railPanel.addView(railRow("Train", "▲", AppPage.Train))
+    }
+
+    private fun railRow(label: String, glyph: String, page: AppPage): View {
         val active = currentPage == page || (page == AppPage.Review && currentPage == AppPage.Detail)
-        val tint = if (active) ACCENT else mutedColor()
+        val tint = if (active) ACCENT else textColor()
         return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setPadding(dp(6), dp(8), dp(6), dp(8))
-            background = rounded(if (active) navActiveColor() else Color.TRANSPARENT, dp(14), 0)
-            addView(text(glyph, 19f, tint).apply { gravity = Gravity.CENTER })
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = rounded(if (active) navActiveColor() else Color.TRANSPARENT, dp(12), 0)
             addView(
-                text(label, 12f, tint, if (active) Typeface.BOLD else Typeface.NORMAL)
-                    .apply { gravity = Gravity.CENTER }.withTop(dp(2)),
+                text(glyph, 18f, tint).apply {
+                    layoutParams = LinearLayout.LayoutParams(dp(28), LinearLayout.LayoutParams.WRAP_CONTENT)
+                    gravity = Gravity.CENTER
+                },
+            )
+            addView(
+                text(label, 16f, tint, if (active) Typeface.BOLD else Typeface.NORMAL).withLeft(dp(8)),
             )
             setOnClickListener {
+                closeRail()
                 if (currentPage != page) {
                     hideKeyboard()
                     statusMessage = ""
@@ -307,6 +416,31 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    private fun toggleRail() {
+        if (railOpen) closeRail() else openRail()
+    }
+
+    private fun openRail() {
+        railOpen = true
+        val width = dp(248).toFloat()
+        railScrim.visibility = View.VISIBLE
+        railScrim.alpha = 0f
+        railScrim.animate().alpha(1f).setDuration(160).start()
+        railPanel.visibility = View.VISIBLE
+        railPanel.translationX = -width
+        railPanel.animate().translationX(0f).setDuration(180).start()
+    }
+
+    private fun closeRail() {
+        if (!railOpen) return
+        railOpen = false
+        val width = dp(248).toFloat()
+        railScrim.animate().alpha(0f).setDuration(140)
+            .withEndAction { railScrim.visibility = View.GONE }.start()
+        railPanel.animate().translationX(-width).setDuration(160)
+            .withEndAction { railPanel.visibility = View.GONE }.start()
     }
 
     // Drop keyboard focus before switching pages. A focused EditText (e.g. on the
@@ -341,7 +475,6 @@ class MainActivity : Activity() {
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 },
             )
-            addView(projectChip())
         }
     }
 
@@ -5030,6 +5163,16 @@ class MainActivity : Activity() {
         return android.graphics.drawable.LayerDrawable(arrayOf(line, body)).apply {
             // Inset the fill 1px from the top so only the stroke layer shows there.
             setLayerInset(1, 0, dp(1), 0, 0)
+        }
+    }
+
+    /** A flat fill with only a bottom hairline, for the top app bar. */
+    private fun bottomBorder(fill: Int, stroke: Int): android.graphics.drawable.Drawable {
+        val line = GradientDrawable().apply { setColor(stroke) }
+        val body = GradientDrawable().apply { setColor(fill) }
+        return android.graphics.drawable.LayerDrawable(arrayOf(line, body)).apply {
+            // Inset the fill 1px from the bottom so only the stroke layer shows there.
+            setLayerInset(1, 0, 0, 0, dp(1))
         }
     }
 

@@ -78,8 +78,22 @@ Current scaffold:
 - The primary collection workflow is now bulk-script recording, server-side
   split generation, and review of generated slices. The old one-prompt-at-a-time
   collector is no longer part of the primary project screen.
-- The UI has a top-left hamburger button that opens the project drawer, plus a
-  top-right settings gear that navigates to a dedicated settings page.
+- Navigation is a **persistent top app bar** plus a **collapsible left
+  navigation rail** (hand-rolled from framework views — no DrawerLayout, no
+  AndroidX). The top bar carries, left to right: a hamburger (☰) that toggles
+  the rail, the project dropdown chip (opens the project picker), a flexible
+  spacer, and a settings gear (⚙) that navigates to the Settings page. The left
+  rail lists the primary destinations Record / Review / Test / Train (Settings
+  now lives on the gear, not the rail); the active destination is highlighted.
+  The rail overlays the workspace from the left with a scrim behind it; tapping
+  the scrim or a destination, or tapping the hamburger again, closes it. It also
+  opens on a left-edge left-to-right swipe and closes on a right-to-left swipe
+  (handled by a custom `FrameLayout.onInterceptTouchEvent`). `railOpen` is an
+  activity field so an in-place `render()` never disturbs the rail. The old
+  five-tab bottom navigation bar was replaced by this top bar + rail.
+  Note: a right-to-left close swipe that runs all the way into the left
+  system-gesture edge zone can also trigger Android's own back gesture; ending
+  the swipe short of the edge closes only the rail.
 - Settings include the sync server URL, an optional Whisper server URL,
   appearance controls, and reset controls.
 - Prompt recording supports direct prompt picking, previous, and skip controls

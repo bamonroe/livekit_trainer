@@ -7,6 +7,20 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [~] Navigation restructure: bottom tab bar → persistent top app bar +
+  collapsible left rail.
+  - [x] Top app bar (hamburger toggles rail · project dropdown · gear →
+    Settings) and a hand-rolled collapsible left rail listing Record / Review /
+    Test / Train (Settings moved off the rail onto the gear). Overlay + scrim,
+    tap-to-close, and left-edge open / right-to-left close swipes via a custom
+    `FrameLayout.onInterceptTouchEvent`; `railOpen` persists across `render()`.
+    Verified on the emulator (closed/open/navigate/gear/edge-swipe/scroll shots).
+    Removed `bottomNav`/`renderBottomNav`/`navTab`.
+  - [ ] Follow-up (deliberately deferred): re-section the Review page for the new
+    layout.
+  - [ ] Consider narrowing the rail's right-to-left close-swipe zone so it never
+    collides with Android's left-edge system back gesture.
+
 - [~] F5-TTS voice-cloned synthetic positives (sound like the user, replace most
   Kokoro synthetic speech).
   - [x] `speech_services` runs `speech-f5tts` (:7860); generator scripts
