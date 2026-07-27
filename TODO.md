@@ -49,6 +49,20 @@ discovered. Prefer small, actionable items with clear status.
     Train page: **Zonos clips** count knob next to F5, folded into the live total-
     positive-input calculator (`total = n_samples + f5_count + zonos_count +
     real×boost`) and sent as `zonos_count` in the train-request JSON.
+  - [x] **Impostor negatives** (the wake phrase in definitely-not-you female
+    voices) as a third synth source, so the personal detector rejects the phrase
+    in anyone else's voice. Generator `trainer/scripts/kokoro_gen_negatives.py`
+    runs inside `speech-kokoro` (kokoro-fastapi :8880), rotates a female-only
+    voice pool with speed jitter, resamples 24k→16k. Wired through the
+    sync-server as `SynthSource::Impostor` (category = negative bucket,
+    reference-free) with a **live per-file count** during `impostorgen`, pooled
+    by `assemble_training_data.py` into `data/synth_impostor_neg/<slug>/negative`.
+    App Train page: **Impostor negatives** field under a Negatives header, shown
+    as its own calculator line (never summed into the positive total), sent as
+    `impostor_neg_count`. Verified end-to-end: batch of 8 generated, live count
+    tracked, all passed the Whisper gate as the phrase, landed as 16k mono.
+  - [ ] Run a training pass with a nonzero `impostor_neg_count` and re-score the
+    all_set misses to measure the impostor-negative effect on false accepts.
 
 
 - [~] Non-lexical wake words (sounds, not words, e.g. fast "beep beep").

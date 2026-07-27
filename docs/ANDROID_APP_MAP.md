@@ -275,16 +275,25 @@ section. Each row plays the local take back with a Play/Pause button and
 can delete it; delete removes the local WAV, its SQLite row, and the server-side
 background clips via `DELETE /bulk/<slug>/<recording_id>`.
 
-The **Train page** (`renderTrainPage`) exposes the model's positive-input knobs.
-A model's total positive input is four streams the live calculator sums:
+The **Train page** (`renderTrainPage`) exposes the model's positive-input knobs
+plus one negative knob. A model's total *positive* input is four streams the
+live calculator sums:
 `total = n_samples (Kokoro built-in TTS) + f5_count + zonos_count + realPositives × positive_boost`.
-Each stream has its own numeric field (Kokoro / F5 / Zonos clips, positive
-boost); the calculator (`recomputeTotal`) re-renders the breakdown line as any
-field changes. The counts persist via `saveTrainNumbers`
-(`KEY_TRAIN_KOKORO_COUNT` / `KEY_TRAIN_F5_COUNT` / `KEY_TRAIN_ZONOS_COUNT`) and
-are sent in the train-request JSON as `n_samples` / `f5_count` / `zonos_count`
-(`buildTrainRequestBody`). The sync-server pools up to `f5_count` F5 clips and
-`zonos_count` Zonos clips as two of the three positive sources at train time.
+A fifth field, **Impostor negatives (female voices)** (`impostor_neg_count`),
+sits under a "Negatives" header; it is the wake phrase spoken by other people's
+voices and is shown on its own breakdown line (`+ N impostor negatives`),
+**never summed into the positive total**. Each stream has its own numeric field
+(Kokoro / F5 / Zonos clips, positive boost, impostor negatives); the calculator
+(`recomputeTotal`) re-renders the breakdown as any field changes. The counts
+persist via `saveTrainNumbers` (`KEY_TRAIN_KOKORO_COUNT` / `KEY_TRAIN_F5_COUNT` /
+`KEY_TRAIN_ZONOS_COUNT` / `KEY_TRAIN_IMPOSTOR_NEG_COUNT`) and are sent in the
+train-request JSON as `n_samples` / `f5_count` / `zonos_count` /
+`impostor_neg_count` (`buildTrainRequestBody`). At train time the sync-server
+pools up to `f5_count` F5 clips and `zonos_count` Zonos clips as two of the three
+positive sources, and up to `impostor_neg_count` Kokoro impostor clips into the
+negative set. During the pre-train generation phase the status renderer maps
+`f5gen` / `zonosgen` / `impostorgen` to their live `<tag>_wrote` /
+`<tag>_requested` counts so each source's file count ticks up on-screen.
 
 ## Build And Test Loop
 
