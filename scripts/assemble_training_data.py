@@ -124,6 +124,27 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--synth-impostor-neg-root",
+        type=Path,
+        default=Path("data/synth_impostor_neg"),
+        help=(
+            "Root of the IMPOSTOR negatives — the wake phrase spoken by "
+            "not-the-user, female Kokoro voices — laid out as <root>/<slug>/negative "
+            "(default: data/synth_impostor_neg). Up to --synth-impostor-neg-count of these "
+            "are pooled into the target's NEGATIVES so the model learns to reject "
+            "the phrase in other people's voices (speaker-discriminative)."
+        ),
+    )
+    parser.add_argument(
+        "--synth-impostor-neg-count",
+        type=int,
+        default=0,
+        help=(
+            "How many impostor negatives (phrase in other female voices) to fold into "
+            "training as negatives (0 = none)."
+        ),
+    )
+    parser.add_argument(
         "--summary-json",
         type=Path,
         default=None,
@@ -143,6 +164,8 @@ def main() -> int:
         raise SystemExit("--synth-count must be 0 or greater")
     if args.synth_zonos_count < 0:
         raise SystemExit("--synth-zonos-count must be 0 or greater")
+    if args.synth_impostor_neg_count < 0:
+        raise SystemExit("--synth-impostor-neg-count must be 0 or greater")
     # No own recordings is allowed: the trainer synthesizes positives/negatives
     # from the phrase, and other wake words' clips are still pooled in as
     # negatives/background. Warn but continue so a brand-new word can train on a
@@ -165,6 +188,8 @@ def main() -> int:
         synth_count=args.synth_count,
         synth_zonos_root=args.synth_zonos_root,
         synth_zonos_count=args.synth_zonos_count,
+        synth_impostor_neg_root=args.synth_impostor_neg_root,
+        synth_impostor_neg_count=args.synth_impostor_neg_count,
     )
 
     dest = args.out / args.slug
@@ -183,11 +208,16 @@ def main() -> int:
         f"  positive:   {summary['positive']} "
         f"(own {summary['own_positive']}{boost_note}{synth_note})"
     )
+    zneg_note = (
+        f", impostor {summary['synth_impostor_negative']}"
+        if summary["synth_impostor_negative"]
+        else ""
+    )
     print(
         f"  negative:   {summary['negative']} "
         f"(own {summary['own_negative']}, own hard negatives {summary['own_hard_negative']}, "
         f"borrowed negatives {summary['borrowed_negative']}, "
-        f"borrowed positives {summary['borrowed_positive']})"
+        f"borrowed positives {summary['borrowed_positive']}{zneg_note})"
     )
     print(
         f"  background: {summary['background']} "
@@ -207,6 +237,7 @@ def main() -> int:
                     "positive_boost": args.positive_boost,
                     "synth_count": args.synth_count,
                     "synth_zonos_count": args.synth_zonos_count,
+                    "synth_impostor_neg_count": args.synth_impostor_neg_count,
                 },
                 indent=2,
             )
@@ -240,6 +271,8 @@ def assemble(
     synth_count: int = 0,
     synth_zonos_root: Path | None = None,
     synth_zonos_count: int = 0,
+    synth_impostor_neg_root: Path | None = None,
+    synth_impostor_neg_count: int = 0,
 ) -> dict:
     dest = out_root / slug
     if dest.exists():
@@ -248,7 +281,7 @@ def assemble(
         (dest / category).mkdir(parents=True, exist_ok=True)
 
     others = other_slugs(data_root, slug)
-    counts = {k: 0 for k in ("own_negative", "own_hard_negative", "borrowed_negative", "borrowed_positive", "own_background", "borrowed_background")}
+    counts = {k: 0 for k in ("own_negative", "own_hard_negative", "borrowed_negative", "borrowed_positive", "synth_impostor_negative", "own_background", "borrowed_background")}
     contributing: set[str] = set()
 
     # Positives come from up to four sources that together are the model's total
@@ -304,6 +337,19 @@ def assemble(
             if got:
                 contributing.add(other)
 
+    # Impostor negatives: the wake phrase spoken by not-the-user, female Kokoro
+    # voices, pooled into negatives so the detector learns to reject the
+    # phrase in anyone else's voice — the speaker-discriminative signal for a
+    # personal wake word.
+    if synth_impostor_neg_root is not None and synth_impostor_neg_count > 0:
+        counts["synth_impostor_negative"] = _link_category(
+            synth_impostor_neg_root / slug / "negative",
+            dest / "negative",
+            f"{slug}_impostorneg",
+            copy,
+            limit=synth_impostor_neg_count,
+        )
+
     # Background: own, then (optionally) every other slug's background.
     counts["own_background"] = _link_category(data_root / slug / "background", dest / "background", slug, copy)
     if borrow_background:
@@ -319,12 +365,13 @@ def assemble(
         "own_positive": own_pos,
         "synth_positive": synth_pos,
         "synth_zonos_positive": synth_zonos_pos,
-        "negative": counts["own_negative"] + counts["own_hard_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"],
+        "negative": counts["own_negative"] + counts["own_hard_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"] + counts["synth_impostor_negative"],
         "background": counts["own_background"] + counts["borrowed_background"],
         "own_negative": counts["own_negative"],
         "own_hard_negative": counts["own_hard_negative"],
         "borrowed_negative": counts["borrowed_negative"],
         "borrowed_positive": counts["borrowed_positive"],
+        "synth_impostor_negative": counts["synth_impostor_negative"],
         "own_background": counts["own_background"],
         "borrowed_background": counts["borrowed_background"],
         "other_slugs": sorted(contributing),
