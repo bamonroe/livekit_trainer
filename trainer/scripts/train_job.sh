@@ -25,6 +25,11 @@ POSITIVE_BOOST="${POSITIVE_BOOST:-1}"
 # trainer container starts (it, not this container, can reach the F5 service);
 # here we just tell the assembler how many of them to pool into positives.
 F5_COUNT="${F5_COUNT:-0}"
+# How many Zonos voice-cloned synthetic positives to fold into training (0 = none).
+# Like F5, the sync-server generates these into data/synth_zonos/<slug>/positive
+# BEFORE the trainer container starts; here we just tell the assembler how many to
+# pool into positives as a third positive source.
+ZONOS_COUNT="${ZONOS_COUNT:-0}"
 N_SAMPLES="${N_SAMPLES:-}"
 N_SAMPLES_VAL="${N_SAMPLES_VAL:-}"
 POSITIVE_PER_BATCH="${POSITIVE_PER_BATCH:-}"
@@ -90,13 +95,14 @@ fail() {
 }
 
 : > "$LOG"
-echo "== train_job slug=$SLUG phrase='$PHRASE' token=$TOKEN_TYPE steps=$STEPS size=$MODEL_SIZE personal=$PERSONAL boost=$POSITIVE_BOOST f5=$F5_COUNT started $STARTED ==" | tee -a "$LOG"
+echo "== train_job slug=$SLUG phrase='$PHRASE' token=$TOKEN_TYPE steps=$STEPS size=$MODEL_SIZE personal=$PERSONAL boost=$POSITIVE_BOOST f5=$F5_COUNT zonos=$ZONOS_COUNT started $STARTED ==" | tee -a "$LOG"
 
 # 1. Assemble the pooled real-samples tree.
 write_status "running" "assemble" 0 "assembling pooled data"
 ASSEMBLE_SUMMARY="$OUT_DIR/assemble_summary.json"
 assemble_args=(--slug "$SLUG" --positive-boost "$POSITIVE_BOOST"
-  --synth-count "$F5_COUNT" --summary-json "$ASSEMBLE_SUMMARY")
+  --synth-count "$F5_COUNT" --synth-zonos-count "$ZONOS_COUNT"
+  --summary-json "$ASSEMBLE_SUMMARY")
 python3 scripts/assemble_training_data.py "${assemble_args[@]}" >>"$LOG" 2>&1 \
   || fail assemble $? "assemble_training_data failed"
 

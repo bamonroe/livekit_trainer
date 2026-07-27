@@ -14,6 +14,12 @@ pub(crate) fn f5_container() -> String {
     env::var("F5_CONTAINER").unwrap_or_else(|_| "speech-f5tts".to_string())
 }
 
+/// The container running the resident Zonos (Zyphra) TTS model (speech_services
+/// stack). A second voice-clone synthetic-positive source alongside F5.
+pub(crate) fn zonos_container() -> String {
+    env::var("ZONOS_CONTAINER").unwrap_or_else(|_| "speech-zonos".to_string())
+}
+
 /// The by-convention trainer container name for a wake word.
 pub(crate) fn training_container_name(slug: &str) -> String {
     format!("lkww-train-{slug}")

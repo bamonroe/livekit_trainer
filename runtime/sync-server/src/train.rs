@@ -14,7 +14,7 @@ use crate::docker::{container_running, push_env, run_docker, training_container_
 use crate::error::{db_error, AppError};
 use crate::score::read_model_manifest;
 use crate::state::{now_ms, rfc3339_ms, AppState};
-use crate::synth::ensure_f5_positives;
+use crate::synth::{ensure_f5_positives, ensure_zonos_positives};
 use crate::util::{is_safe_slug, parse_query};
 use axum::{
     extract::{Path as AxumPath, RawQuery, State},
@@ -41,6 +41,9 @@ pub(crate) struct TrainRequest {
     // How many F5 voice-cloned positives to generate (in the sync-server, before
     // the trainer launches) and fold into training. 0/omitted = no F5 clips.
     f5_count: Option<u32>,
+    // How many Zonos voice-cloned positives to generate (same pre-launch path as
+    // F5, from the resident speech-zonos container). 0/omitted = no Zonos clips.
+    zonos_count: Option<u32>,
     positive_per_batch: Option<u32>,
     real_samples_dir: Option<String>,
     // "start" | "end". Selects the leading-context recipe (see
@@ -91,6 +94,7 @@ pub(crate) struct ValidatedTrain {
     pub(crate) personal: bool,
     positive_boost: u32,
     pub(crate) f5_count: u32,
+    pub(crate) zonos_count: u32,
     n_samples: Option<u32>,
     n_samples_val: Option<u32>,
     positive_per_batch: Option<u32>,
@@ -176,6 +180,7 @@ fn validate_train(request: TrainRequest) -> Result<ValidatedTrain, AppError> {
         personal: request.personal.unwrap_or(false),
         positive_boost: request.positive_boost.unwrap_or(1).clamp(1, 50),
         f5_count: request.f5_count.unwrap_or(0).min(50_000),
+        zonos_count: request.zonos_count.unwrap_or(0).min(50_000),
         n_samples: request.n_samples,
         n_samples_val: request.n_samples_val,
         positive_per_batch: request.positive_per_batch,
@@ -307,6 +312,7 @@ fn build_train_argv(
     );
     push_env(&mut args, "POSITIVE_BOOST", vt.positive_boost.to_string());
     push_env(&mut args, "F5_COUNT", vt.f5_count.to_string());
+    push_env(&mut args, "ZONOS_COUNT", vt.zonos_count.to_string());
     if let Some(n) = vt.n_samples {
         push_env(&mut args, "N_SAMPLES", n.to_string());
     }
@@ -388,6 +394,11 @@ async fn launch_train_container(
     // f5gen phase is written into train_status.json so the app's training screen
     // shows it. Non-fatal — training proceeds on whatever clips exist.
     ensure_f5_positives(state, slug, phrase, vt).await;
+
+    // Zonos voice-cloned positives are generated the same way, from the resident
+    // speech-zonos container, as an independent third positive source. Runs after
+    // F5 so the two pre-launch top-ups never contend for the same job-map key.
+    ensure_zonos_positives(state, slug, phrase, vt).await;
 
     let output = run_docker(args).await?;
     if !output.status.success() {
@@ -782,6 +793,14 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
     })
 }
 
+/// Is this train_status.json `step` a sync-server pre-launch generation phase
+/// (F5 or Zonos voice-clone top-up) rather than a trainer-container stage? These
+/// phases are written by the sync-server before any trainer container exists, so
+/// a "running" status with no live container is expected, not a crash.
+fn is_pregen_phase(step: &str) -> bool {
+    matches!(step, "f5gen" | "zonosgen")
+}
+
 /// Build the base training-status body from the persisted train_status.json (if
 /// any) reconciled against whether the trainer container is currently alive. A
 /// file marked "running" with no live container is treated as a crash and
@@ -792,9 +811,10 @@ fn parse_train_progress(text: &str, run_state: &str) -> Value {
 fn reconcile_status_body(file_status: Option<Value>, running: bool, slug: &str) -> Value {
     match file_status {
         Some(mut status) => {
+            let step = status.get("step").and_then(Value::as_str).unwrap_or("");
             if !running
                 && status.get("state").and_then(Value::as_str) == Some("running")
-                && status.get("step").and_then(Value::as_str) != Some("f5gen")
+                && !is_pregen_phase(step)
             {
                 status["state"] = json!("stopped");
                 status["message"] = json!("trainer container exited before completing");
@@ -864,10 +884,10 @@ pub(crate) async fn training_status(
     {
         let run_state = body.get("state").and_then(Value::as_str).unwrap_or("none");
         let step = body.get("step").and_then(Value::as_str).unwrap_or("");
-        // Skip the six-step trainer progress during f5gen: the trainer hasn't run
-        // yet, so any train.log is stale from a prior run. The app renders the
-        // f5gen phase from the status body instead.
-        if matches!(run_state, "running" | "starting" | "succeeded") && step != "f5gen" {
+        // Skip the six-step trainer progress during a pre-launch generation phase
+        // (f5gen/zonosgen): the trainer hasn't run yet, so any train.log is stale
+        // from a prior run. The app renders that phase from the status body instead.
+        if matches!(run_state, "running" | "starting" | "succeeded") && !is_pregen_phase(step) {
             let log_path = state.models_root.join(&slug).join("train.log");
             if let Some(text) = read_tail_bytes(&log_path, 1_048_576) {
                 body["progress"] = parse_train_progress(&text, run_state);
@@ -970,10 +990,11 @@ pub(crate) async fn training_status(
         };
         if let Some(entry) = entry {
             body["queue_id"] = json!(entry.id);
-            // The pre-launch f5gen phase is a queued entry with no container yet,
-            // but it is actively generating — don't overwrite it with "queued".
-            let f5gen = body.get("step").and_then(Value::as_str) == Some("f5gen");
-            if entry.state == "queued" && !running && !f5gen {
+            // The pre-launch f5gen/zonosgen phase is a queued entry with no
+            // container yet, but it is actively generating — don't overwrite it
+            // with "queued".
+            let pregen = is_pregen_phase(body.get("step").and_then(Value::as_str).unwrap_or(""));
+            if entry.state == "queued" && !running && !pregen {
                 let position = {
                     let conn = state.db.lock().expect("db lock poisoned");
                     db::queue_position(&conn, entry.id).ok().flatten()
@@ -1083,6 +1104,7 @@ mod tests {
             personal: true,
             positive_boost: 3,
             f5_count: 7,
+            zonos_count: 9,
             n_samples: Some(500),
             n_samples_val: None,
             positive_per_batch: None,
@@ -1241,6 +1263,7 @@ mod tests {
         assert_eq!(env_value(&args, "STEPS"), Some("1234"));
         assert_eq!(env_value(&args, "PERSONAL"), Some("1"));
         assert_eq!(env_value(&args, "F5_COUNT"), Some("7"));
+        assert_eq!(env_value(&args, "ZONOS_COUNT"), Some("9"));
         assert_eq!(env_value(&args, "N_SAMPLES"), Some("500"));
         // n_samples_val is None -> no env pair emitted.
         assert_eq!(env_value(&args, "N_SAMPLES_VAL"), None);

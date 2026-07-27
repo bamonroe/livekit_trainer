@@ -130,9 +130,18 @@ def main():
     import torchaudio
     from zonos.model import Zonos
     from zonos.conditioning import make_cond_dict
+    from zonos.speaker_cloning import SpeakerEmbeddingLDA
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = Zonos.from_pretrained(args.model, device=device)
+    # Zonos builds the speaker-embedding model's mel filterbank inside a
+    # `with torch.device("cuda")` block; this torchaudio version mixes CPU/CUDA
+    # tensors there and crashes ("Expected all tensors to be on the same
+    # device"). Build that model on CPU instead — it runs only once per set and
+    # is cheap — which sidesteps the bug. Embeddings are moved to the GPU by the
+    # conditioning path.
+    if device == "cuda":
+        model.spk_clone_model = SpeakerEmbeddingLDA(device="cpu")
 
     rng = random.Random(args.seed_base)
     phrase_text = " ".join([args.gen_text.strip()] * max(1, args.repeat))

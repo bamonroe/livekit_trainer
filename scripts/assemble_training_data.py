@@ -103,6 +103,27 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--synth-zonos-root",
+        type=Path,
+        default=Path("data/synth_zonos"),
+        help=(
+            "Root of the Zonos voice-cloned synthetic positives, laid out as "
+            "<root>/<slug>/positive (default: data/synth_zonos). Up to "
+            "--synth-zonos-count of these are pooled into the target's positives "
+            "as a THIRD synthetic source alongside the F5 clips and boosted real."
+        ),
+    )
+    parser.add_argument(
+        "--synth-zonos-count",
+        type=int,
+        default=0,
+        help=(
+            "How many Zonos voice-cloned positives to fold into training (0 = none). "
+            "Independent of --synth-count; both synthetic sources plus the boosted "
+            "real positives make up the model's total positive input."
+        ),
+    )
+    parser.add_argument(
         "--summary-json",
         type=Path,
         default=None,
@@ -120,6 +141,8 @@ def main() -> int:
         raise SystemExit("--positive-boost must be 1 or greater")
     if args.synth_count < 0:
         raise SystemExit("--synth-count must be 0 or greater")
+    if args.synth_zonos_count < 0:
+        raise SystemExit("--synth-zonos-count must be 0 or greater")
     # No own recordings is allowed: the trainer synthesizes positives/negatives
     # from the phrase, and other wake words' clips are still pooled in as
     # negatives/background. Warn but continue so a brand-new word can train on a
@@ -140,6 +163,8 @@ def main() -> int:
         positive_boost=args.positive_boost,
         synth_root=args.synth_root,
         synth_count=args.synth_count,
+        synth_zonos_root=args.synth_zonos_root,
+        synth_zonos_count=args.synth_zonos_count,
     )
 
     dest = args.out / args.slug
@@ -152,6 +177,8 @@ def main() -> int:
     synth_note = (
         f", F5 synth {summary['synth_positive']}" if summary["synth_positive"] else ""
     )
+    if summary["synth_zonos_positive"]:
+        synth_note += f", Zonos synth {summary['synth_zonos_positive']}"
     print(
         f"  positive:   {summary['positive']} "
         f"(own {summary['own_positive']}{boost_note}{synth_note})"
@@ -179,6 +206,7 @@ def main() -> int:
                     **summary,
                     "positive_boost": args.positive_boost,
                     "synth_count": args.synth_count,
+                    "synth_zonos_count": args.synth_zonos_count,
                 },
                 indent=2,
             )
@@ -210,6 +238,8 @@ def assemble(
     positive_boost: int = 1,
     synth_root: Path | None = None,
     synth_count: int = 0,
+    synth_zonos_root: Path | None = None,
+    synth_zonos_count: int = 0,
 ) -> dict:
     dest = out_root / slug
     if dest.exists():
@@ -221,13 +251,16 @@ def assemble(
     counts = {k: 0 for k in ("own_negative", "own_hard_negative", "borrowed_negative", "borrowed_positive", "own_background", "borrowed_background")}
     contributing: set[str] = set()
 
-    # Positives come from up to three sources that together are the model's total
+    # Positives come from up to four sources that together are the model's total
     # positive input:
     #   1. the user's own real recordings, optionally replicated `positive_boost`
     #      times so they weigh more against the synthetic pools;
     #   2. up to `synth_count` F5 voice-cloned clips (data/synth_f5/<slug>), a
     #      synthetic source that carries the user's timbre;
-    #   3. the trainer's own built-in TTS pool (n_samples), synthesized later by
+    #   3. up to `synth_zonos_count` Zonos voice-cloned clips
+    #      (data/synth_zonos/<slug>), a second timbre-carrying synthetic source
+    #      with explicit prosody variety;
+    #   4. the trainer's own built-in TTS pool (n_samples), synthesized later by
     #      `livekit-wakeword setup`, not pooled here.
     n_pos_unique = _count_wavs(data_root / slug / "positive")
     own_pos = _link_category(
@@ -242,7 +275,16 @@ def assemble(
             copy,
             limit=synth_count,
         )
-    n_pos = own_pos + synth_pos
+    synth_zonos_pos = 0
+    if synth_zonos_root is not None and synth_zonos_count > 0:
+        synth_zonos_pos = _link_category(
+            synth_zonos_root / slug / "positive",
+            dest / "positive",
+            f"{slug}_zonossynth",
+            copy,
+            limit=synth_zonos_count,
+        )
+    n_pos = own_pos + synth_pos + synth_zonos_pos
 
     # Negatives: own negatives, own hard negatives (project-scoped, never
     # borrowed from or lent to another slug), then every other slug's negatives,
@@ -276,6 +318,7 @@ def assemble(
         "positive_unique": n_pos_unique,
         "own_positive": own_pos,
         "synth_positive": synth_pos,
+        "synth_zonos_positive": synth_zonos_pos,
         "negative": counts["own_negative"] + counts["own_hard_negative"] + counts["borrowed_negative"] + counts["borrowed_positive"],
         "background": counts["own_background"] + counts["borrowed_background"],
         "own_negative": counts["own_negative"],

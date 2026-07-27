@@ -10,7 +10,7 @@
 //! hook that tops the bucket up before the trainer assembles it.
 
 use crate::db;
-use crate::docker::{docker_ok, f5_container, run_docker};
+use crate::docker::{docker_ok, f5_container, run_docker, zonos_container};
 use crate::error::{db_error, AppError};
 use crate::state::{now_ms, AppState, SynthJob};
 use crate::train::ValidatedTrain;
@@ -35,15 +35,100 @@ use std::path::{Path, PathBuf};
 /// real positives a batch can draw on (and how many small files we `docker cp`).
 const STAGED_REFERENCE_CAP: usize = 48;
 
-/// Directory holding the F5 voice-cloned positives for a slug. The trainer
-/// writes these to `<repo>/data/synth_f5/<slug>/positive`; the container mounts
+/// Which resident voice-clone TTS produced a batch of synthetic positives. Both
+/// sources share the same pipeline — stage the user's real refs, run a resident
+/// generator over docker, Whisper-gate the output — and differ only in their
+/// bucket subdir, container, generator script, clip prefix, and status label. F5
+/// is the default so every existing app call (which passes no `source`) is
+/// unchanged; Zonos is the second source that adds explicit prosody levers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SynthSource {
+    F5,
+    Zonos,
+}
+
+impl SynthSource {
+    /// Parse the `?source=` query value; anything but an explicit `zonos` (incl.
+    /// the absent/default case) is F5, so existing callers keep F5 behavior.
+    fn from_str(value: Option<&str>) -> SynthSource {
+        match value {
+            Some(v) if v.eq_ignore_ascii_case("zonos") => SynthSource::Zonos,
+            _ => SynthSource::F5,
+        }
+    }
+
+    /// Resolve the source from a raw query string's `source` param (default F5).
+    fn from_query(query: Option<&str>) -> SynthSource {
+        let params = parse_query(query);
+        SynthSource::from_str(params.get("source").map(String::as_str))
+    }
+
+    /// The `data/<subdir>/<slug>/positive` bucket subdir for this source.
+    fn subdir(self) -> &'static str {
+        match self {
+            SynthSource::F5 => "synth_f5",
+            SynthSource::Zonos => "synth_zonos",
+        }
+    }
+
+    /// The resident generator container name for this source.
+    fn container(self) -> String {
+        match self {
+            SynthSource::F5 => f5_container(),
+            SynthSource::Zonos => zonos_container(),
+        }
+    }
+
+    /// The container path of the generator script (mounted at /trainer).
+    fn gen_script(self) -> &'static str {
+        match self {
+            SynthSource::F5 => "/trainer/scripts/f5_gen_positives.py",
+            SynthSource::Zonos => "/trainer/scripts/zonos_gen_positives.py",
+        }
+    }
+
+    /// Short lowercase tag used for scratch dirs, status field prefixes, and the
+    /// synth-job map key. Matches the generator's clip filename prefix.
+    fn tag(self) -> &'static str {
+        match self {
+            SynthSource::F5 => "f5",
+            SynthSource::Zonos => "zonos",
+        }
+    }
+
+    /// Human label for status/log messages.
+    fn label(self) -> &'static str {
+        match self {
+            SynthSource::F5 => "F5",
+            SynthSource::Zonos => "Zonos",
+        }
+    }
+
+    /// The `train_status.json` pre-launch phase step for this source. The trainer
+    /// module treats both as pre-launch generation phases (not a crashed run).
+    fn status_step(self) -> &'static str {
+        match self {
+            SynthSource::F5 => "f5gen",
+            SynthSource::Zonos => "zonosgen",
+        }
+    }
+
+    /// The synth-job map key: `<tag>:<slug>` so F5 and Zonos runs for the same
+    /// wake word never collide in the shared map.
+    fn job_key(self, slug: &str) -> String {
+        format!("{}:{slug}", self.tag())
+    }
+}
+
+/// Directory holding a source's voice-cloned positives for a slug. The trainer
+/// writes these to `<repo>/data/<subdir>/<slug>/positive`; the container mounts
 /// the repo `data/` at the parent of `data_root` (DATA_ROOT=/data/real →
 /// /data), so the synth bucket is a sibling of `data_root`.
-fn synth_positive_dir(data_root: &Path, slug: &str) -> PathBuf {
+fn synth_positive_dir(data_root: &Path, slug: &str, source: SynthSource) -> PathBuf {
     data_root
         .parent()
         .unwrap_or(data_root)
-        .join("synth_f5")
+        .join(source.subdir())
         .join(slug)
         .join("positive")
 }
@@ -76,43 +161,47 @@ pub(crate) struct SyntheticSamplesResponse {
 pub(crate) async fn delete_synth(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Result<Json<Value>, AppError> {
     if !is_safe_slug(&slug) {
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
     }
+    let source = SynthSource::from_query(query.as_deref());
     {
         let jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
-        if jobs.get(&slug).map(|j| j.running).unwrap_or(false) {
+        if jobs.get(&source.job_key(&slug)).map(|j| j.running).unwrap_or(false) {
             return Err(AppError::bad_request(
                 "a generation run is in progress; wait for it to finish before deleting",
             ));
         }
     }
-    // The synth bucket is data/synth_f5/<slug>/positive; remove its <slug> parent
+    // The synth bucket is data/<subdir>/<slug>/positive; remove its <slug> parent
     // so nothing for this wake word is left behind.
-    let slug_dir = synth_positive_dir(&state.data_root, &slug)
+    let slug_dir = synth_positive_dir(&state.data_root, &slug, source)
         .parent()
         .map(Path::to_path_buf);
     let removed = match slug_dir {
         Some(dir) if dir.exists() => {
-            let count = count_wavs(&synth_positive_dir(&state.data_root, &slug));
+            let count = count_wavs(&synth_positive_dir(&state.data_root, &slug, source));
             fs::remove_dir_all(&dir)
                 .map_err(|e| AppError::internal(format!("failed to delete synth dir: {e}")))?;
             count
         }
         _ => 0,
     };
-    Ok(Json(json!({ "status": "ok", "slug": slug, "deleted": removed })))
+    Ok(Json(json!({ "status": "ok", "slug": slug, "source": source.tag(), "deleted": removed })))
 }
 
 pub(crate) async fn synthetic_samples(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Result<Json<SyntheticSamplesResponse>, AppError> {
     if !is_safe_slug(&slug) {
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
     }
-    let dir = synth_positive_dir(&state.data_root, &slug);
+    let source = SynthSource::from_query(query.as_deref());
+    let dir = synth_positive_dir(&state.data_root, &slug, source);
     let mut files: Vec<String> = Vec::new();
     if dir.is_dir() {
         for entry in fs::read_dir(&dir)? {
@@ -154,10 +243,11 @@ pub(crate) async fn synthetic_samples(
     }))
 }
 
-/// Serve one F5 synthetic positive WAV by file name. Mirrors `review_audio`.
+/// Serve one synthetic positive WAV by file name. Mirrors `review_audio`.
 pub(crate) async fn synthetic_audio(
     State(state): State<AppState>,
     AxumPath((slug, file_name)): AxumPath<(String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<impl IntoResponse, AppError> {
     if !is_safe_slug(&slug) {
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
@@ -169,7 +259,8 @@ pub(crate) async fn synthetic_audio(
     {
         return Err(AppError::bad_request(format!("unsafe file name: {file_name}")));
     }
-    let path = synth_positive_dir(&state.data_root, &slug).join(&file_name);
+    let source = SynthSource::from_query(query.as_deref());
+    let path = synth_positive_dir(&state.data_root, &slug, source).join(&file_name);
     let bytes = fs::read(path)?;
     Ok(([(header::CONTENT_TYPE, "audio/wav")], bytes))
 }
@@ -256,16 +347,18 @@ async fn generate_synth_batch(
     slug: &str,
     phrase: &str,
     count: usize,
+    source: SynthSource,
 ) -> Result<usize, AppError> {
     let refs = resolve_synth_refs(&state.data_root, slug)?;
-    let synth_dir = synth_positive_dir(&state.data_root, slug);
+    let synth_dir = synth_positive_dir(&state.data_root, slug, source);
     let cp_refs = refs.to_string_lossy().to_string();
     let cp_out = synth_dir.to_string_lossy().to_string();
-    let cp_gen_py = "/trainer/scripts/f5_gen_positives.py".to_string();
+    let cp_gen_py = source.gen_script().to_string();
     run_synth_generation(
         slug,
         phrase,
         count,
+        source,
         &refs,
         &cp_refs,
         &cp_gen_py,
@@ -276,23 +369,50 @@ async fn generate_synth_batch(
     .await
 }
 
-/// Ensure the F5 synth bucket for `slug` holds `vt.f5_count` voice-cloned
-/// positives before the trainer assembles them, generating a fresh batch when it
-/// is short. Reuses an existing batch that is already large enough (so repeated
-/// trains don't re-pay F5's cost); otherwise clears the bucket and regenerates
-/// exactly `f5_count` (the generator names clips `f5_00000..`, so a clean bucket
-/// yields exactly the count the user asked for with no stale leftovers). Writes
-/// an `f5gen` phase into train_status.json so the app's training screen shows it.
-/// Non-fatal: on any failure it logs, records the error, and returns whatever
-/// clips exist so training still proceeds. Returns the final clip count.
+/// Ensure the F5 synth bucket holds `vt.f5_count` voice-cloned positives before
+/// the trainer assembles them. Thin wrapper over `ensure_synth_positives`.
 pub(crate) async fn ensure_f5_positives(
     state: &AppState,
     slug: &str,
     phrase: &str,
     vt: &ValidatedTrain,
 ) -> usize {
-    let target = vt.f5_count as usize;
-    let synth_dir = synth_positive_dir(&state.data_root, slug);
+    ensure_synth_positives(state, slug, phrase, vt, vt.f5_count as usize, SynthSource::F5).await
+}
+
+/// Ensure the Zonos synth bucket holds `vt.zonos_count` voice-cloned positives
+/// before the trainer assembles them. Thin wrapper over `ensure_synth_positives`.
+pub(crate) async fn ensure_zonos_positives(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+) -> usize {
+    ensure_synth_positives(state, slug, phrase, vt, vt.zonos_count as usize, SynthSource::Zonos)
+        .await
+}
+
+/// Ensure a source's synth bucket for `slug` holds `target` voice-cloned
+/// positives before the trainer assembles them, generating a fresh batch when it
+/// is short. Reuses an existing batch that is already large enough (so repeated
+/// trains don't re-pay the generator's cost); otherwise clears the bucket and
+/// regenerates exactly `target` (the generator names clips `<tag>_00000..`, so a
+/// clean bucket yields exactly the count with no stale leftovers). Writes the
+/// source's pre-launch phase into train_status.json so the app's training screen
+/// shows it. Non-fatal: on any failure it logs, records the error, and returns
+/// whatever clips exist so training still proceeds. Returns the final clip count.
+/// F5 and Zonos runs for the same slug key the job map independently, so the two
+/// pre-launch top-ups never collide.
+pub(crate) async fn ensure_synth_positives(
+    state: &AppState,
+    slug: &str,
+    phrase: &str,
+    vt: &ValidatedTrain,
+    target: usize,
+    source: SynthSource,
+) -> usize {
+    let label = source.label();
+    let synth_dir = synth_positive_dir(&state.data_root, slug, source);
     if target == 0 {
         return count_wavs(&synth_dir);
     }
@@ -303,21 +423,22 @@ pub(crate) async fn ensure_f5_positives(
     // Can we clone at all? Resolve references before touching the bucket so a
     // slug with no positives keeps whatever clips it already has.
     if let Err(e) = resolve_synth_refs(&state.data_root, slug) {
-        eprintln!("f5 pregen: no reference clips for {slug}: {}", e.message);
+        eprintln!("{label} pregen: no reference clips for {slug}: {}", e.message);
         return existing;
     }
-    // Don't collide with a manual generation already running for this slug.
+    // Don't collide with a manual generation already running for this slug/source.
+    let key = source.job_key(slug);
     {
         let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
-        if jobs.get(slug).map(|j| j.running).unwrap_or(false) {
+        if jobs.get(&key).map(|j| j.running).unwrap_or(false) {
             eprintln!(
-                "f5 pregen: a manual generation is already running for {slug}; \
+                "{label} pregen: a manual generation is already running for {slug}; \
                  training on the {existing} existing clips"
             );
             return existing;
         }
         jobs.insert(
-            slug.to_string(),
+            key.clone(),
             SynthJob {
                 running: true,
                 requested: target,
@@ -326,50 +447,56 @@ pub(crate) async fn ensure_f5_positives(
             },
         );
     }
-    write_f5_status(
+    write_synth_status(
         state,
         slug,
         phrase,
         vt,
+        source,
         target,
         0,
-        &format!("generating {target} voice-cloned positives (F5)"),
+        &format!("generating {target} voice-cloned positives ({label})"),
     );
     // Fresh batch: clear the bucket so the count is exactly `target` (no stale
     // clips from a previous, larger run linger).
     let _ = fs::remove_dir_all(&synth_dir);
-    let result = generate_synth_batch(state, slug, phrase, target).await;
+    let result = generate_synth_batch(state, slug, phrase, target, source).await;
     let wrote = *result.as_ref().unwrap_or(&0);
     if let Err(e) = &result {
-        eprintln!("f5 pregen failed for {slug}: {}", e.message);
+        eprintln!("{label} pregen failed for {slug}: {}", e.message);
     }
     {
         let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
-        if let Some(j) = jobs.get_mut(slug) {
+        if let Some(j) = jobs.get_mut(&key) {
             j.running = false;
             j.wrote = wrote;
             j.error = result.as_ref().err().map(|e| e.message.clone());
         }
     }
     let msg = match &result {
-        Ok(w) => format!("generated {w} voice-cloned positives (F5)"),
+        Ok(w) => format!("generated {w} voice-cloned positives ({label})"),
         Err(e) => format!(
-            "F5 generation failed: {}; training on existing clips",
+            "{label} generation failed: {}; training on existing clips",
             e.message
         ),
     };
-    write_f5_status(state, slug, phrase, vt, target, wrote, &msg);
+    write_synth_status(state, slug, phrase, vt, source, target, wrote, &msg);
     count_wavs(&synth_dir)
 }
 
-/// Write the pre-training `f5gen` phase into a slug's train_status.json. The
+/// Write the pre-training generation phase into a slug's train_status.json. The
 /// trainer overwrites this file with its own phases once it launches; until then
-/// the app sees a `running` status stepped `f5gen`, with the F5 clip counts.
-fn write_f5_status(
+/// the app sees a `running` status stepped with the source's phase (`f5gen` /
+/// `zonosgen`), carrying the generated clip counts under `<tag>_requested` /
+/// `<tag>_wrote`. F5 writes exactly the same `f5gen`/`f5_requested`/`f5_wrote`
+/// fields it always has.
+#[allow(clippy::too_many_arguments)]
+fn write_synth_status(
     state: &AppState,
     slug: &str,
     phrase: &str,
     vt: &ValidatedTrain,
+    source: SynthSource,
     requested: usize,
     wrote: usize,
     message: &str,
@@ -379,18 +506,19 @@ fn write_f5_status(
         return;
     }
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let tag = source.tag();
     let body = json!({
         "slug": slug,
         "phrase": phrase,
         "state": "running",
-        "step": "f5gen",
+        "step": source.status_step(),
         "exit_code": 0,
         "message": message,
         "steps": vt.steps,
         "model_size": vt.model_size,
         "personal": vt.personal,
-        "f5_requested": requested,
-        "f5_wrote": wrote,
+        (format!("{tag}_requested")): requested,
+        (format!("{tag}_wrote")): wrote,
         "started_at": now,
         "updated_at": now,
     });
@@ -418,6 +546,7 @@ pub(crate) async fn generate_synth(
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
     }
     let params = parse_query(query.as_deref());
+    let source = SynthSource::from_str(params.get("source").map(String::as_str));
     let count: usize = params
         .get("count")
         .and_then(|v| v.parse().ok())
@@ -443,15 +572,16 @@ pub(crate) async fn generate_synth(
         ));
     }
 
+    let key = source.job_key(&slug);
     {
         let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
-        if jobs.get(&slug).map(|j| j.running).unwrap_or(false) {
+        if jobs.get(&key).map(|j| j.running).unwrap_or(false) {
             return Err(AppError::bad_request(
                 "a generation run is already in progress for this wake word",
             ));
         }
         jobs.insert(
-            slug.clone(),
+            key.clone(),
             SynthJob {
                 running: true,
                 requested: count,
@@ -464,19 +594,21 @@ pub(crate) async fn generate_synth(
     // These paths feed `docker cp`, whose local side is resolved inside THIS
     // container, so they must be container paths (the repo `data/` is mounted at
     // /data, trainer scripts at /trainer), not host paths.
-    let synth_server_dir = synth_positive_dir(&state.data_root, &slug);
+    let synth_server_dir = synth_positive_dir(&state.data_root, &slug, source);
     let cp_refs = refs_server_dir.to_string_lossy().to_string();
-    let cp_gen_py = "/trainer/scripts/f5_gen_positives.py".to_string();
+    let cp_gen_py = source.gen_script().to_string();
     let cp_out = synth_server_dir.to_string_lossy().to_string();
 
     let task_state = state.clone();
     let task_slug = slug.clone();
     let task_phrase = phrase.clone();
+    let task_key = key.clone();
     tokio::spawn(async move {
         let result = run_synth_generation(
             &task_slug,
             &task_phrase,
             count,
+            source,
             &refs_server_dir,
             &cp_refs,
             &cp_gen_py,
@@ -486,7 +618,7 @@ pub(crate) async fn generate_synth(
         )
         .await;
         let mut jobs = task_state.synth_jobs.lock().expect("synth jobs lock poisoned");
-        let entry = jobs.entry(task_slug).or_insert(SynthJob {
+        let entry = jobs.entry(task_key).or_insert(SynthJob {
             running: false,
             requested: count,
             wrote: 0,
@@ -520,6 +652,7 @@ async fn run_synth_generation(
     slug: &str,
     phrase: &str,
     count: usize,
+    source: SynthSource,
     refs_server_dir: &Path,
     cp_refs: &str,
     cp_gen_py: &str,
@@ -527,9 +660,10 @@ async fn run_synth_generation(
     synth_server_dir: &Path,
     whisper_url: Option<&str>,
 ) -> Result<usize, AppError> {
-    let container = f5_container();
+    let container = source.container();
+    let tag = source.tag();
     let stamp = now_ms();
-    let scratch = format!("/tmp/f5gen_{slug}_{stamp}");
+    let scratch = format!("/tmp/{tag}gen_{slug}_{stamp}");
     let crefs = format!("{scratch}/refs");
     let cout = format!("{scratch}/out");
 
@@ -572,7 +706,9 @@ async fn run_synth_generation(
         format!("{container}:{scratch}/gen.py"),
     ])
     .await?;
-    docker_ok(vec![
+    // Common CLI shape shared by both generators (F5 and Zonos accept the same
+    // --refs-dir/--ref-text/--gen-text/--out-dir/--count/--out-sr contract).
+    let mut gen_args = vec![
         "exec".into(),
         container.clone(),
         "python3".into(),
@@ -589,21 +725,29 @@ async fn run_synth_generation(
         count.to_string(),
         "--out-sr".into(),
         "16000".into(),
-        // Fidelity knobs (F5 defaults unless overridden in the environment).
-        // Raise F5_NFE_STEP for a sharper, more faithful render (slower);
-        // raise F5_CFG_STRENGTH to hew closer to the user's timbre.
-        "--nfe-step".into(),
-        env::var("F5_NFE_STEP").unwrap_or_else(|_| "32".to_string()),
-        "--cfg-strength".into(),
-        env::var("F5_CFG_STRENGTH").unwrap_or_else(|_| "2.0".to_string()),
-        // Batched-priming rotation: concatenate this many real refs into one
-        // priming clip, render this many seeds off it, then rotate the window.
-        "--concat-size".into(),
-        env::var("F5_CONCAT_SIZE").unwrap_or_else(|_| "5".to_string()),
-        "--seeds-per-set".into(),
-        env::var("F5_SEEDS_PER_SET").unwrap_or_else(|_| "5".to_string()),
-    ])
-    .await?;
+    ];
+    match source {
+        SynthSource::F5 => gen_args.extend([
+            // Fidelity knobs (F5 defaults unless overridden in the environment).
+            // Raise F5_NFE_STEP for a sharper, more faithful render (slower);
+            // raise F5_CFG_STRENGTH to hew closer to the user's timbre.
+            "--nfe-step".into(),
+            env::var("F5_NFE_STEP").unwrap_or_else(|_| "32".to_string()),
+            "--cfg-strength".into(),
+            env::var("F5_CFG_STRENGTH").unwrap_or_else(|_| "2.0".to_string()),
+            // Batched-priming rotation: concatenate this many real refs into one
+            // priming clip, render this many seeds off it, then rotate the window.
+            "--concat-size".into(),
+            env::var("F5_CONCAT_SIZE").unwrap_or_else(|_| "5".to_string()),
+            "--seeds-per-set".into(),
+            env::var("F5_SEEDS_PER_SET").unwrap_or_else(|_| "5".to_string()),
+        ]),
+        // Zonos carries its own sane prosody-lever defaults (speaking_rate,
+        // pitch_std, emotion jitter) and the same concat/seed rotation, so it
+        // runs on the common args alone — F5's fidelity flags don't apply.
+        SynthSource::Zonos => {}
+    }
+    docker_ok(gen_args).await?;
 
     // Copy the finished clips into the synth bucket (dir must exist first).
     fs::create_dir_all(synth_server_dir)?;
@@ -637,7 +781,7 @@ async fn run_synth_generation(
     let wrote = match whisper_url {
         Some(url) => gate_synth_clips(url, phrase, synth_server_dir, &names).await,
         None => {
-            eprintln!("f5 gate: no Whisper URL configured; skipping verification");
+            eprintln!("{tag} gate: no Whisper URL configured; skipping verification");
             names.len()
         }
     };
@@ -740,13 +884,15 @@ pub(crate) struct GenerateSynthStatusResponse {
 pub(crate) async fn generate_synth_status(
     State(state): State<AppState>,
     AxumPath(slug): AxumPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Result<Json<GenerateSynthStatusResponse>, AppError> {
     if !is_safe_slug(&slug) {
         return Err(AppError::bad_request(format!("unsafe wake word slug: {slug}")));
     }
+    let source = SynthSource::from_query(query.as_deref());
     let job = {
         let jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
-        jobs.get(&slug).cloned()
+        jobs.get(&source.job_key(&slug)).cloned()
     };
     Ok(Json(match job {
         Some(j) => GenerateSynthStatusResponse {
@@ -792,8 +938,29 @@ mod tests {
 
     #[test]
     fn synth_positive_dir_is_sibling_of_data_root() {
-        let dir = synth_positive_dir(Path::new("/data/real"), "all_set");
+        let dir = synth_positive_dir(Path::new("/data/real"), "all_set", SynthSource::F5);
         assert_eq!(dir, PathBuf::from("/data/synth_f5/all_set/positive"));
+        // Zonos lands in its own sibling bucket, keyed by the source subdir.
+        let zdir = synth_positive_dir(Path::new("/data/real"), "all_set", SynthSource::Zonos);
+        assert_eq!(zdir, PathBuf::from("/data/synth_zonos/all_set/positive"));
+    }
+
+    #[test]
+    fn synth_source_from_query_defaults_to_f5() {
+        assert_eq!(SynthSource::from_query(None), SynthSource::F5);
+        assert_eq!(SynthSource::from_query(Some("count=5")), SynthSource::F5);
+        assert_eq!(SynthSource::from_query(Some("source=f5")), SynthSource::F5);
+        assert_eq!(SynthSource::from_query(Some("source=ZONOS")), SynthSource::Zonos);
+        assert_eq!(SynthSource::from_query(Some("source=zonos&count=3")), SynthSource::Zonos);
+        // An unknown source falls back to F5 rather than erroring.
+        assert_eq!(SynthSource::from_query(Some("source=bogus")), SynthSource::F5);
+    }
+
+    #[test]
+    fn synth_source_job_keys_never_collide() {
+        assert_eq!(SynthSource::F5.job_key("w"), "f5:w");
+        assert_eq!(SynthSource::Zonos.job_key("w"), "zonos:w");
+        assert_ne!(SynthSource::F5.job_key("w"), SynthSource::Zonos.job_key("w"));
     }
 
     #[test]
