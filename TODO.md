@@ -7,6 +7,15 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
+- [ ] **WAITING ON LOG** — A/B clone-vs-baseline training test. A detached tmux
+  session "wake word testing" runs `sleep 4h && bash ~/wakeword_ab_test.sh`
+  (launched 2026-07-27 ~18:16 EDT, so it fires ~22:16 EDT) and tees output to
+  `~/wakeword_ab_test.log`. Run A = shipped Piper pool + real positives (no
+  clones); Run B = same recipe + 2000 F5 + 2000 Zonos voice clones. Both are two
+  full 50k-step runs, so the log won't be complete until well into 2026-07-28.
+  **Next action for the agent: read `~/wakeword_ab_test.log` and compare Run A vs
+  Run B recall / fp-per-hour to judge whether the voice clones help.**
+
 - [~] Navigation restructure: bottom tab bar → persistent top app bar +
   collapsible left rail.
   - [x] Top app bar (hamburger toggles rail · project dropdown · gear →
