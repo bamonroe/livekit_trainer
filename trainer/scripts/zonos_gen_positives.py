@@ -33,6 +33,41 @@ import tempfile
 import wave
 
 
+def wav_secs(path):
+    """Duration of a wav in seconds (0 if unreadable)."""
+    try:
+        with contextlib.closing(wave.open(path)) as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:
+        return 0.0
+
+
+def take_until(paths, start, target_secs):
+    """Take consecutive clips (wrapping at the end) beginning at `start` until
+    their combined duration reaches `target_secs`, always at least one. Returns
+    (chosen_paths, seconds_taken, next_start)."""
+    if not paths:
+        return [], 0.0, start
+    chosen, total, i = [], 0.0, 0
+    while total < target_secs and i < len(paths):
+        p = paths[(start + i) % len(paths)]
+        chosen.append(p)
+        total += wav_secs(p)
+        i += 1
+    return chosen, total, start + i
+
+
+def interleave(a, b):
+    """Alternate two lists, appending the longer list's tail, so the speaker
+    embedding hears positives and negatives mixed rather than segregated."""
+    out = []
+    for x, y in zip(a, b):
+        out.append(x)
+        out.append(y)
+    out.extend(a[len(b):] if len(a) > len(b) else b[len(a):])
+    return out
+
+
 def concat_refs(paths, out_path, gap_secs):
     """Concatenate reference wavs into one clip for speaker embedding, returning
     its length in seconds. Mismatched-format clips are skipped (the user's real
@@ -78,6 +113,17 @@ def jittered_emotion(rng, amount):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refs-dir", required=True)
+    ap.add_argument("--neg-refs-dir", default="",
+                    help="Optional dir of the user's real NEGATIVE takes (full "
+                         "natural sentences). When given, each speaker-embedding "
+                         "priming clip is built roughly half from these and half "
+                         "from the short positives, so Zonos hears varied phonetics "
+                         "and locks the user's accent instead of drifting to its "
+                         "own prior.")
+    ap.add_argument("--target-secs", type=float, default=16.0,
+                    help="Target total duration of each priming clip. Zonos clones "
+                         "best from ~10-30s of reference; ~16s split pos/neg is the "
+                         "sweet spot.")
     ap.add_argument("--ref-text", default="",
                     help="Accepted for interface parity with the F5 generator; "
                          "Zonos clones from the audio embedding, not ref text.")
@@ -115,7 +161,7 @@ def main():
     ap.add_argument("--seeds-per-set", type=int, default=5,
                     help="Clips rendered per speaker embedding before rotating the "
                          "reference window.")
-    ap.add_argument("--concat-gap", type=float, default=0.2)
+    ap.add_argument("--concat-gap", type=float, default=0.15)
     ap.add_argument("--out-sr", type=int, default=0,
                     help="If >0, resample each clip to this rate (mono, 16-bit PCM). "
                          "The trainer wants 16000; 0 keeps Zonos's 44.1 kHz output.")
@@ -124,6 +170,8 @@ def main():
     refs = sorted(glob.glob(os.path.join(args.refs_dir, "*.wav")))
     if not refs:
         raise SystemExit(f"no reference wavs in {args.refs_dir}")
+    neg_refs = (sorted(glob.glob(os.path.join(args.neg_refs_dir, "*.wav")))
+                if args.neg_refs_dir else [])
     os.makedirs(args.out_dir, exist_ok=True)
 
     import torch
@@ -157,22 +205,32 @@ def main():
             wav = torchaudio.functional.resample(wav, sr, args.out_sr)
         torchaudio.save(path, wav, args.out_sr, encoding="PCM_S", bits_per_sample=16)
 
-    concat_size = max(1, args.concat_size)
     seeds_per_set = max(1, args.seeds_per_set)
     priming_dir = tempfile.mkdtemp(prefix="zonospriming_")
     current_set = -1
     speaker = None
+    # Rotating cursors so each set draws a fresh slice of each reference list.
+    pos_cursor = 0
+    neg_cursor = 0
 
     skipped = 0
     for i in range(args.count):
-        # Rebuild the speaker embedding when we roll into a new set: concatenate a
-        # rotating window of real refs and embed it, so the clone hears several
-        # utterances and the batch spreads across all of the user's positives.
+        # Rebuild the speaker embedding when we roll into a new set: build a
+        # priming clip targeting ~target-secs total, split roughly half positives
+        # (short wake phrase, carries timbre) and half negatives (full sentences,
+        # carry the user's accent), interleaved. Falls back to positives-only when
+        # no negatives are supplied.
         set_idx = i // seeds_per_set
         if set_idx != current_set:
             current_set = set_idx
-            window = [refs[(set_idx * concat_size + k) % len(refs)]
-                      for k in range(concat_size)]
+            if neg_refs:
+                half = args.target_secs / 2.0
+                pos_win, _, pos_cursor = take_until(refs, pos_cursor, half)
+                neg_win, _, neg_cursor = take_until(neg_refs, neg_cursor, half)
+                window = interleave(pos_win, neg_win)
+            else:
+                pos_win, _, pos_cursor = take_until(refs, pos_cursor, args.target_secs)
+                window = pos_win
             priming_path = os.path.join(priming_dir, f"priming_{set_idx:04d}.wav")
             secs = concat_refs(window, priming_path, args.concat_gap)
             wav, sr = torchaudio.load(priming_path)

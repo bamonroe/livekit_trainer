@@ -699,6 +699,32 @@ async fn run_synth_generation(
         }
     }
 
+    // Zonos clones its accent best from ~16s of varied phonetics, so also stage
+    // the user's real NEGATIVE takes (full sentences, sibling `negative` dir) —
+    // the generator builds each priming clip half from these and half from the
+    // short positives. Best-effort: no negatives → positives-only priming.
+    let cnegs = format!("{scratch}/negs");
+    let mut have_negs = false;
+    if matches!(source, SynthSource::Zonos) {
+        if let Some(neg_server_dir) = refs_server_dir.parent().map(|p| p.join("negative")) {
+            if dir_has_wav(&neg_server_dir) {
+                docker_ok(vec!["exec".into(), container.clone(), "mkdir".into(),
+                    "-p".into(), cnegs.clone()])
+                .await?;
+                let cp_negs = neg_server_dir.to_string_lossy().to_string();
+                for name in staged_reference_names(&neg_server_dir)? {
+                    docker_ok(vec![
+                        "cp".into(),
+                        format!("{cp_negs}/{name}"),
+                        format!("{container}:{cnegs}/{name}"),
+                    ])
+                    .await?;
+                }
+                have_negs = true;
+            }
+        }
+    }
+
     // Stage and run the resident-model generator, writing 16 kHz clips directly.
     docker_ok(vec![
         "cp".into(),
@@ -743,9 +769,13 @@ async fn run_synth_generation(
             env::var("F5_SEEDS_PER_SET").unwrap_or_else(|_| "5".to_string()),
         ]),
         // Zonos carries its own sane prosody-lever defaults (speaking_rate,
-        // pitch_std, emotion jitter) and the same concat/seed rotation, so it
-        // runs on the common args alone — F5's fidelity flags don't apply.
-        SynthSource::Zonos => {}
+        // pitch_std, emotion jitter). Point it at the staged negatives when we
+        // have them so priming spans varied phonetics and holds the user's accent.
+        SynthSource::Zonos => {
+            if have_negs {
+                gen_args.extend(["--neg-refs-dir".into(), cnegs.clone()]);
+            }
+        }
     }
     docker_ok(gen_args).await?;
 
