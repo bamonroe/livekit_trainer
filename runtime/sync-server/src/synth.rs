@@ -15,6 +15,7 @@ use crate::error::{db_error, AppError};
 use crate::state::{now_ms, AppState, SynthJob};
 use crate::train::ValidatedTrain;
 use crate::util::{is_safe_slug, parse_query};
+use crate::whisper::{normalized_words, transcribe_with_words, transcript_tail_has_phrase};
 use axum::{
     extract::{Path as AxumPath, RawQuery, State},
     http::header,
@@ -209,16 +210,6 @@ fn staged_reference_names(refs_server_dir: &Path) -> Result<Vec<String>, AppErro
     Ok(names)
 }
 
-/// Parse the `ls | wc -l` clip count the container prints for a finished batch,
-/// defaulting to 0 on any non-numeric output. Pure. Extracted from
-/// `run_synth_generation`.
-fn parse_wc_count(stdout: &[u8]) -> usize {
-    String::from_utf8_lossy(stdout)
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(0)
-}
-
 /// Does this directory hold at least one `.wav`?
 fn dir_has_wav(dir: &Path) -> bool {
     fs::read_dir(dir)
@@ -272,7 +263,15 @@ async fn generate_synth_batch(
     let cp_out = synth_dir.to_string_lossy().to_string();
     let cp_gen_py = "/trainer/scripts/f5_gen_positives.py".to_string();
     run_synth_generation(
-        slug, phrase, count, &refs, &cp_refs, &cp_gen_py, &cp_out, &synth_dir,
+        slug,
+        phrase,
+        count,
+        &refs,
+        &cp_refs,
+        &cp_gen_py,
+        &cp_out,
+        &synth_dir,
+        state.whisper_url.as_deref(),
     )
     .await
 }
@@ -483,6 +482,7 @@ pub(crate) async fn generate_synth(
             &cp_gen_py,
             &cp_out,
             &synth_server_dir,
+            task_state.whisper_url.as_deref(),
         )
         .await;
         let mut jobs = task_state.synth_jobs.lock().expect("synth jobs lock poisoned");
@@ -525,6 +525,7 @@ async fn run_synth_generation(
     cp_gen_py: &str,
     cp_out: &str,
     synth_server_dir: &Path,
+    whisper_url: Option<&str>,
 ) -> Result<usize, AppError> {
     let container = f5_container();
     let stamp = now_ms();
@@ -613,16 +614,33 @@ async fn run_synth_generation(
     ])
     .await?;
 
-    // Count what this run produced from the container's output dir.
-    let counted = docker_ok(vec![
+    // List exactly the clips this run produced (basenames), so the Whisper gate
+    // and the count only touch this batch, not older clips already in the bucket.
+    let listed = docker_ok(vec![
         "exec".into(),
         container.clone(),
         "sh".into(),
         "-c".into(),
-        format!("ls -1 {cout}/*.wav 2>/dev/null | wc -l"),
+        format!("cd {cout} && ls -1 *.wav 2>/dev/null"),
     ])
     .await?;
-    let wrote = parse_wc_count(&counted.stdout);
+    let names: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Whisper-verify the fresh clips: F5 zero-shot cloning occasionally
+    // hallucinates filler ("um", "okay") or a quote instead of the wake phrase,
+    // and such a clip is a poisoned positive. Drop any whose transcript doesn't
+    // end in the phrase before they can enter the training pool.
+    let wrote = match whisper_url {
+        Some(url) => gate_synth_clips(url, phrase, synth_server_dir, &names).await,
+        None => {
+            eprintln!("f5 gate: no Whisper URL configured; skipping verification");
+            names.len()
+        }
+    };
 
     // Best-effort scratch cleanup.
     let _ = run_docker(vec![
@@ -635,6 +653,77 @@ async fn run_synth_generation(
     .await;
 
     Ok(wrote)
+}
+
+/// Fraction of a batch that may fail the phrase check before the gate assumes the
+/// wake word is non-lexical (Whisper hears no words) and keeps the whole batch
+/// rather than gutting it. "beep beep" and similar sound-based tokens transcribe
+/// to nothing, so a near-total failure means "don't trust Whisper here", not
+/// "every clip is bad".
+const GATE_MAX_REJECT_FRACTION: f64 = 0.8;
+
+/// Whisper-verify freshly generated F5 clips in `dir` (named by `names`), deleting
+/// any whose transcript doesn't end in the wake phrase. Returns how many clips
+/// survive. Best-effort and fail-open: a Whisper error on a clip keeps it (better
+/// than dropping good data on a flaky call), and if nearly the whole batch fails
+/// the check the wake word is presumed non-lexical and the batch is kept intact.
+///
+/// Whisper is deliberately called with NO phrase prompt: priming it with the
+/// expected text would bias it toward "hearing" the phrase in a hallucinated
+/// clip, defeating the gate.
+async fn gate_synth_clips(
+    whisper_url: &str,
+    phrase: &str,
+    dir: &Path,
+    names: &[String],
+) -> usize {
+    let phrase_words = normalized_words(phrase);
+    if phrase_words.is_empty() || names.is_empty() {
+        return names.len();
+    }
+    // Pass 1: collect verdicts without deleting, so a mostly-failing batch (a
+    // non-lexical wake word) can be spared wholesale below.
+    let mut fails: Vec<(String, String)> = Vec::new();
+    let mut checked = 0usize;
+    for name in names {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        match transcribe_with_words(whisper_url, &path, None).await {
+            Ok(resp) => {
+                checked += 1;
+                if !transcript_tail_has_phrase(&resp.text, &phrase_words) {
+                    fails.push((name.clone(), resp.text.trim().to_string()));
+                }
+            }
+            Err(e) => eprintln!("f5 gate: whisper failed on {name}: {}; keeping", e.message),
+        }
+    }
+    if checked == 0 {
+        return names.len();
+    }
+    if (fails.len() as f64 / checked as f64) > GATE_MAX_REJECT_FRACTION {
+        eprintln!(
+            "f5 gate: {}/{checked} clips lacked \"{phrase}\"; assuming non-lexical wake word, keeping all",
+            fails.len()
+        );
+        return names.len();
+    }
+    // Pass 2: delete the confirmed hallucinations.
+    let mut rejected = 0usize;
+    for (name, heard) in &fails {
+        if fs::remove_file(dir.join(name)).is_ok() {
+            rejected += 1;
+            eprintln!("f5 gate: rejected {name}: heard {heard:?}");
+        }
+    }
+    eprintln!(
+        "f5 gate: kept {}/{} clips ({rejected} rejected as not \"{phrase}\")",
+        names.len() - rejected,
+        names.len()
+    );
+    names.len() - rejected
 }
 
 #[derive(Serialize)]
@@ -744,13 +833,5 @@ mod tests {
         assert_eq!(names[0], "ref_000.wav");
         assert!(names.iter().all(|n| n.ends_with(".wav")));
         let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn parse_wc_count_reads_number_or_defaults_zero() {
-        assert_eq!(parse_wc_count(b"  42\n"), 42);
-        assert_eq!(parse_wc_count(b"0\n"), 0);
-        assert_eq!(parse_wc_count(b"not a number"), 0);
-        assert_eq!(parse_wc_count(b""), 0);
     }
 }
