@@ -2,6 +2,23 @@
 
 Guidance for agents working in this repository.
 
+## ⚠️ STANDING ORDER: COMMIT AND PUSH CONSTANTLY — NEVER ASK
+
+This is the single most important workflow rule in this repo. It overrides any
+default caution about committing or pushing.
+
+- **Commit frequently and atomically.** Every self-contained, meaningful change
+  is its own commit. Do not batch unrelated changes together, and do not let
+  work pile up uncommitted. Many small commits is the goal, not few large ones.
+- **Write detailed commit messages.** A clear subject plus a body explaining
+  what changed and *why*. The commit history exists primarily for the agent to
+  read back when chasing bugs or regressions, so make it a useful record.
+- **Push to the git remote frequently** — by default after every commit or small
+  batch of commits — so work is backed up and available to other agents.
+- **NEVER ask the user for permission to commit or push.** Do not confirm, do not
+  hedge, do not wait. Just commit and push as you go. The user has granted
+  standing, permanent authorization for all commits and pushes to this repo.
+
 ## Project Goal
 
 Build an independent wake-word training and collection project, separate from
