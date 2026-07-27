@@ -1900,23 +1900,37 @@ class MainActivity : Activity() {
             setText(savedTrainZonosCount().toString())
             styleInput()
         }
+        val impostorInput = EditText(this).apply {
+            hint = "Impostor negatives (female voices)"
+            isSaveEnabled = false
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_NUMBER
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            textSize = 14f
+            setText(savedTrainImpostorNegCount().toString())
+            styleInput()
+        }
         // The model's total positive input = Kokoro (built-in TTS pool) + F5
         // (voice-cloned) + Zonos (voice-cloned) + your own real positives x boost.
-        // This wake word's real positive count is fixed from the server tally, so
-        // the calculator below updates live as the four knobs change.
+        // Impostor clips are NEGATIVES (the phrase in other people's voices), so
+        // they are reported separately, not added to the positive total. This wake
+        // word's real positive count is fixed from the server tally, so the
+        // calculator below updates live as the knobs change.
         val realPositiveCount = projectCounts[project.slug]?.positive ?: 0
         val totalView = text("", 13f, textColor(), Typeface.BOLD)
         fun recomputeTotal() {
             val kokoro = kokoroInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 200_000) ?: 0
             val f5 = f5Input.text.toString().trim().toIntOrNull()?.coerceIn(0, 50_000) ?: 0
             val zonos = zonosInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 50_000) ?: 0
+            val impostor = impostorInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 50_000) ?: 0
             val boost = boostInput.text.toString().trim().toIntOrNull()?.coerceIn(1, 50) ?: 1
             val real = realPositiveCount * boost
             val total = kokoro + f5 + zonos + real
             totalView.text = "Total positive input: $total\n" +
-                "= $kokoro Kokoro + $f5 F5 + $zonos Zonos + $real your voice ($realPositiveCount×$boost)"
+                "= $kokoro Kokoro + $f5 F5 + $zonos Zonos + $real your voice ($realPositiveCount×$boost)\n" +
+                "+ $impostor impostor negatives (female voices, not you)"
         }
-        for (field in listOf(kokoroInput, f5Input, zonosInput, boostInput)) {
+        for (field in listOf(kokoroInput, f5Input, zonosInput, impostorInput, boostInput)) {
             field.addTextChangedListener(object : android.text.TextWatcher {
                 override fun afterTextChanged(s: android.text.Editable?) = recomputeTotal()
                 override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -1961,6 +1975,7 @@ class MainActivity : Activity() {
                 kokoroInput.text.toString().trim().toIntOrNull(),
                 f5Input.text.toString().trim().toIntOrNull(),
                 zonosInput.text.toString().trim().toIntOrNull(),
+                impostorInput.text.toString().trim().toIntOrNull(),
             )
             saveRealisticNumbers(
                 leadProbability = leadProbInput.text.toString().trim().toFloatOrNull(),
@@ -2105,6 +2120,17 @@ class MainActivity : Activity() {
 
             addView(text("Positive boost (replicate your voice)", 15f, mutedColor()).withTop(dp(14)))
             addView(boostInput.withTop(dp(6)))
+
+            addView(text("Negatives", 16f, textColor(), Typeface.BOLD).withTop(dp(20)))
+            addView(text("Impostor negatives (female voices)", 15f, mutedColor()).withTop(dp(14)))
+            addView(
+                text(
+                    "The wake phrase spoken by female Kokoro voices — definitely not you — generated at train time and pooled into the negatives, so the model learns to reject the phrase in other people's voices.",
+                    11f,
+                    mutedColor(),
+                ).withTop(dp(2)),
+            )
+            addView(impostorInput.withTop(dp(6)))
 
             addView(
                 LinearLayout(this@MainActivity).apply {
@@ -2512,19 +2538,27 @@ class MainActivity : Activity() {
             append("State: $label")
             val progress = status.optJSONObject("progress")
             val activeStep = progress?.optInt("active_step", 0) ?: 0
-            // The pre-launch "f5gen" phase: the sync-server is cloning voice
-            // positives before the trainer container starts. Show it as its own
-            // stage with the clip counts, ahead of the six trainer steps.
-            if (step == "f5gen") {
-                val requested = status.optInt("f5_requested", 0)
-                val wrote = status.optInt("f5_wrote", 0)
-                append("\n  ▶ [G] Voice cloning (F5)")
+            // The pre-launch generation phases: before the trainer container
+            // starts, the sync-server generates each synthetic source (F5/Zonos
+            // voice clones, Kokoro impostor negatives) and reports a LIVE wave-file
+            // count. Show whichever is active as its own stage with the clip
+            // counts, ahead of the six trainer steps.
+            val pregen = mapOf(
+                "f5gen" to ("f5" to "Voice cloning (F5)"),
+                "zonosgen" to ("zonos" to "Voice cloning (Zonos)"),
+                "impostorgen" to ("impostor" to "Impostor negatives (Kokoro)"),
+            )[step]
+            if (pregen != null) {
+                val (tag, phaseLabel) = pregen
+                val requested = status.optInt("${tag}_requested", 0)
+                val wrote = status.optInt("${tag}_wrote", 0)
+                append("\n  ▶ [G] $phaseLabel")
                 append(if (wrote > 0) "  $wrote / $requested clips" else "  generating $requested clips…")
             }
             // The coarse `step` (assemble/setup/train…) is only useful before the
             // six-stage pipeline starts; once a pipeline stage is active the
             // granular view below replaces it, so don't show both.
-            if (state == "running" && step.isNotBlank() && step != "f5gen" && activeStep == 0) append("  ·  step: $step")
+            if (state == "running" && step.isNotBlank() && pregen == null && activeStep == 0) append("  ·  step: $step")
             if (progress != null && (state == "running" || state == "starting" || state == "succeeded")) {
                 val overall = progress.optInt("overall_percent", 0)
                 append("  ·  ${overall}% overall")
@@ -2593,10 +2627,11 @@ class MainActivity : Activity() {
         val kokoro = savedTrainKokoroCount()
         val f5 = savedTrainF5Count()
         val zonos = savedTrainZonosCount()
+        val impostor = savedTrainImpostorNegCount()
         val tokenType = savedTrainTokenType(project.slug)
         val r = savedRealistic()
         return """
-            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"n_samples":$kokoro,"f5_count":$f5,"zonos_count":$zonos,"token_type":"$tokenType","realistic":${r.realistic},"lead_probability":${r.leadProbability},"real_lead_fraction":${r.realLeadFraction},"synthetic_lead":${r.syntheticLead},"max_lead_ms":${r.maxLeadMs},"lead_gap_min_ms":${r.leadGapMinMs},"lead_gap_max_ms":${r.leadGapMaxMs},"margin_min_ms":${r.marginMinMs},"margin_max_ms":${r.marginMaxMs},"snr_min_db":${r.snrMinDb},"snr_max_db":${r.snrMaxDb},"background_augment":${r.backgroundAugment},"voice_peak":${r.voicePeak}}
+            {"steps":$steps,"model_size":"$size","target_fp_per_hour":$targetFp,"personal":$personal,"positive_boost":$boost,"n_samples":$kokoro,"f5_count":$f5,"zonos_count":$zonos,"impostor_neg_count":$impostor,"token_type":"$tokenType","realistic":${r.realistic},"lead_probability":${r.leadProbability},"real_lead_fraction":${r.realLeadFraction},"synthetic_lead":${r.syntheticLead},"max_lead_ms":${r.maxLeadMs},"lead_gap_min_ms":${r.leadGapMinMs},"lead_gap_max_ms":${r.leadGapMaxMs},"margin_min_ms":${r.marginMinMs},"margin_max_ms":${r.marginMaxMs},"snr_min_db":${r.snrMinDb},"snr_max_db":${r.snrMaxDb},"background_augment":${r.backgroundAugment},"voice_peak":${r.voicePeak}}
         """.trimIndent()
     }
 
@@ -2655,6 +2690,14 @@ class MainActivity : Activity() {
             .coerceIn(0, 50_000)
     }
 
+    // Kokoro impostor negatives (phrase in female voices) generated at train time.
+    // 0 = none (opt-in).
+    private fun savedTrainImpostorNegCount(): Int {
+        return getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_TRAIN_IMPOSTOR_NEG_COUNT, 0)
+            .coerceIn(0, 50_000)
+    }
+
     private fun saveTrainNumbers(
         steps: Int?,
         targetFp: Float?,
@@ -2662,6 +2705,7 @@ class MainActivity : Activity() {
         kokoroCount: Int? = null,
         f5Count: Int? = null,
         zonosCount: Int? = null,
+        impostorNegCount: Int? = null,
     ) {
         getSharedPreferences(SYNC_PREFS, Context.MODE_PRIVATE).edit().apply {
             if (steps != null) putInt(KEY_TRAIN_STEPS, steps.coerceIn(100, 500_000))
@@ -2670,6 +2714,9 @@ class MainActivity : Activity() {
             if (kokoroCount != null) putInt(KEY_TRAIN_KOKORO_COUNT, kokoroCount.coerceIn(0, 200_000))
             if (f5Count != null) putInt(KEY_TRAIN_F5_COUNT, f5Count.coerceIn(0, 50_000))
             if (zonosCount != null) putInt(KEY_TRAIN_ZONOS_COUNT, zonosCount.coerceIn(0, 50_000))
+            if (impostorNegCount != null) {
+                putInt(KEY_TRAIN_IMPOSTOR_NEG_COUNT, impostorNegCount.coerceIn(0, 50_000))
+            }
         }.apply()
     }
 
@@ -5427,6 +5474,7 @@ class MainActivity : Activity() {
         // Zonos = a second voice-clone source (prosody levers), pooled at train
         // time as a third positive stream alongside Kokoro and F5.
         const val KEY_TRAIN_ZONOS_COUNT = "train_zonos_count"
+        const val KEY_TRAIN_IMPOSTOR_NEG_COUNT = "train_impostor_neg_count"
         const val KEY_TRAIN_TOKEN_TYPE = "train_token_type"
         const val KEY_TRAIN_REALISTIC = "train_realistic"
         const val KEY_TRAIN_LEAD_PROB = "train_lead_prob"
