@@ -61,6 +61,9 @@ class MainActivity : Activity() {
     // render() (e.g. tapping play on a slice) never slams the rail shut; only
     // openRail()/closeRail() flip visibility.
     private var railOpen: Boolean = false
+    // Which Review sub-section is shown. Tracked as a field so an in-place
+    // render() keeps the chosen section instead of snapping back to WakeWord.
+    private var reviewSection: ReviewSection = ReviewSection.WakeWord
     private lateinit var serverUrlInput: EditText
     private lateinit var bulkWakePlacementsInput: EditText
     private var currentPage: AppPage = AppPage.Record
@@ -384,8 +387,51 @@ class MainActivity : Activity() {
         )
         railPanel.addView(railRow("Record", "●", AppPage.Record))
         railPanel.addView(railRow("Review", "≡", AppPage.Review))
+        // Review's sub-sections nest under it, but only while Review (or its
+        // Detail child) is the active destination.
+        if (currentPage == AppPage.Review || currentPage == AppPage.Detail) {
+            railPanel.addView(reviewSubRow("Wake word", ReviewSection.WakeWord))
+            railPanel.addView(reviewSubRow("Negatives", ReviewSection.Negatives))
+            railPanel.addView(reviewSubRow("Hard negatives", ReviewSection.HardNegatives))
+            railPanel.addView(reviewSubRow("Background", ReviewSection.Background))
+            railPanel.addView(reviewSubRow("Synthetic", ReviewSection.Synthetic))
+        }
         railPanel.addView(railRow("Test", "◇", AppPage.Test))
         railPanel.addView(railRow("Train", "▲", AppPage.Train))
+    }
+
+    // An indented Review sub-section row. Tapping it selects the section,
+    // switches to Review if needed, and closes the rail — matching railRow.
+    private fun reviewSubRow(label: String, section: ReviewSection): View {
+        val active = currentPage == AppPage.Review && reviewSection == section
+        val tint = if (active) ACCENT else textColor()
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(36), dp(9), dp(12), dp(9))
+            background = rounded(if (active) navActiveColor() else Color.TRANSPARENT, dp(12), 0)
+            addView(
+                text(if (active) "•" else "·", 16f, tint).apply {
+                    layoutParams = LinearLayout.LayoutParams(dp(16), LinearLayout.LayoutParams.WRAP_CONTENT)
+                    gravity = Gravity.CENTER
+                },
+            )
+            addView(
+                text(label, 15f, tint, if (active) Typeface.BOLD else Typeface.NORMAL).withLeft(dp(8)),
+            )
+            setOnClickListener {
+                closeRail()
+                val changed = currentPage != AppPage.Review || reviewSection != section
+                reviewSection = section
+                if (changed) {
+                    hideKeyboard()
+                    statusMessage = ""
+                    currentPage = AppPage.Review
+                    render()
+                }
+            }
+        }
     }
 
     private fun railRow(label: String, glyph: String, page: AppPage): View {
@@ -590,40 +636,52 @@ class MainActivity : Activity() {
         val backgroundRecordings = store.loadBackgroundRecordings(project.id)
         val serverForSlug =
             if (serverRecordingsSlug == project.slug) serverRecordings else emptyList()
+        // Sync is global to Review, so its card stays on top of every section.
         workspace.addView(syncCard(project, bulkRecordings))
         // Test takes are managed on the Test page, not the training pool.
         val speechServer = serverForSlug.filter { !it.isBackground && !it.isTest }
-        // One card per recording kind so each straight recorder has its own
-        // review section. A legacy/mixed take falls into the "Other" bucket.
-        val sections = listOf(
-            BulkRecording.KIND_POSITIVE to "Wake word takes",
-            BulkRecording.KIND_NEGATIVE to "Negative takes",
-            BulkRecording.KIND_HARD_NEGATIVE to "Hard negative takes",
-            BulkRecording.KIND_ENROLLMENT to "Enrollment takes",
-            "other" to "Other takes",
-        )
-        var anySpeech = false
-        for ((bucket, title) in sections) {
+
+        // Only the selected sub-section's card(s) render below the sync card.
+        fun speechCard(bucket: String, title: String) {
             val serverBucket = speechServer.filter { reviewKindBucket(it.kind) == bucket }
             val localBucket = bulkRecordings.filter { reviewKindBucket(it.kind) == bucket }
-            if (serverBucket.isEmpty() && localBucket.isEmpty()) continue
-            anySpeech = true
+            // Always show the card (even empty) so the section stays visible.
             workspace.addView(
                 recordingsCard(project, title, localBucket, serverBucket).withTop(dp(12)),
             )
         }
-        if (!anySpeech) {
-            workspace.addView(
-                recordingsCard(project, "Wake word takes", emptyList(), emptyList()).withTop(dp(12)),
-            )
+
+        when (reviewSection) {
+            ReviewSection.WakeWord -> {
+                speechCard(BulkRecording.KIND_POSITIVE, "Wake word takes")
+                // Legacy enrollment/mixed takes have no recorder of their own;
+                // fold them under Wake word so they stay reviewable and deletable
+                // without a permanent near-empty section. Only surfaced when they
+                // actually exist.
+                for ((bucket, title) in listOf(
+                    BulkRecording.KIND_ENROLLMENT to "Enrollment takes (legacy)",
+                    "other" to "Other takes (legacy)",
+                )) {
+                    val serverBucket = speechServer.filter { reviewKindBucket(it.kind) == bucket }
+                    val localBucket = bulkRecordings.filter { reviewKindBucket(it.kind) == bucket }
+                    if (serverBucket.isEmpty() && localBucket.isEmpty()) continue
+                    workspace.addView(
+                        recordingsCard(project, title, localBucket, serverBucket).withTop(dp(12)),
+                    )
+                }
+            }
+            ReviewSection.Negatives -> speechCard(BulkRecording.KIND_NEGATIVE, "Negative takes")
+            ReviewSection.HardNegatives ->
+                speechCard(BulkRecording.KIND_HARD_NEGATIVE, "Hard negative takes")
+            ReviewSection.Background -> {
+                val serverBackground = serverForSlug.filter { it.isBackground }
+                workspace.addView(
+                    backgroundRecordingsCard(backgroundRecordings, serverBackground).withTop(dp(12)),
+                )
+            }
+            ReviewSection.Synthetic ->
+                workspace.addView(syntheticSamplesCard(project).withTop(dp(12)))
         }
-        val serverBackground = serverForSlug.filter { it.isBackground }
-        if (backgroundRecordings.isNotEmpty() || serverBackground.isNotEmpty()) {
-            workspace.addView(
-                backgroundRecordingsCard(backgroundRecordings, serverBackground).withTop(dp(12)),
-            )
-        }
-        workspace.addView(syntheticSamplesCard(project).withTop(dp(12)))
         maybeStatus()
     }
 
@@ -5325,6 +5383,16 @@ class MainActivity : Activity() {
         Test,
         Train,
         Settings,
+    }
+
+    // Review page sub-sections, chosen from the left rail. Only one shows at a
+    // time; the sync card stays global above whichever section is selected.
+    private enum class ReviewSection {
+        WakeWord,
+        Negatives,
+        HardNegatives,
+        Background,
+        Synthetic,
     }
 
     private enum class ButtonStyle {

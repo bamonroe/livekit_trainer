@@ -16,8 +16,12 @@ discovered. Prefer small, actionable items with clear status.
     `FrameLayout.onInterceptTouchEvent`; `railOpen` persists across `render()`.
     Verified on the emulator (closed/open/navigate/gear/edge-swipe/scroll shots).
     Removed `bottomNav`/`renderBottomNav`/`navTab`.
-  - [ ] Follow-up (deliberately deferred): re-section the Review page for the new
-    layout.
+  - [x] Follow-up: re-section the Review page for the new layout. Review now
+    shows one per-kind sub-section at a time (Wake word / Negatives / Hard
+    negatives / Background / Synthetic), chosen from indented rail sub-rows
+    under Review; the `Sync & process` card stays global on top. Legacy
+    enrollment/"other" takes fold under Wake word only when present.
+    `reviewSection` persists across `render()`. Verified on the emulator.
   - [ ] Consider narrowing the rail's right-to-left close-swipe zone so it never
     collides with Android's left-edge system back gesture.
 

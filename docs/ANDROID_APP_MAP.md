@@ -85,6 +85,12 @@ Current scaffold:
   spacer, and a settings gear (⚙) that navigates to the Settings page. The left
   rail lists the primary destinations Record / Review / Test / Train (Settings
   now lives on the gear, not the rail); the active destination is highlighted.
+  While Review (or its Detail child) is the active destination, the rail nests
+  the Review sub-sections as indented sub-rows beneath it — Wake word /
+  Negatives / Hard negatives / Background / Synthetic — with the active
+  sub-section highlighted (`reviewSubRow`). The Review page shows only one of
+  these sections at a time (see below); the chosen section is held in the
+  `reviewSection` activity field so an in-place `render()` keeps it.
   The rail overlays the workspace from the left with a scrim behind it; tapping
   the scrim or a destination, or tapping the hamburger again, closes it. It also
   opens on a left-edge left-to-right swipe and closes on a right-to-left swipe
@@ -239,9 +245,22 @@ current Whisper word during playback, and shows generated cut markers inline.
 Slice and source playback buttons toggle between play and pause while their
 audio is active.
 
+The Review page is split into **per-kind sub-sections chosen from the left
+rail**, showing only one section's card(s) at a time (`renderReviewPage`
+switches on `reviewSection`). The `Sync & process` card is global to Review and
+always stays on top, above whichever section is selected. The sections are:
+Wake word (the POSITIVE `recordingsCard`), Negatives, Hard negatives (their
+respective `recordingsCard`s, always shown even when empty so the section stays
+visible), Background (`backgroundRecordingsCard`), and Synthetic
+(`syntheticSamplesCard`). Legacy ENROLLMENT and "other"/mixed takes have no
+recorder of their own; they are folded under the Wake word section as extra
+cards ("Enrollment takes (legacy)" / "Other takes (legacy)") that surface only
+when such takes actually exist, so legacy takes stay reviewable and deletable
+without a permanent near-empty section.
+
 The Review page also lists saved **background takes** (the ambient/non-speech
-recordings from the Record page's "Record background" control) in their own card
-when any exist. Each row plays the local take back with a Play/Pause button and
+recordings from the Record page's "Record background" control) in the Background
+section. Each row plays the local take back with a Play/Pause button and
 can delete it; delete removes the local WAV, its SQLite row, and the server-side
 background clips via `DELETE /bulk/<slug>/<recording_id>`.
 
