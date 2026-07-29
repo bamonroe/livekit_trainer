@@ -10,7 +10,10 @@
 //! the container starts.
 
 use crate::db;
-use crate::docker::{container_running, push_env, run_docker, training_container_name};
+use crate::docker::{
+    container_running, push_env, run_docker, start_speech_services, stop_speech_services,
+    training_container_name,
+};
 use crate::error::{db_error, AppError};
 use crate::score::read_model_manifest;
 use crate::state::{now_ms, rfc3339_ms, AppState};
@@ -394,6 +397,11 @@ async fn launch_train_container(
         vt,
     );
 
+    // The resident speech containers must be up for the pre-launch synth top-ups.
+    // A prior crash or a previous run's VRAM-freeing stop may have left them down,
+    // so bring them up first (idempotent no-op if already running).
+    start_speech_services().await;
+
     // F5 voice-cloned positives are generated HERE, in the sync-server, before
     // the trainer launches: only this container can reach the speech-f5tts
     // service (the trainer container has no docker access). This tops the synth
@@ -413,9 +421,25 @@ async fn launch_train_container(
     // by anyone who is not the user.
     ensure_impostor_negatives(state, slug, phrase, vt).await;
 
-    let output = run_docker(args).await?;
+    // Free the GPU before training. F5, Zonos, and Kokoro each keep a model
+    // resident on the card (~10 GiB combined); none is needed once the synth
+    // buckets are filled. Leaving them loaded starved the trainer's own GPU
+    // stages (synthesis, training, evaluation) and caused CUDA OOM. They are
+    // restarted when the trainer container finishes — see dispatch_training's
+    // reconcile step — or right here if the launch itself fails.
+    stop_speech_services().await;
+
+    let output = match run_docker(args).await {
+        Ok(o) => o,
+        Err(e) => {
+            // Launch never happened; nothing will restart the services later.
+            start_speech_services().await;
+            return Err(e);
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        start_speech_services().await;
         return Err(AppError::internal(format!(
             "docker run failed: {}",
             stderr.trim()
@@ -547,6 +571,7 @@ async fn dispatch_training(state: &AppState) {
         db::running_queue(&conn).unwrap_or_default()
     };
     let mut pipeline_busy = false;
+    let mut trainer_finished = false;
     for entry in running {
         let name = entry
             .container_name
@@ -557,6 +582,7 @@ async fn dispatch_training(state: &AppState) {
         } else {
             // The trainer container is gone; the real outcome lives in the
             // per-slug train_status.json. Retire the queue row either way.
+            trainer_finished = true;
             let conn = state.db.lock().expect("db lock poisoned");
             let _ = db::finish_queue_entry(&conn, entry.id, "done", now_ms());
         }
@@ -570,7 +596,17 @@ async fn dispatch_training(state: &AppState) {
         let conn = state.db.lock().expect("db lock poisoned");
         db::next_queued(&conn).unwrap_or_default()
     };
-    let Some(entry) = next else { return };
+    let Some(entry) = next else {
+        // Pipeline is idle with nothing queued. If a trainer just finished, it
+        // left the speech services stopped (they are stopped before every launch
+        // to free VRAM) — restore them so the voice services come back. When a
+        // job IS queued, the launch below brings them up itself, so we skip the
+        // pointless stop/start bounce here.
+        if trainer_finished {
+            start_speech_services().await;
+        }
+        return;
+    };
 
     // The project must still exist to supply its phrase; otherwise drop the job.
     let phrase = {

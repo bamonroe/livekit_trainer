@@ -32,6 +32,32 @@ pub(crate) fn training_container_name(slug: &str) -> String {
     format!("lkww-train-{slug}")
 }
 
+/// The resident TTS containers the sync-server drives for synthetic data. Each
+/// pins a model on the GPU (~10 GiB combined: F5 ~2.5, Zonos ~5.4, Kokoro ~2.3),
+/// none of which is needed once the pre-launch synth buckets are filled, so they
+/// are stopped to free VRAM for a trainer run and restarted afterward.
+pub(crate) fn speech_service_containers() -> Vec<String> {
+    vec![f5_container(), zonos_container(), kokoro_container()]
+}
+
+/// Stop the resident speech-synthesis containers to free their GPU memory before
+/// a trainer run. Best-effort: a container already stopped or missing is not an
+/// error, and a short stop timeout keeps this from blocking training for long.
+pub(crate) async fn stop_speech_services() {
+    for name in speech_service_containers() {
+        let _ = run_docker(vec!["stop".into(), "-t".into(), "5".into(), name]).await;
+    }
+}
+
+/// Start the resident speech-synthesis containers back up — after a trainer run,
+/// or before synth generation needs them. Best-effort and idempotent: `docker
+/// start` on an already-running container is a harmless no-op.
+pub(crate) async fn start_speech_services() {
+    for name in speech_service_containers() {
+        let _ = run_docker(vec!["start".into(), name]).await;
+    }
+}
+
 /// Append a `-e KEY=VALUE` pair to a docker argv.
 pub(crate) fn push_env(args: &mut Vec<String>, key: &str, value: String) {
     args.push("-e".into());

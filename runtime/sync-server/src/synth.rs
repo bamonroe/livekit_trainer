@@ -443,11 +443,13 @@ pub(crate) async fn ensure_impostor_negatives(
 }
 
 /// Ensure a source's synth bucket for `slug` holds `target` voice-cloned
-/// positives before the trainer assembles them, generating a fresh batch when it
-/// is short. Reuses an existing batch that is already large enough (so repeated
-/// trains don't re-pay the generator's cost); otherwise clears the bucket and
-/// regenerates exactly `target` (the generator names clips `<tag>_00000..`, so a
-/// clean bucket yields exactly the count with no stale leftovers). Writes the
+/// positives before the trainer assembles them, generating only the shortfall
+/// when it is short. Reuses an existing batch that is already large enough (so
+/// repeated trains don't re-pay the generator's cost); when the bucket is only
+/// partially filled — e.g. a run was killed mid-generation — it keeps the
+/// survivors and tops up the difference, so work is never thrown away and
+/// redone. Fresh clips are given per-run-unique names, so merging a top-up batch
+/// into a non-empty bucket never overwrites what is already there. Writes the
 /// source's pre-launch phase into train_status.json so the app's training screen
 /// shows it. Non-fatal: on any failure it logs, records the error, and returns
 /// whatever clips exist so training still proceeds. Returns the final clip count.
@@ -516,14 +518,20 @@ pub(crate) async fn ensure_synth_positives(
         0,
         &format!("generating {target} {noun} ({label})"),
     );
-    // Fresh batch: clear the bucket so the count is exactly `target` (no stale
-    // clips from a previous, larger run linger).
-    let _ = fs::remove_dir_all(&synth_dir);
-    let result = generate_synth_batch(state, slug, phrase, target, source).await;
-    let wrote = *result.as_ref().unwrap_or(&0);
+    // Resume-friendly top-up: keep whatever clips already survive in the bucket
+    // and generate only the shortfall, so a killed and re-run job never re-pays
+    // for clips it already made (F5 alone can be thousands of clips / many GPU
+    // minutes). `existing < target` here. The generated clips get per-run-unique
+    // names (see run_synth_generation), so copying this batch into a non-empty
+    // bucket never clobbers the clips already there.
+    let shortfall = target.saturating_sub(existing);
+    let result = generate_synth_batch(state, slug, phrase, shortfall, source).await;
     if let Err(e) = &result {
         eprintln!("{label} pregen failed for {slug}: {}", e.message);
     }
+    // Report the whole bucket (existing survivors + freshly kept clips), not just
+    // this batch, so the app's count reflects the resumed total.
+    let wrote = count_wavs(&synth_dir);
     {
         let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
         if let Some(j) = jobs.get_mut(&key) {
@@ -533,14 +541,14 @@ pub(crate) async fn ensure_synth_positives(
         }
     }
     let msg = match &result {
-        Ok(w) => format!("generated {w} {noun} ({label})"),
+        Ok(_) => format!("generated {wrote} {noun} ({label})"),
         Err(e) => format!(
             "{label} generation failed: {}; training on existing clips",
             e.message
         ),
     };
     write_synth_status(state, slug, phrase, vt, source, target, wrote, &msg);
-    count_wavs(&synth_dir)
+    wrote
 }
 
 /// Write the pre-training generation phase into a slug's train_status.json. The
@@ -722,6 +730,10 @@ async fn run_synth_generation(
     let scratch = format!("/tmp/{tag}gen_{slug}_{stamp}");
     let crefs = format!("{scratch}/refs");
     let cout = format!("{scratch}/out");
+    // Clips already in the bucket before this run (a resume/top-up appends to
+    // them), so the live progress count can show the running total, not just this
+    // batch.
+    let base = count_wavs(synth_server_dir);
 
     docker_ok(vec![
         "exec".into(),
@@ -864,13 +876,31 @@ async fn run_synth_generation(
                     if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<usize>() {
                         let mut jobs = state.synth_jobs.lock().expect("synth jobs lock poisoned");
                         if let Some(j) = jobs.get_mut(&job_key) {
-                            j.wrote = n;
+                            j.wrote = base + n;
                         }
                     }
                 }
             }
         }
     }
+
+    // Give this run's clips per-run-unique names before merging them into the
+    // bucket. The generator always numbers from `<tag>_00000`, so a top-up would
+    // otherwise `docker cp` right over clips a previous run already left there;
+    // prefixing with the unique run `stamp` keeps every batch's clips distinct so
+    // the bucket accumulates instead of clobbering. Best-effort: if the rename
+    // fails the copy below still runs (same as before, at worst overwriting).
+    let _ = docker_ok(vec![
+        "exec".into(),
+        container.clone(),
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "cd {cout} 2>/dev/null && for f in *.wav; do \
+             [ -e \"$f\" ] && mv -- \"$f\" \"r{stamp}_$f\"; done"
+        ),
+    ])
+    .await;
 
     // Copy the finished clips into the synth bucket (dir must exist first).
     fs::create_dir_all(synth_server_dir)?;
