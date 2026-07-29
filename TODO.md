@@ -7,14 +7,20 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Active
 
-- [ ] **WAITING ON LOG** — A/B clone-vs-baseline training test. A detached tmux
-  session "wake word testing" runs `sleep 4h && bash ~/wakeword_ab_test.sh`
-  (launched 2026-07-27 ~18:16 EDT, so it fires ~22:16 EDT) and tees output to
-  `~/wakeword_ab_test.log`. Run A = shipped Piper pool + real positives (no
-  clones); Run B = same recipe + 2000 F5 + 2000 Zonos voice clones. Both are two
-  full 50k-step runs, so the log won't be complete until well into 2026-07-28.
-  **Next action for the agent: read `~/wakeword_ab_test.log` and compare Run A vs
-  Run B recall / fp-per-hour to judge whether the voice clones help.**
+- [ ] **RE-LAUNCH — heavy personal-pipeline run** (`~/wakeword_ab_test.sh`, tmux
+  "wake word testing", tees `~/wakeword_ab_test.log`). Current recipe: Piper
+  dropped (`n_samples=0`), positives = 5000 F5 + 5000 Zonos clones + real×15,
+  plus 3000 Kokoro impostor hard negatives; 50k steps; compared head-to-head
+  against stock Piper baseline `20260728T112805Z`. On 2026-07-29 this run was
+  **killed mid-pregen** (job id=21, all_set) because the GPU hit CUDA OOM: the
+  resident F5/Zonos/Kokoro speech containers held ~10 GiB on the 16 GiB card
+  through the whole run. **Fixed** in `ffefc34` — the sync-server now stops those
+  containers before the trainer launches and restarts them after, and synth
+  top-ups are resumable (kept clips are reused, only the shortfall regenerates).
+  The already-generated clips survive on disk (F5 ≈ 4483, impostor ≈ 972), so a
+  re-launch resumes from them. **Next action: re-run with `START_NOW=1 bash
+  ~/wakeword_ab_test.sh 2>&1 | tee ~/wakeword_ab_test.log`, watch the pregen
+  counts resume, then compare recall / fp-per-hour against the baseline.**
 
 - [~] Navigation restructure: bottom tab bar → persistent top app bar +
   collapsible left rail.
