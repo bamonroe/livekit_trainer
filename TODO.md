@@ -454,9 +454,13 @@ discovered. Prefer small, actionable items with clear status.
   the synth `f5_count` / `zonos_count` buckets cannot be topped up until those
   services are rebuilt in `/data/speech_services`.
 - [ ] Verify slice quality now that the slicer transcribes via whisper.cpp
-  (host :8572) instead of WhisperX (now on :8571). WhisperX was chosen for
-  stable wav2vec2 word timestamps and the slicer cuts on word boundaries, so
-  compare slice boundaries on a known take before trusting a fresh batch.
+  instead of WhisperX. WhisperX has been **retired** in `/data/speech_services`
+  (it pinned ~4 GB of idle VRAM on a 16 GB card); whisper.cpp now answers on
+  both :8571 and :8572, so `WHISPER_SERVER_URL` needed no change. WhisperX was
+  chosen for stable wav2vec2 word timestamps and the slicer cuts on word
+  boundaries, so compare slice boundaries on a known take before trusting a
+  fresh batch. WhisperX can be brought back for that comparison with
+  `docker compose --profile whisperx up -d whisperx` (host :8574).
 
 - [ ] Add optional runtime scorer service or test harness under `runtime/`. When
   it lands it should emit `corrections.json` (see `docs/CORRECTION_BATCH_FORMAT.md`)
