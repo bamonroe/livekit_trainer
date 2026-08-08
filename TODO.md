@@ -446,6 +446,18 @@ discovered. Prefer small, actionable items with clear status.
 
 ## Later
 
+- [x] Trainer stack was torn down on 2026-08-08: sync-server and scorer
+  containers removed, and the `livekit-trainer-sync-server`,
+  `livekit-wakeword-scorer`, and `livekit-wakeword-trainer` images deleted
+  (~36 GB). Compose files are intact, so `docker compose build` rebuilds them.
+  The F5-TTS and Zonos speech services were removed too (~41 GB of images), so
+  the synth `f5_count` / `zonos_count` buckets cannot be topped up until those
+  services are rebuilt in `/data/speech_services`.
+- [ ] Verify slice quality now that the slicer transcribes via whisper.cpp
+  (host :8572) instead of WhisperX (now on :8571). WhisperX was chosen for
+  stable wav2vec2 word timestamps and the slicer cuts on word boundaries, so
+  compare slice boundaries on a known take before trusting a fresh batch.
+
 - [ ] Add optional runtime scorer service or test harness under `runtime/`. When
   it lands it should emit `corrections.json` (see `docs/CORRECTION_BATCH_FORMAT.md`)
   so live detection mistakes flow straight back into training.
