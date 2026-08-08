@@ -59,6 +59,10 @@ services:
       TRAINER_USE_GPU: "${TRAINER_USE_GPU:-1}"
       # Where recorded audio is transcribed. This is the source of truth for the
       # Whisper server; the Android app no longer configures it.
+      # Port 8572 is whisper.cpp (speech_services swapped 8571/8572 so that
+      # 8572 is whisper.cpp and 8571 is WhisperX). whisper.cpp is fast and uses
+      # far less VRAM; watch slice quality, since WhisperX was originally
+      # chosen for its stable word timestamps.
       WHISPER_SERVER_URL: "${WHISPER_SERVER_URL:-http://pickle.bam.net:8572}"
       # Where the model-test scoring endpoint sends audio. Points at the scorer
       # service below; unset disables /score only.
